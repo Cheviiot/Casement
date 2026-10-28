@@ -222,8 +222,43 @@ async fn run() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    let dir = config_dir(cli.config)?;
-    let identity = Identity::load_or_create(&dir)?;
+    // On Windows with the system service, "this computer" is the machine's settings.
+    #[cfg(windows)]
+    let machine = cli.config.is_none()
+        && matches!(
+            cli.command,
+            Command::Setup
+                | Command::Status
+                | Command::Accept { .. }
+                | Command::Password { .. }
+                | Command::Trusted { .. }
+                | Command::Fingerprint
+                | Command::Listen { .. }
+        )
+        && casement_media::autostart::system_service();
+    #[cfg(not(windows))]
+    let machine = false;
+    let dir = if machine {
+        #[cfg(windows)]
+        {
+            casement_media::autostart::machine_settings_dir()
+        }
+        #[cfg(not(windows))]
+        unreachable!()
+    } else {
+        config_dir(cli.config)?
+    };
+    let identity = Identity::load_or_create(&dir).map_err(|e| {
+        if machine {
+            anyhow::anyhow!(
+                "настройки службы Casement ({}) доступны только администраторам: \
+                 запустите терминал от имени администратора",
+                dir.display()
+            )
+        } else {
+            e.into()
+        }
+    })?;
 
     match cli.command {
         Command::Setup => setup::wizard(&dir, &identity, &host_name())?,

@@ -53,6 +53,8 @@ struct Inner {
     /// in-process host, so the computer stays reachable without the window.
     service: bool,
     updating_accept: std::cell::Cell<bool>,
+    /// Windows with the system service: the settings below are the machine's.
+    machine: bool,
 }
 
 /// Without the background service the window accepts connections itself: on unless the
@@ -145,6 +147,7 @@ impl Window {
             host: RefCell::new(None),
             service: service::installed(),
             updating_accept: std::cell::Cell::new(false),
+            machine: service::machine(),
         }));
         this.0.navigation.add(&this.build_home());
         this.connect_signals();
@@ -326,13 +329,21 @@ impl Window {
             .this_row
             .connect_activated(move |_| this.open_this_computer());
         let this = self.clone();
-        self.0
-            .password_row
-            .connect_activated(move |_| this.open_password());
+        self.0.password_row.connect_activated(move |_| {
+            if this.0.machine {
+                this.configure_machine();
+            } else {
+                this.open_password();
+            }
+        });
         let this = self.clone();
-        self.0
-            .trusted_row
-            .connect_activated(move |_| this.open_trusted());
+        self.0.trusted_row.connect_activated(move |_| {
+            if this.0.machine {
+                this.configure_machine();
+            } else {
+                this.open_trusted();
+            }
+        });
     }
 
     fn connect_address(&self, text: &str) {
@@ -479,7 +490,11 @@ impl Window {
         let (hero, _, _) = pages::hero("computer-symbolic", &self.0.core.name, "");
         page.add(&pages::bare(&hero));
 
-        let fingerprint = self.0.core.identity.fingerprint().display();
+        let fingerprint = if self.0.machine {
+            service::machine_access().map_or_else(|| "—".to_string(), |m| m.fingerprint)
+        } else {
+            self.0.core.identity.fingerprint().display()
+        };
         let key = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
@@ -502,11 +517,22 @@ impl Window {
         page.add(&access);
 
         let files = adw::PreferencesGroup::builder().title("Файлы").build();
-        let downloads = glib::user_special_dir(glib::UserDirectory::Downloads)
-            .unwrap_or_else(|| glib::home_dir().join("Downloads"));
+        let (downloads, shared) = if self.0.machine {
+            // The service works before anyone logs in: the shared public folders.
+            let public = std::env::var_os("PUBLIC")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| r"C:\Users\Public".into());
+            (public.join("Downloads"), public)
+        } else {
+            (
+                glib::user_special_dir(glib::UserDirectory::Downloads)
+                    .unwrap_or_else(|| glib::home_dir().join("Downloads")),
+                glib::home_dir(),
+            )
+        };
         for (title, path) in [
             ("Полученные файлы", downloads),
-            ("Доступно для скачивания", glib::home_dir()),
+            ("Доступно для скачивания", shared),
         ] {
             let row = adw::ActionRow::builder()
                 .title(title)
@@ -519,16 +545,47 @@ impl Window {
         pages::preferences("Этот компьютер", "this-computer", &page, None)
     }
 
+    /// An access password is set for connections to this computer.
+    fn password_set(&self) -> bool {
+        if self.0.machine {
+            service::machine_access().is_some_and(|m| m.password)
+        } else {
+            has_password(&self.0.core.dir)
+        }
+    }
+
+    /// Windows with the system service: its settings change in the setup wizard, run as
+    /// administrator; the service publishes the result within a few seconds.
+    fn configure_machine(&self) {
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            if let Err(e) = service::configure_machine().await {
+                this.toast(&format!("Не удалось: {e}"));
+            }
+            this.refresh_access();
+            glib::timeout_future_seconds(4).await;
+            this.refresh_access();
+        });
+    }
+
     fn refresh_access(&self) {
         let dir = &self.0.core.dir;
-        let password = has_password(dir);
+        let password = self.password_set();
         self.0.password_row.set_subtitle(if password {
             "Задан"
         } else {
             "Не задан"
         });
-        let store = TrustStore::load(dir).unwrap_or_default();
-        let count = store.devices().len();
+        let store = if self.0.machine {
+            TrustStore::default()
+        } else {
+            TrustStore::load(dir).unwrap_or_default()
+        };
+        let count = if self.0.machine {
+            service::machine_access().map_or(0, |m| m.trusted)
+        } else {
+            store.devices().len()
+        };
         self.0.trusted_row.set_subtitle(&if count == 0 {
             "Нет".to_string()
         } else {
@@ -707,10 +764,7 @@ impl Window {
             glib::spawn_future_local(async move {
                 let result = service::set_enabled(active).await;
                 match result {
-                    Ok(_)
-                        if active
-                            && !matches!(StoredPassword::load(&this.0.core.dir), Ok(Some(_))) =>
-                    {
+                    Ok(_) if active && !this.password_set() => {
                         this.toast("Задайте пароль доступа, иначе новые устройства не смогут войти")
                     }
                     Ok(_) => {}

@@ -43,8 +43,19 @@ Linux и Windows.
   изменения из приложения или `casement-cli` действуют сразу, без перезапуска службы.
 - **Служба `casement-host`** принимает подключения без окна и включена по умолчанию: на
   Linux — пользовательская служба systemd (пакеты включают её для всех,
-  `systemctl --global`), на Windows — автозапуск при входе пользователя. Её включают и
+  `systemctl --global`), на Windows — системная служба «Casement». Её включают и
   выключают «Принимать подключения», `casement-cli accept` и мастер `casement-cli setup`.
+- **Служба Windows** работает от SYSTEM с запуска Windows, до входа в систему. Сама она
+  живёт в сеансе 0 без рабочего стола, поэтому запускает рабочий процесс
+  (`casement-host --worker`) в сеансе консоли на рабочем столе, который сейчас получает
+  ввод: `Default`, `Winlogon` (экран входа, блокировки, окна UAC) или `Screen-saver`.
+  Процесс захватывает и управляет только своим рабочим столом; когда ввод переходит на
+  другой, он завершается с кодом этого стола, служба запускает его там же, а клиент
+  переподключается. Настройки машины (ключ, пароль, доверенные) лежат в
+  `%ProgramData%\Casement` с доступом только для SYSTEM и администраторов; для
+  приложения служба публикует сводку в `public\status`, а меняются настройки мастером
+  `casement-cli setup`, который приложение запускает с запросом UAC. Файлы — в общих
+  папках `C:\Users\Public`.
 - **Источники.** По умолчанию хост принимает только частные адреса, CGNAT 100.64/10
   (Tailscale), ULA и loopback.
 - **Поиск** — mDNS `_casement._udp.local.` с записями `v`, `name`, `os`, `fp`.
@@ -77,6 +88,6 @@ Linux и Windows.
 
 ## Настройки
 
-`~/.config/casement` на Linux, `%APPDATA%\casement` на Windows (или
-`$CASEMENT_CONFIG_DIR`), файлы с правами 0600: `device.key`, `connections.ini`,
-`host-password`, `trusted-devices`.
+`~/.config/casement` на Linux, `%APPDATA%\casement` на Windows (у службы Windows —
+`%ProgramData%\Casement`) или `$CASEMENT_CONFIG_DIR`; файлы с правами 0600:
+`device.key`, `connections.ini`, `host-password`, `trusted-devices`.

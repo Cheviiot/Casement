@@ -1,8 +1,8 @@
 #!/bin/sh
 # Installs Casement for the current user into ~/.local: the programs, the menu entry and
-# the systemd user service casement-host (off until "Принимать подключения" is switched
-# on in the application). Run it from an unpacked release archive, or straight from the
-# web, which fetches the latest release first:
+# the systemd user service casement-host, switched on: accepting connections is on by
+# default ("Принимать подключения" switches it). Run it from an unpacked release archive,
+# or straight from the web, which fetches the latest release first:
 #   curl -fsSL https://github.com/Cheviiot/Casement/releases/latest/download/install.sh | sh
 set -eu
 repo=Cheviiot/Casement

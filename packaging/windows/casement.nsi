@@ -4,6 +4,7 @@
 Unicode true
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
+!include "LogicLib.nsh"
 
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Casement"
 !define RUN_KEY "Software\Microsoft\Windows\CurrentVersion\Run"
@@ -51,8 +52,11 @@ LangString MainSection ${LANG_ENGLISH} "Casement"
 LangString DesktopSection ${LANG_RUSSIAN} "Ярлык на рабочем столе"
 LangString DesktopSection ${LANG_ENGLISH} "Desktop shortcut"
 
-; Running copies hold their files: stop them before replacing or removing.
+; Running copies hold their files: stop the service and the programs before replacing or
+; removing them.
 !macro StopPrograms
+  nsExec::Exec 'sc stop Casement'
+  Sleep 1500
   nsExec::Exec 'taskkill /F /IM casement.exe'
   nsExec::Exec 'taskkill /F /IM casement-host.exe'
   nsExec::Exec 'taskkill /F /IM casement-cli.exe'
@@ -88,9 +92,28 @@ Section "!$(MainSection)" SecMain
   SetShellVarContext all
   CreateShortcut "$SMPROGRAMS\Casement.lnk" "$INSTDIR\bin\casement.exe" "" "$INSTDIR\casement.ico"
 
-  ; Accepting connections is on by default: casement-host starts at this user's login.
-  ; "Принимать подключения" in the application switches it.
-  WriteRegStr HKCU "${RUN_KEY}" "Casement host" '"$INSTDIR\bin\casement-host.exe"'
+  ; The system service accepts connections from Windows start, before anyone logs in, and
+  ; shows the login screen and UAC prompts. It replaces the per-user autostart of 0.1.0.
+  DeleteRegValue HKCU "${RUN_KEY}" "Casement host"
+  ; The machine's key, password and trusted devices: SYSTEM and administrators only
+  ; (well-known SIDs, so it works in every language).
+  ReadEnvStr $1 PROGRAMDATA
+  CreateDirectory "$1\Casement"
+  nsExec::Exec 'icacls "$1\Casement" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F'
+  ; The service's summary for the application (key fingerprint, password set, number of
+  ; trusted devices): readable by every user.
+  CreateDirectory "$1\Casement\public"
+  nsExec::Exec 'icacls "$1\Casement\public" /grant *S-1-5-32-545:(OI)(CI)RX'
+  nsExec::Exec 'sc query Casement'
+  Pop $0
+  ${If} $0 == 0
+    nsExec::Exec 'sc config Casement binPath= "\"$INSTDIR\bin\casement-host.exe\" --service" start= auto'
+  ${Else}
+    nsExec::Exec 'sc create Casement binPath= "\"$INSTDIR\bin\casement-host.exe\" --service" start= auto DisplayName= "Casement"'
+  ${EndIf}
+  nsExec::Exec 'sc description Casement "Accepts Casement remote desktop connections, also at the login screen."'
+  nsExec::Exec 'sc failure Casement reset= 86400 actions= restart/5000/restart/5000/restart/30000'
+  nsExec::Exec 'sc start Casement'
 
   WriteRegStr HKLM "Software\Casement" "InstallDir" "$INSTDIR"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayName" "Casement"
@@ -121,6 +144,7 @@ SectionEnd
 
 Section "Uninstall"
   !insertmacro StopPrograms
+  nsExec::Exec 'sc delete Casement'
   ; "Принимать подключения" in the application adds this for its user.
   DeleteRegValue HKCU "${RUN_KEY}" "Casement host"
   nsExec::Exec 'netsh advfirewall firewall delete rule name="Casement"'
@@ -130,5 +154,6 @@ Section "Uninstall"
   RMDir /r "$INSTDIR"
   DeleteRegKey HKLM "${UNINSTALL_KEY}"
   DeleteRegKey HKLM "Software\Casement"
-  ; Settings in %APPDATA%\casement (device key, password, trusted devices) stay.
+  ; The machine's settings in %ProgramData%\Casement and each user's in
+  ; %APPDATA%\casement (keys, password, trusted devices) stay for a later install.
 SectionEnd

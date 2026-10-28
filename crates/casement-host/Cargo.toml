@@ -11,5 +11,16 @@ publish.workspace = true
 casement-media = { version = "0.1.0", path = "../casement-media" }
 casement-net = { version = "0.1.0", path = "../casement-net" }
 glib = "0.21.5"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.1"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Threading",
+] }

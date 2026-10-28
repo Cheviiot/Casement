@@ -55,7 +55,8 @@ casement-cli accept off   # stop accepting connections
 
 ## Requirements
 
-- **Windows** 10 or 11.
+- **Windows** 10 or 11. Casement runs as a service, so it also shows the login screen,
+  the lock screen and UAC prompts.
 - **Linux** with GTK 4.14+, Libadwaita 1.6+ and GStreamer 1.24+ (the packages pull them
   in). Accepting connections needs GNOME on Wayland.
 

@@ -1,22 +1,33 @@
 //! casement-host: accepts Casement connections to this computer without the window open.
-//! Runs as the systemd user service `casement-host.service` inside the graphical session
-//! (the screen comes from that session's Mutter). Settings are the application's:
-//! `~/.config/casement` or `$CASEMENT_CONFIG_DIR`. Restart it after changing the password
-//! or the trusted devices; the application does that itself.
+//!
+//! - Without arguments it runs in the user's graphical session: on Linux as the systemd
+//!   user service `casement-host.service` (the screen comes from that session's Mutter),
+//!   on Windows from the user's autostart. Settings are the application's
+//!   (`~/.config/casement`, `%APPDATA%\casement` or `$CASEMENT_CONFIG_DIR`).
+//! - `--service` (Windows) is the system service "Casement"; `--worker --desktop NAME` is
+//!   what that service starts in the console session, with the machine's settings in
+//!   `%ProgramData%\Casement` (see windows.rs).
 
-// Started at login on Windows: no console window.
+// Started at login or by the service on Windows: no console window.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::path::PathBuf;
 
 use casement_net::host::HostEvent;
+use casement_net::transfer::HostFiles;
 use casement_net::DEFAULT_PORT;
+
+#[cfg(windows)]
+mod windows;
 
 /// Files sent by clients land in the user's Downloads folder; clients may browse and
 /// download from the home folder (they control this desktop anyway).
-fn downloads_dir() -> Option<PathBuf> {
-    glib::user_special_dir(glib::UserDirectory::Downloads)
-        .or_else(|| Some(glib::home_dir().join("Downloads")))
+fn user_files() -> HostFiles {
+    HostFiles {
+        incoming: glib::user_special_dir(glib::UserDirectory::Downloads)
+            .or_else(|| Some(glib::home_dir().join("Downloads"))),
+        shared: Some(glib::home_dir()),
+    }
 }
 
 /// The same place as `casement-cli` uses: on Windows %APPDATA%\casement (GLib's user config
@@ -33,45 +44,121 @@ fn config_dir() -> PathBuf {
     glib::user_config_dir().join("casement")
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> std::process::ExitCode {
+/// Logs to `file` (a service has no terminal) or to stderr; info and up unless
+/// $CASEMENT_LOG says otherwise.
+fn init_logging(file: Option<PathBuf>) {
+    let filter = || {
+        tracing_subscriber::EnvFilter::try_from_env("CASEMENT_LOG")
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    };
+    let file = file.and_then(|path| {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::File::create(path).ok()
+    });
+    match file {
+        Some(file) => tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init(),
+        None => tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_writer(std::io::stderr)
+            .init(),
+    }
+}
+
+fn main() -> std::process::ExitCode {
     casement_media::use_bundled_gstreamer();
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_env("CASEMENT_LOG"))
-        .with_writer(std::io::stderr)
-        .init();
-    let dir = config_dir();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    #[cfg(windows)]
+    if args.first().map(String::as_str) == Some("--service") {
+        init_logging(Some(windows::machine_dir().join("service.log")));
+        return match windows::run_service() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => {
+                tracing::error!("not started by the service manager: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+
+    #[cfg(windows)]
+    let (dir, files) = if args.first().map(String::as_str) == Some("--worker") {
+        let desktop = args
+            .iter()
+            .skip_while(|a| *a != "--desktop")
+            .nth(1)
+            .cloned()
+            .unwrap_or_else(|| "Default".into());
+        let machine = windows::machine_dir();
+        init_logging(Some(machine.join("host.log")));
+        tracing::info!("worker on the {desktop} desktop");
+        windows::follow_input_desktop(desktop);
+        // At the login screen nobody's home folder is in use: the shared public folders.
+        let public = std::env::var_os("PUBLIC")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Users\Public"));
+        let files = HostFiles {
+            incoming: Some(public.join("Downloads")),
+            shared: Some(public),
+        };
+        (machine, files)
+    } else {
+        init_logging(None);
+        (config_dir(), user_files())
+    };
+    #[cfg(not(windows))]
+    let (dir, files) = {
+        let _ = args;
+        init_logging(None);
+        (config_dir(), user_files())
+    };
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            tracing::error!("cannot start: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(run(dir, files))
+}
+
+async fn run(dir: PathBuf, files: HostFiles) -> std::process::ExitCode {
     let name = glib::host_name().to_string();
     let port = std::env::var("CASEMENT_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PORT);
-    let running = match casement_media::service::start_host(
-        &dir,
-        &name,
-        port,
-        true,
-        false,
-        casement_net::transfer::HostFiles {
-            incoming: downloads_dir(),
-            shared: Some(glib::home_dir()),
-        },
-    ) {
+    let running = match casement_media::service::start_host(&dir, &name, port, true, false, files) {
         Ok(running) => running,
         Err(e) => {
-            eprintln!("cannot accept connections: {e}");
+            tracing::error!("cannot accept connections: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
-    println!(
+    tracing::info!(
         "accepting connections on UDP {port} as {name}, key {}",
         running.host.fingerprint().display()
     );
     if let Some(e) = &running.screen_error {
-        println!("screen not shared: {e}");
+        tracing::warn!("screen not shared: {e}");
     }
     if !running.has_password {
-        println!("no access password: only trusted devices can connect");
+        tracing::info!("no access password: only trusted devices can connect");
+    }
+    #[cfg(windows)]
+    if dir == windows::machine_dir() {
+        let fingerprint = running.host.fingerprint().display();
+        tokio::spawn(windows::publish_status(dir.clone(), fingerprint));
     }
     let host = running.host.clone();
     tokio::spawn(async move { host.run().await });
@@ -83,13 +170,18 @@ async fn main() -> std::process::ExitCode {
             _ = tokio::signal::ctrl_c() => break,
             _ = &mut term => break,
             Some(event) = events.recv() => match event {
-                HostEvent::LoggedIn { peer, fingerprint, name, trusted } => println!(
+                HostEvent::LoggedIn { peer, fingerprint, name, trusted } => tracing::info!(
                     "{peer}: {name} logged in{} (key {})",
-                    if trusted { " as a trusted device" } else { " with the password" }, fingerprint.display()),
-                HostEvent::Refused { peer, reason } => println!("{peer}: refused: {reason}"),
-                HostEvent::FileReceived { peer, path, size } => println!("{peer}: received {} ({size} bytes)", path.display()),
-                HostEvent::FileSent { peer, path, size } => println!("{peer}: downloaded {} ({size} bytes)", path.display()),
-                HostEvent::Closed { peer } => println!("{peer}: closed"),
+                    if trusted { " as a trusted device" } else { " with the password" },
+                    fingerprint.display()),
+                HostEvent::Refused { peer, reason } => tracing::info!("{peer}: refused: {reason}"),
+                HostEvent::FileReceived { peer, path, size } => {
+                    tracing::info!("{peer}: received {} ({size} bytes)", path.display())
+                }
+                HostEvent::FileSent { peer, path, size } => {
+                    tracing::info!("{peer}: downloaded {} ({size} bytes)", path.display())
+                }
+                HostEvent::Closed { peer } => tracing::info!("{peer}: closed"),
             },
         }
     }
