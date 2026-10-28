@@ -9,7 +9,14 @@
 //! temporary file and renames it only when the size and SHA-256 match, never overwriting
 //! an existing file. Browsing and downloading stay inside the host's shared folder.
 
-use std::path::{Path, PathBuf};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+#[cfg(target_os = "linux")]
+use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
 use casement_proto::{
     control::Kind, Control, ErrorCode, FileDone, FileEntry, FileFetch, FileList, FileListing,
@@ -23,6 +30,159 @@ use crate::{framing, NetError};
 const CHUNK: usize = 256 * 1024;
 /// Most entries in one listing; keeps the answer well below the control frame limit.
 pub const MAX_LISTING: usize = 4000;
+static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+/// A uniquely-created temporary file that is removed if its transfer fails or is
+/// cancelled. The file lives beside its destination so publishing it is atomic.
+struct TransferTemp {
+    path: PathBuf,
+}
+
+impl TransferTemp {
+    async fn create(dir: &Path) -> Result<(Self, tokio::fs::File), NetError> {
+        let dir = dir.to_path_buf();
+        // Construct the guard inside the blocking operation: cancellation while opening
+        // must not leave an unowned file after the open completes. A short ASCII name
+        // also leaves room for long Unicode destination names.
+        let (file, guard) = tokio::task::spawn_blocking(move || loop {
+            let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!(
+                ".casement-{}-{id}.casement-part",
+                std::process::id()
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok::<_, io::Error>((file, Self { path })),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        })
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))??;
+        Ok((guard, tokio::fs::File::from_std(file)))
+    }
+
+    /// Publishes without replacing a path created by another transfer or process.
+    /// Same-directory no-replace rename works on NTFS, FAT/exFAT and Linux filesystems.
+    fn publish(mut self, dir: &Path, name: &str) -> Result<PathBuf, NetError> {
+        let (stem, ext) = match name.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
+            _ => (name.to_string(), String::new()),
+        };
+        for n in 0u64.. {
+            let candidate = if n == 0 {
+                dir.join(name)
+            } else {
+                dir.join(format!("{stem} ({n}){ext}"))
+            };
+            match rename_noreplace(&self.path, &candidate) {
+                Ok(()) => {
+                    self.remove();
+                    return Ok(candidate);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unreachable!("a free destination name must eventually be found")
+    }
+
+    fn remove(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Atomically moves a completed temporary file to an unused destination path.
+#[cfg(target_os = "linux")]
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: both C strings are NUL-terminated and live through the call; paths share
+    // a destination directory, and renameat2 atomically refuses an existing target.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        #[link_name = "MoveFileW"]
+        fn move_file_w(existing: *const u16, new: *const u16) -> i32;
+    }
+
+    fn extended_path(path: &Path) -> Vec<u16> {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        const EXTENDED: &[u16] = &[92, 92, 63, 92]; // \\?\
+        const UNC: &[u16] = &[92, 92];
+        let mut result = if wide.starts_with(EXTENDED) {
+            wide
+        } else if wide.starts_with(UNC) {
+            [EXTENDED, &[85, 78, 67, 92], &wide[2..]].concat()
+        } else {
+            [EXTENDED, &wide].concat()
+        };
+        result.push(0);
+        result
+    }
+
+    let from_wide = extended_path(&std::fs::canonicalize(from)?);
+    let parent = to
+        .parent()
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let name = to
+        .file_name()
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let target = std::fs::canonicalize(parent)?.join(name);
+    let to_wide = extended_path(&target);
+    // SAFETY: both paths are valid, NUL-terminated UTF-16 strings for the duration of
+    // the call. MoveFileW is same-volume atomic and fails if the destination exists.
+    let result = unsafe { move_file_w(from_wide.as_ptr(), to_wide.as_ptr()) };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::hard_link(from, to)?;
+    let _ = std::fs::remove_file(from);
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::hard_link(from, to)?;
+    let _ = std::fs::remove_file(from);
+    Ok(())
+}
+
+impl Drop for TransferTemp {
+    fn drop(&mut self) {
+        self.remove();
+    }
+}
 
 /// Where the host keeps files: uploads go to `incoming`, browsing and downloads stay in
 /// `shared`; None refuses that direction.
@@ -113,7 +273,10 @@ pub(crate) async fn serve(
             HostFiles {
                 shared: Some(root), ..
             },
-        ) => send_shared(&mut send, root, &fetch.path).await,
+        ) => {
+            let _ = send.set_priority(-1);
+            send_shared(&mut send, root, &fetch.path).await
+        }
         (Some(Kind::FileList(_) | Kind::FileFetch(_)), _) => Err(NetError::Protocol(
             "this computer does not share its files".into(),
         )),
@@ -316,14 +479,13 @@ async fn receive(
         return Err(NetError::Protocol("unusable file name".into()));
     };
     tokio::fs::create_dir_all(dir).await?;
-    let partial = dir.join(format!(".{name}.casement-part"));
-    let mut file = tokio::fs::File::create(&partial).await?;
+    let (partial, mut file) = TransferTemp::create(dir).await?;
     reply(&mut send, true, "").await?;
 
     let result: Result<(PathBuf, u64), NetError> = async {
         read_bytes(&mut recv, &mut file, offer.size, |_, _| {}).await?;
-        let path = unique_path(dir, &name);
-        tokio::fs::rename(&partial, &path).await?;
+        drop(file);
+        let path = partial.publish(dir, &name)?;
         Ok((path, offer.size))
     }
     .await;
@@ -336,7 +498,6 @@ async fn receive(
             reply(&mut send, true, &saved).await?;
         }
         Err(e) => {
-            let _ = tokio::fs::remove_file(&partial).await;
             let _ = reply(&mut send, false, &e.to_string()).await;
         }
     }
@@ -359,6 +520,7 @@ pub async fn send(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let (mut send, mut recv) = connection.open_bi().await?;
+    let _ = send.set_priority(-1);
     framing::write(
         &mut send,
         &Control::new(Kind::FileOffer(FileOffer { name, size })),
@@ -431,18 +593,14 @@ pub async fn fetch(
     };
     let name = safe_name(&offer.name).unwrap_or_else(|| "file".into());
     tokio::fs::create_dir_all(dir).await?;
-    let partial = dir.join(format!(".{name}.casement-part"));
-    let mut file = tokio::fs::File::create(&partial).await?;
+    let (partial, mut file) = TransferTemp::create(dir).await?;
     let result = async {
         read_bytes(&mut recv, &mut file, offer.size, progress).await?;
-        let path = unique_path(dir, &name);
-        tokio::fs::rename(&partial, &path).await?;
+        drop(file);
+        let path = partial.publish(dir, &name)?;
         Ok(path)
     }
     .await;
-    if result.is_err() {
-        let _ = tokio::fs::remove_file(&partial).await;
-    }
     result
 }
 
@@ -482,5 +640,22 @@ mod tests {
             unique_path(dir.path(), "README"),
             dir.path().join("README (1)")
         );
+    }
+
+    #[tokio::test]
+    async fn publish_never_overwrites_and_allocates_collision_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("same.bin");
+        std::fs::write(&original, b"keep existing").unwrap();
+
+        let (temp, mut file) = TransferTemp::create(dir.path()).await.unwrap();
+        file.write_all(b"incoming").await.unwrap();
+        file.sync_all().await.unwrap();
+        drop(file);
+
+        let published = temp.publish(dir.path(), "same.bin").unwrap();
+        assert_eq!(published, dir.path().join("same (1).bin"));
+        assert_eq!(std::fs::read(&original).unwrap(), b"keep existing");
+        assert_eq!(std::fs::read(published).unwrap(), b"incoming");
     }
 }

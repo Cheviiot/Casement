@@ -516,6 +516,107 @@ async fn files_arrive_whole_and_never_overwrite() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_uploads_with_same_name_keep_both_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = start_host(dir.path(), Some(PASSWORD));
+    let me = client_identity(dir.path(), "client");
+    let handshake = client::connect(&me, host.addr, None, &info(false))
+        .await
+        .unwrap();
+    let session = handshake.login(Some(PASSWORD)).await.unwrap();
+
+    let first = vec![0x31; 4_000_000];
+    let second = vec![0xC7; 4_000_000];
+    let sources = dir.path().join("sources");
+    std::fs::create_dir_all(sources.join("first")).unwrap();
+    std::fs::create_dir_all(sources.join("second")).unwrap();
+    let first_path = sources.join("first/same.bin");
+    let second_path = sources.join("second/same.bin");
+    std::fs::write(&first_path, &first).unwrap();
+    std::fs::write(&second_path, &second).unwrap();
+
+    let downloads = dir.path().join("host").join("downloads");
+    std::fs::create_dir_all(&downloads).unwrap();
+    std::fs::write(downloads.join("same.bin"), b"keep existing").unwrap();
+    let (a, b) = tokio::join!(
+        session.send_file(&first_path, |_, _| {}),
+        session.send_file(&second_path, |_, _| {}),
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    assert_ne!(a, b);
+    assert_eq!(
+        std::fs::read(downloads.join("same.bin")).unwrap(),
+        b"keep existing"
+    );
+    let contents = [
+        std::fs::read(downloads.join(a)).unwrap(),
+        std::fs::read(downloads.join(b)).unwrap(),
+    ];
+    assert!(contents.contains(&first));
+    assert!(contents.contains(&second));
+    assert_no_partial_files(&downloads);
+    session.close();
+    host.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_fetches_with_same_name_keep_both_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared = dir.path().join("host").join("shared");
+    std::fs::create_dir_all(shared.join("first")).unwrap();
+    std::fs::create_dir_all(shared.join("second")).unwrap();
+    let first = vec![0x25; 4_000_000];
+    let second = vec![0xD2; 4_000_000];
+    std::fs::write(shared.join("first/same.bin"), &first).unwrap();
+    std::fs::write(shared.join("second/same.bin"), &second).unwrap();
+    let host = start_host(dir.path(), Some(PASSWORD));
+    let me = client_identity(dir.path(), "client");
+    let handshake = client::connect(&me, host.addr, None, &info(false))
+        .await
+        .unwrap();
+    let session = handshake.login(Some(PASSWORD)).await.unwrap();
+
+    let downloads = dir.path().join("client-downloads");
+    std::fs::create_dir_all(&downloads).unwrap();
+    std::fs::write(downloads.join("same.bin"), b"keep existing").unwrap();
+    let (a, b) = tokio::join!(
+        session.fetch_file("first/same.bin", &downloads, |_, _| {}),
+        session.fetch_file("second/same.bin", &downloads, |_, _| {}),
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    assert_ne!(a, b);
+    assert_eq!(
+        std::fs::read(downloads.join("same.bin")).unwrap(),
+        b"keep existing"
+    );
+    let contents = [std::fs::read(a).unwrap(), std::fs::read(b).unwrap()];
+    assert!(contents.contains(&first));
+    assert!(contents.contains(&second));
+    assert_no_partial_files(&downloads);
+    session.close();
+    host.host.close();
+}
+
+fn assert_no_partial_files(dir: &std::path::Path) {
+    let leftovers: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".casement-part")
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no partial files stay behind: {leftovers:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shared_folder_lists_and_downloads_but_never_escapes() {
     let dir = tempfile::tempdir().unwrap();
     let shared = dir.path().join("host").join("shared");
