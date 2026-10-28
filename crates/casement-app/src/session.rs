@@ -712,7 +712,11 @@ impl SessionPage {
             });
             entry.grab_focus();
         } else {
-            yes.grab_focus();
+            if question.yes_style == "destructive-action" {
+                no.grab_focus();
+            } else {
+                yes.grab_focus();
+            }
         }
         rx.await.ok().flatten()
     }
@@ -1525,7 +1529,8 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
                     .await
                     .is_some()
                 {
-                    computer.fingerprint.clear();
+                    // Approval is for this exact key, including the next handshake.
+                    computer.fingerprint = seen.to_hex();
                     page.show_progress("Проверка нового ключа…");
                     continue;
                 }
