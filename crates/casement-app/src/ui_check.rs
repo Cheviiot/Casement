@@ -12,11 +12,16 @@ use adw::prelude::*;
 use crate::store::Store;
 use crate::window::Window;
 
+mod live;
+
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const STATE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn run(window: &Window) -> Result<Vec<String>, String> {
     require_fixture(window)?;
+    if let Some(root) = std::env::var_os("CASEMENT_UI_FIXTURE_ROOT").filter(|v| !v.is_empty()) {
+        return live::run(window, &PathBuf::from(root)).await;
+    }
     let mut checks = Vec::new();
     let navigation = window.navigation();
     wait_tag(&navigation, "home", STATE_TIMEOUT).await?;
@@ -120,7 +125,7 @@ pub async fn run(window: &Window) -> Result<Vec<String>, String> {
     }
     checks.push("edit atomically and reload saved connection".into());
 
-    let mut blocked_file = BlockConnectionsFile::new(&window.core().dir)?;
+    let mut blocked_file = BlockSettingsFile::new(&window.core().dir, "connections.ini")?;
     crate::computer::open(window, &computer.id);
     wait_tag(&navigation, "computer", STATE_TIMEOUT).await?;
     let failed_edit = visible_page(&navigation)?;
@@ -151,6 +156,15 @@ pub async fn run(window: &Window) -> Result<Vec<String>, String> {
 
     window.open_dev_page("settings");
     wait_tag(&navigation, "settings", STATE_TIMEOUT).await?;
+    let settings = descendants(visible_page(&navigation)?.upcast_ref());
+    if find_row(&settings, "Пароль доступа")?.subtitle().as_deref() != Some("Не задан")
+        || find_row(&settings, "Доверенные устройства")?
+            .subtitle()
+            .as_deref()
+            != Some("Нет устройств")
+    {
+        return Err("settings: отсутствующие файлы доступа показаны как ошибка".into());
+    }
     checks.push("open settings".into());
     navigation.pop_to_tag("home");
     window.open_dev_page("set-password");
@@ -188,6 +202,54 @@ pub async fn run(window: &Window) -> Result<Vec<String>, String> {
         return Err("password: тестовый пароль записан открытым текстом".into());
     }
     checks.push("validate and save password without plaintext".into());
+
+    navigation.pop_to_tag("home");
+    let mut blocked_password = BlockSettingsFile::new(&window.core().dir, "host-password")?;
+    window.open_dev_page("settings");
+    let settings = descendants(visible_page(&navigation)?.upcast_ref());
+    let password_row = find_row(&settings, "Пароль доступа")?;
+    if password_row.subtitle().as_deref() != Some("Не удалось прочитать") {
+        return Err("settings: ошибка чтения пароля показана как его отсутствие".into());
+    }
+    password_row.emit_by_name::<()>("activated", &[]);
+    if active_tag(&navigation).as_deref() != Some("settings") {
+        return Err("settings: открыта форма поверх нечитаемого пароля".into());
+    }
+    checks.push("unreadable password is an error and cannot open an empty password form".into());
+    blocked_password.restore()?;
+    navigation.pop_to_tag("home");
+    window.open_dev_page("settings");
+    if password_row.subtitle().as_deref() != Some("Задан") {
+        return Err("settings: пароль не перечитан после восстановления файла".into());
+    }
+    checks.push("password state recovers after the settings file becomes readable".into());
+
+    casement_net::auth::TrustStore::load(&window.core().dir)
+        .and_then(|mut trust| trust.add(window.core().identity.fingerprint(), "GTK fixture"))
+        .map_err(|e| e.to_string())?;
+    let mut blocked_trust = BlockSettingsFile::new(&window.core().dir, "trusted-devices")?;
+    navigation.pop_to_tag("home");
+    window.open_dev_page("settings");
+    let settings = descendants(visible_page(&navigation)?.upcast_ref());
+    if find_row(&settings, "Доверенные устройства")?
+        .subtitle()
+        .as_deref()
+        != Some("Не удалось прочитать")
+    {
+        return Err("settings: ошибка чтения доверенных показана как пустой список".into());
+    }
+    activate_action_row(&settings, "Доверенные устройства")?;
+    wait_tag(&navigation, "trusted", STATE_TIMEOUT).await?;
+    let trusted = descendants(visible_page(&navigation)?.upcast_ref());
+    let retry =
+        find_button(&trusted, "Повторить").ok_or("trusted: нет повторного чтения после ошибки")?;
+    blocked_trust.restore()?;
+    retry.emit_clicked();
+    find_row(
+        &descendants(visible_page(&navigation)?.upcast_ref()),
+        "GTK fixture",
+    )?;
+    checks.push("unreadable trust list shows an error and Retry restores the saved devices".into());
 
     computer = store
         .find(&computer.id)
@@ -302,14 +364,17 @@ fn find_password_entry(
         .ok_or_else(|| format!("не найдена строка пароля «{title}»"))
 }
 
-fn activate_action_row(widgets: &[gtk::Widget], title: &str) -> Result<(), String> {
-    let row = visible_widgets(widgets)
+fn find_row(widgets: &[gtk::Widget], title: &str) -> Result<adw::ActionRow, String> {
+    visible_widgets(widgets)
         .find_map(|widget| {
             let row = widget.clone().downcast::<adw::ActionRow>().ok()?;
             (row.title().as_str() == title).then_some(row)
         })
-        .ok_or_else(|| format!("не найдена строка действия «{title}»"))?;
-    row.emit_by_name::<()>("activated", &[]);
+        .ok_or_else(|| format!("не найдена строка действия «{title}»"))
+}
+
+fn activate_action_row(widgets: &[gtk::Widget], title: &str) -> Result<(), String> {
+    find_row(widgets, title)?.emit_by_name::<()>("activated", &[]);
     Ok(())
 }
 
@@ -359,16 +424,16 @@ async fn wait_until(
     Ok(())
 }
 
-struct BlockConnectionsFile {
+struct BlockSettingsFile {
     path: PathBuf,
     backup: PathBuf,
     blocked: bool,
 }
 
-impl BlockConnectionsFile {
-    fn new(config_dir: &Path) -> Result<Self, String> {
-        let path = config_dir.join("connections.ini");
-        let backup = config_dir.join("connections.ini.ui-check-backup");
+impl BlockSettingsFile {
+    fn new(config_dir: &Path, name: &str) -> Result<Self, String> {
+        let path = config_dir.join(name);
+        let backup = config_dir.join(format!("{name}.ui-check-backup"));
         if !path.is_file() {
             return Err(format!(
                 "ui-check fixture: {} не является файлом",
@@ -382,10 +447,10 @@ impl BlockConnectionsFile {
             ));
         }
         fs::rename(&path, &backup)
-            .map_err(|error| format!("ui-check: резервирование connections.ini: {error}"))?;
+            .map_err(|error| format!("ui-check: резервирование {name}: {error}"))?;
         if let Err(error) = fs::create_dir(&path) {
             let _ = fs::rename(&backup, &path);
-            return Err(format!("ui-check: блокировка connections.ini: {error}"));
+            return Err(format!("ui-check: блокировка {name}: {error}"));
         }
         Ok(Self {
             path,
@@ -401,11 +466,11 @@ impl BlockConnectionsFile {
             self.blocked = false;
         }
         fs::rename(&self.backup, &self.path)
-            .map_err(|error| format!("ui-check: восстановить connections.ini: {error}"))
+            .map_err(|error| format!("ui-check: восстановить файл настроек: {error}"))
     }
 }
 
-impl Drop for BlockConnectionsFile {
+impl Drop for BlockSettingsFile {
     fn drop(&mut self) {
         if self.blocked {
             let _ = fs::remove_dir(&self.path);

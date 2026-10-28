@@ -1,0 +1,30 @@
+#!/bin/sh
+# Real QUIC, H.264 and file pages in a private Broadway window. No desktop input.
+set -eu
+cd "$(dirname "$0")/../.."
+mkdir -p _scratch/ui-live
+work=$(mktemp -d "$PWD/_scratch/ui-live/run.XXXXXX")
+: > "$work/.casement-ui-fixture"
+scripts/dev/in-box scripts/cargo build --locked -p casement --example ui_fixture_host -j 2
+scripts/dev/in-box ./target/debug/examples/ui_fixture_host "$work" >"$work/host.log" 2>&1 &
+host_job=$!
+cleanup() {
+    : > "$work/stop"
+    wait "$host_job" || :
+}
+trap cleanup EXIT INT TERM
+attempt=0
+while [ ! -f "$work/ready" ]; do
+    if ! kill -0 "$host_job" 2>/dev/null || [ "$attempt" -ge 100 ]; then
+        cat "$work/host.log"
+        exit 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+CASEMENT_CONFIG_DIR="$work/client" CASEMENT_UI_FIXTURE_ROOT="$work" \
+    XDG_CONFIG_HOME="$work/xdg" CASEMENT_UI_CHECK="$work/result.txt" \
+    scripts/dev/ui-check "$work/window.png"
+cat "$work/result.txt"
+test "$(head -n 1 "$work/result.txt")" = PASS
+echo "Report and snapshot: $work"

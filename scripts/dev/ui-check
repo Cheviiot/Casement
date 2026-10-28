@@ -22,6 +22,9 @@ exec podman exec -i --user "$(id -un)" -w "$PWD" \
     -e CASEMENT_WINDOW_WIDTH="${CASEMENT_WINDOW_WIDTH:-900}" \
     -e CASEMENT_WINDOW_HEIGHT="${CASEMENT_WINDOW_HEIGHT:-660}" \
     -e CASEMENT_UI_CHECK="${CASEMENT_UI_CHECK:-}" \
+    -e CASEMENT_UI_FIXTURE_ROOT="${CASEMENT_UI_FIXTURE_ROOT:-}" \
+    -e XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}" \
+    -e CASEMENT_DECODER \
     oriel-dev ionice -c 3 nice -n 19 sh -s -- "$display" <<'BROADWAY'
 set -e
 display=$1
