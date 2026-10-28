@@ -14,9 +14,19 @@ curl -sSfL "https://download.gnome.org/sources/libadwaita/$series/libadwaita-$ve
 grep "libadwaita-$version.tar.xz" sums | sha256sum -c -
 tar xf "libadwaita-$version.tar.xz"
 cd "libadwaita-$version"
+# Following Windows' light or dark mode and accent colour needs WinRT, which Libadwaita
+# looks for as <Windows.Foundation.h> and <Windows.UI.ViewManagement.h>; mingw names
+# these headers in lower case, so on a case-sensitive file system they need aliases.
+winrt="$work/winrt-include"
+mingw_include=/usr/x86_64-w64-mingw32/sys-root/mingw/include
+mkdir -p "$winrt"
+ln -s "$mingw_include/windows.foundation.h" "$winrt/Windows.Foundation.h"
+ln -s "$mingw_include/windows.ui.viewmanagement.h" "$winrt/Windows.UI.ViewManagement.h"
 meson setup build-w64 --cross-file /usr/share/mingw/toolchain-mingw64.meson \
     --prefix="$prefix" --buildtype=release -Dintrospection=disabled -Dvapi=false \
-    -Dgtk_doc=false -Dtests=false -Dexamples=false
+    -Dgtk_doc=false -Dtests=false -Dexamples=false \
+    -Dc_args="-I$winrt" -Dc_link_args=-lruntimeobject
+grep -q "HAS_WINRT" build-w64/build.ninja || { echo "WinRT not found" >&2; exit 1; }
 ninja -C build-w64 -j "${JOBS:-$(nproc)}"
 ninja -C build-w64 install
 cd / && rm -rf "$work"
