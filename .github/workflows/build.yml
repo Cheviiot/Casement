@@ -65,8 +65,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Built with Debian's rpmbuild: ALT's own mirrors are very slow from abroad.
           - name: ALT p11
-            image: registry.altlinux.org/p11/base:latest
+            image: docker.io/library/debian:13
             script: packaging/alt/build.sh
             artifact: alt
             files: dist/*.rpm

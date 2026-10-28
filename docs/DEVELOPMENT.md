@@ -48,7 +48,7 @@ scripts/check-glibc target/release/casement   # не новее glibc 2.38 (ALT 
 | Команда | Результат в `dist/` |
 |---|---|
 | `scripts/package-linux` | `casement-ВЕРСИЯ-linux-x86_64.tar.gz` с `install.sh` |
-| `scripts/package-alt` | `casement-ВЕРСИЯ-alt1.x86_64.rpm` (в контейнере ALT p11) |
+| `scripts/package-alt` | `casement-ВЕРСИЯ-alt1.x86_64.rpm` (rpmbuild из Debian 13, зависимости ALT в spec) |
 | `scripts/package-fedora` | `casement-ВЕРСИЯ-1.fc44.x86_64.rpm` (в контейнере Fedora 44) |
 | `scripts/package-deb` | `casement_ВЕРСИЯ_amd64.deb` (в контейнере Debian 13) |
 | `scripts/package-windows` | `casement-ВЕРСИЯ-windows-x86_64-setup.exe` (NSIS) и `-portable.zip` |
