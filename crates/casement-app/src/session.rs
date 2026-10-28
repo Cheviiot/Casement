@@ -382,6 +382,8 @@ pub struct SessionPage {
     gone: Cell<bool>,
     /// Automatic reconnect attempt in progress (0 = none).
     reconnects: Cell<u32>,
+    /// Pending automatic reconnect; cancelled when this page leaves or a flow restarts.
+    reconnect_watch: RefCell<Option<glib::SourceId>>,
     /// New window sizes for a virtual monitor.
     resize_out: RefCell<Option<tokio::sync::mpsc::UnboundedSender<(u32, u32)>>>,
     resize_watch: RefCell<Option<glib::SourceId>>,
@@ -533,6 +535,7 @@ impl SessionPage {
             host_name: RefCell::new(computer.title()),
             gone: Cell::new(false),
             reconnects: Cell::new(0),
+            reconnect_watch: RefCell::new(None),
             resize_watch: RefCell::new(None),
             clipboard_watch: RefCell::new(None),
             pipeline: RefCell::new(None),
@@ -883,6 +886,7 @@ impl SessionPage {
     }
 
     fn shutdown(&self) {
+        self.clear_reconnect_watch();
         if self.window.is_fullscreen() {
             self.set_fullscreen(false);
         }
@@ -921,6 +925,12 @@ impl SessionPage {
         }
         self.sound.set_visible(false);
         self.monitors_button.set_visible(false);
+    }
+
+    fn clear_reconnect_watch(&self) {
+        if let Some(id) = self.reconnect_watch.take() {
+            id.remove();
+        }
     }
 
     /// With more than one monitor on the host, a button that opens the monitor page.
@@ -1252,11 +1262,38 @@ pub async fn check_session_lifetime(window: &Window) -> Result<Vec<String>, Stri
         }
         glib::timeout_future(std::time::Duration::from_millis(10)).await;
     }
+
+    let computer = Computer::new("\0", 47999);
+    let page = session_page(window, &computer);
+    let weak = Rc::downgrade(&page);
+    let reconnect_started = Rc::new(Cell::new(false));
+    page.reconnects.set(1);
+    schedule_reconnect_after(
+        window,
+        &page,
+        &computer,
+        std::time::Duration::from_millis(100),
+        {
+            let reconnect_started = reconnect_started.clone();
+            move |_, _, _| reconnect_started.set(true)
+        },
+    );
+    window.navigation().pop();
+    drop(page);
+    if weak.upgrade().is_some() {
+        return Err("session: reconnect timer retained the page after removal".into());
+    }
+    glib::timeout_future(std::time::Duration::from_millis(150)).await;
+    if reconnect_started.get() {
+        return Err("session: reconnect started after its page was removed".into());
+    }
+
     Ok(vec![
         "session controller survives a completed error flow".into(),
         "covered session remains alive".into(),
         "retry works after an error".into(),
         "session controller is released after leaving".into(),
+        "reconnect timer is cancelled when its page leaves".into(),
     ])
 }
 
@@ -1475,6 +1512,7 @@ fn session_page(window: &Window, computer: &Computer) -> Rc<SessionPage> {
 }
 
 async fn flow(window: Window, page: Rc<SessionPage>, computer: Computer) {
+    page.clear_reconnect_watch();
     if page.gone.get() {
         return;
     }
@@ -1841,13 +1879,40 @@ fn schedule_reconnect(window: &Window, page: &Rc<SessionPage>, computer: &Comput
         "Переподключение через {delay} с · {attempt} из {}",
         RECONNECT_DELAYS.len()
     ));
-    let (window, page, id) = (window.clone(), page.clone(), computer.id.clone());
+    schedule_reconnect_after(
+        window,
+        page,
+        computer,
+        std::time::Duration::from_secs(delay),
+        |window, page, computer| {
+            glib::spawn_future_local(flow(window, page, computer));
+        },
+    );
+}
+
+fn schedule_reconnect_after(
+    window: &Window,
+    page: &Rc<SessionPage>,
+    computer: &Computer,
+    delay: std::time::Duration,
+    reconnect: impl FnOnce(Window, Rc<SessionPage>, Computer) + 'static,
+) {
+    page.clear_reconnect_watch();
+    let (window, weak_page, id) = (window.clone(), Rc::downgrade(page), computer.id.clone());
+    let watch_owner = page.clone();
     let fallback = computer.clone();
-    glib::timeout_add_local_once(std::time::Duration::from_secs(delay), move || {
+    let source = glib::timeout_add_local_once(delay, move || {
+        let Some(page) = weak_page.upgrade() else {
+            return;
+        };
+        // Clear the stored ID before starting a new flow so it cannot remove its own
+        // already-dispatched source if that flow calls shutdown immediately.
+        page.reconnect_watch.borrow_mut().take();
         if page.gone.get() {
             return;
         }
         let computer = window.store().find(&id).unwrap_or(fallback);
-        glib::spawn_future_local(flow(window, page, computer));
+        reconnect(window, page, computer);
     });
+    watch_owner.reconnect_watch.replace(Some(source));
 }

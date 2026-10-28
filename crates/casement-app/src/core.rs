@@ -27,10 +27,24 @@ where
     T: Send + 'static,
 {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    runtime().spawn(async move {
+    let mut task = AbortOnDrop(Some(runtime().spawn(async move {
         let _ = tx.send(future.await);
-    });
-    rx.await.expect("network task ended without an answer")
+    })));
+    let result = rx.await.expect("network task ended without an answer");
+    // The task has sent its result and is finishing. Dropping the JoinHandle detaches
+    // it without cancelling successful work; cancellation while awaiting drops the guard.
+    task.0.take();
+    result
+}
+
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
 }
 
 /// What every part of the application needs to reach the core.
@@ -76,6 +90,53 @@ pub fn config_dir() -> PathBuf {
         return dir;
     }
     glib::user_config_dir().join("casement")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    struct DropProbe(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[test]
+    fn dropping_run_future_aborts_the_network_task() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+            let waiting = tokio::spawn(async move {
+                run(async move {
+                    let _probe = DropProbe(Some(dropped_tx));
+                    let _ = started_tx.send(());
+                    std::future::pending::<()>().await;
+                })
+                .await
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), started_rx)
+                .await
+                .expect("network task did not start")
+                .expect("start signal was dropped");
+            waiting.abort();
+            let _ = waiting.await;
+            tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+                .await
+                .expect("dropping run did not abort its task")
+                .expect("drop probe was not notified");
+        });
+    }
 }
 
 /// Russian text for people.
