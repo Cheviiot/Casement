@@ -134,8 +134,39 @@ pub(super) async fn run(window: &Window, root: &Path) -> Result<Vec<String>, Str
     checks.push(
         "page picker selects two files and sequential uploads preserve their contents".into(),
     );
+    let cancel_row = row(files.upcast_ref(), "cancel.bin")?;
+    tooltip_button(cancel_row.upcast_ref(), "Скачать")?.emit_clicked();
+    wait_until("download has partial data", STATE_TIMEOUT, || {
+        has_partial(&root)
+    })
+    .await?;
+    tooltip_button(cancel_row.upcast_ref(), "Отменить скачивание")?.emit_clicked();
+    wait_until("cancel removes partial download", STATE_TIMEOUT, || {
+        !has_partial(&root)
+    })
+    .await?;
+    if root.join("downloads/cancel.bin").exists() {
+        return Err("live files: cancelled download was published".into());
+    }
+    tooltip_button(cancel_row.upcast_ref(), "Скачать")?.emit_clicked();
+    wait_until("second download has partial data", STATE_TIMEOUT, || {
+        has_partial(&root)
+    })
+    .await?;
     navigation.pop();
     wait_tag(&navigation, "session", STATE_TIMEOUT).await?;
+    wait_until(
+        "leaving files removes partial download",
+        STATE_TIMEOUT,
+        || !has_partial(&root),
+    )
+    .await?;
+    if root.join("downloads/cancel.bin").exists() {
+        return Err("live files: leaving the page did not cancel the download".into());
+    }
+    checks.push(
+        "cancel and leaving Files both stop in-flight downloads and clean partial files".into(),
+    );
     let before = frame_updates.get();
     wait_until(
         "video keeps updating after file pages",
@@ -201,4 +232,16 @@ async fn wait_frame(picture: &gtk::Picture) -> Result<(), String> {
             .is_some_and(|frame| frame.intrinsic_width() == 640 && frame.intrinsic_height() == 360)
     })
     .await
+}
+
+fn has_partial(root: &Path) -> bool {
+    fs::read_dir(root.join("downloads")).is_ok_and(|entries| {
+        entries.filter_map(Result::ok).any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".casement-")
+                && entry.metadata().is_ok_and(|m| m.len() > 0)
+        })
+    })
 }

@@ -152,6 +152,8 @@ fn seed(root: &Path) -> std::io::Result<()> {
     std::fs::write(root.join("shared/visible.txt"), "download fixture\n")?;
     std::fs::write(root.join("shared/.hidden.txt"), "hidden fixture\n")?;
     std::fs::write(root.join("shared/folder/nested.txt"), "nested fixture\n")?;
+    // Sparse data makes it possible to observe and cancel a real in-flight fetch.
+    std::fs::File::create(root.join("shared/cancel.bin"))?.set_len(128 * 1024 * 1024)?;
     std::fs::write(root.join("downloads/upload-a.txt"), "first upload\n")?;
     std::fs::write(root.join("downloads/upload-b.txt"), "second upload\n")?;
     std::fs::write(
