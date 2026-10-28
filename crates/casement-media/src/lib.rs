@@ -210,11 +210,38 @@ pub fn use_bundled_gstreamer() {
         if scanner.is_file() {
             std::env::set_var("GST_PLUGIN_SCANNER_1_0", scanner);
         }
-        // Our own plugin cache: a system-wide GStreamer must not share it.
-        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-            let dir = std::path::Path::new(&local).join("casement");
-            let _ = std::fs::create_dir_all(&dir);
-            std::env::set_var("GST_REGISTRY_1_0", dir.join("gstreamer-registry.bin"));
+        // Our own plugin cache, never a system-wide GStreamer's: the one the installer made
+        // next to the plugins, else one per user (scanning takes a minute the first time).
+        let shared = bundled_registry(&root);
+        if std::env::var_os("GST_REGISTRY_1_0").is_none() {
+            if shared.is_file() {
+                std::env::set_var("GST_REGISTRY_1_0", shared);
+            } else if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+                let dir = std::path::Path::new(&local).join("casement");
+                let _ = std::fs::create_dir_all(&dir);
+                std::env::set_var("GST_REGISTRY_1_0", dir.join("gstreamer-registry.bin"));
+            }
         }
     }
+}
+
+#[cfg(windows)]
+fn bundled_registry(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("lib").join("gstreamer-registry.bin")
+}
+
+/// Installer step (Windows): scans the bundled plugins once into the shared cache, so that
+/// the first start of each program after installing is not held up by it.
+pub fn prepare_bundled_gstreamer() -> Result<(), String> {
+    #[cfg(windows)]
+    if let Some(root) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.parent()?.to_path_buf()))
+    {
+        let shared = bundled_registry(&root);
+        let _ = std::fs::remove_file(&shared);
+        std::env::set_var("GST_REGISTRY_1_0", shared);
+    }
+    use_bundled_gstreamer();
+    gstreamer::init().map_err(|e| e.to_string())
 }

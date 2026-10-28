@@ -55,7 +55,16 @@ fn init_logging(file: Option<PathBuf>) {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        std::fs::File::create(path).ok()
+        // Each worker appends (a desktop switch starts a new one); past 1 MB the log starts
+        // over, keeping the previous one as .old.
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 1 << 20) {
+            let _ = std::fs::rename(&path, path.with_extension("old"));
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
     });
     match file {
         Some(file) => tracing_subscriber::fmt()
@@ -71,8 +80,14 @@ fn init_logging(file: Option<PathBuf>) {
 }
 
 fn main() -> std::process::ExitCode {
-    casement_media::use_bundled_gstreamer();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--prepare") {
+        return match casement_media::prepare_bundled_gstreamer() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(_) => std::process::ExitCode::FAILURE,
+        };
+    }
+    casement_media::use_bundled_gstreamer();
 
     #[cfg(windows)]
     if args.first().map(String::as_str) == Some("--service") {

@@ -104,6 +104,8 @@ Section "!$(MainSection)" SecMain
   ; trusted devices): readable by every user.
   CreateDirectory "$1\Casement\public"
   nsExec::Exec 'icacls "$1\Casement\public" /grant *S-1-5-32-545:(OI)(CI)RX'
+  ; Scan the GStreamer plugins once for every program and user (a minute on first use).
+  nsExec::Exec '"$INSTDIR\bin\casement-host.exe" --prepare'
   nsExec::Exec 'sc query Casement'
   Pop $0
   ${If} $0 == 0

@@ -437,13 +437,18 @@ impl Window {
 
     fn start_discovery(&self) {
         let own = self.0.core.identity.fingerprint();
+        // With the Windows service this computer announces the machine's key instead.
+        let machine = service::machine_access().map(|m| m.fingerprint);
         let (tx, rx) = async_channel::unbounded::<DiscoveryEvent>();
         runtime().spawn(async move {
             let Ok(browser) = Browser::start() else {
                 return;
             };
             while let Some(event) = browser.next().await {
-                if matches!(&event, DiscoveryEvent::Found(peer) if peer.fingerprint == own) {
+                if matches!(&event, DiscoveryEvent::Found(peer)
+                    if peer.fingerprint == own
+                        || machine.as_deref() == Some(peer.fingerprint.display().as_str()))
+                {
                     continue;
                 }
                 if tx.send(event).await.is_err() {

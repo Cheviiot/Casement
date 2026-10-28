@@ -52,9 +52,30 @@ impl Core {
 }
 
 pub fn config_dir() -> PathBuf {
-    std::env::var_os("CASEMENT_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| glib::user_config_dir().join("casement"))
+    if let Some(dir) = std::env::var_os("CASEMENT_CONFIG_DIR") {
+        return PathBuf::from(dir);
+    }
+    #[cfg(windows)]
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        // %APPDATA%, as casement-cli and casement-host use (GLib's own choice is
+        // %LOCALAPPDATA%, where 0.1.0 kept them: moved over once).
+        let dir = PathBuf::from(appdata).join("casement");
+        let old = glib::user_config_dir().join("casement");
+        if !dir.join("device.key").exists() && old.join("device.key").exists() {
+            let _ = std::fs::create_dir_all(&dir);
+            for name in [
+                "device.key",
+                "connections.ini",
+                "host-password",
+                "trusted-devices",
+                "accept-off",
+            ] {
+                let _ = std::fs::copy(old.join(name), dir.join(name));
+            }
+        }
+        return dir;
+    }
+    glib::user_config_dir().join("casement")
 }
 
 /// Russian text for people.
