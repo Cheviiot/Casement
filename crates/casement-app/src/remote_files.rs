@@ -84,6 +84,7 @@ struct FileWidgets {
     subtitle: String,
     button: gtk::Button,
     progress: gtk::ProgressBar,
+    cancel: gtk::Button,
     stack: gtk::Stack,
 }
 
@@ -144,6 +145,7 @@ struct Browser {
     generation: Cell<u64>,
     gone: Cell<bool>,
     next_download: Cell<u64>,
+    download_cancel: RefCell<BTreeMap<String, tokio::sync::oneshot::Sender<()>>>,
     uploads: RefCell<UploadQueue>,
     upload_widgets: UploadWidgets,
     upload_cancel: RefCell<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -257,6 +259,7 @@ pub fn open(window: &Window, files: FileSender, host: &str, initial_uploads: Vec
         generation: Cell::new(0),
         gone: Cell::new(false),
         next_download: Cell::new(0),
+        download_cancel: RefCell::new(BTreeMap::new()),
         uploads: RefCell::new(UploadQueue::default()),
         upload_widgets,
         upload_cancel: RefCell::new(None),
@@ -279,7 +282,7 @@ pub fn open(window: &Window, files: FileSender, host: &str, initial_uploads: Vec
     let weak = Rc::downgrade(&browser);
     browser.upload_widgets.cancel.connect_clicked(move |_| {
         if let Some(browser) = weak.upgrade() {
-            browser.cancel_uploads();
+            browser.cancel_uploads(true);
         }
     });
     let weak = Rc::downgrade(&browser);
@@ -335,6 +338,16 @@ pub fn open(window: &Window, files: FileSender, host: &str, initial_uploads: Vec
                 if let Some(browser) = keep.take() {
                     browser.gone.set(true);
                     browser.generation.set(browser.generation.get() + 1);
+                    browser.cancel_uploads(false);
+                    let downloads = browser
+                        .download_cancel
+                        .borrow()
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for path in downloads {
+                        browser.cancel_download(&path, false);
+                    }
                 }
                 if let Some(id) = handler2.take() {
                     navigation.disconnect(id);
@@ -526,7 +539,7 @@ impl Browser {
                     }
                 }
                 None => {
-                    this.cancel_uploads();
+                    this.cancel_uploads(true);
                     return;
                 }
             }
@@ -534,11 +547,14 @@ impl Browser {
         });
     }
 
-    fn cancel_uploads(self: &Rc<Self>) {
+    fn cancel_uploads(self: &Rc<Self>, show_result: bool) {
         self.uploads.borrow_mut().cancel();
         self.upload_id.set(self.upload_id.get().wrapping_add(1));
         if let Some(cancel) = self.upload_cancel.take() {
             let _ = cancel.send(());
+        }
+        if !show_result {
+            return;
         }
         let detail = if self.uploaded.get() > 0 {
             format!("Отправлено файлов: {}", self.uploaded.get())
@@ -685,8 +701,16 @@ impl Browser {
                 .valign(gtk::Align::Center)
                 .build();
             let stack = gtk::Stack::builder().valign(gtk::Align::Center).build();
+            let cancel = pages::flat_icon("process-stop-symbolic", "Отменить скачивание");
+            let transfer = gtk::Box::builder()
+                .spacing(6)
+                .valign(gtk::Align::Center)
+                .build();
+            transfer.append(&progress);
+            transfer.append(&cancel);
+            stack.set_hhomogeneous(false);
             stack.add_named(&button, Some("action"));
-            stack.add_named(&progress, Some("progress"));
+            stack.add_named(&transfer, Some("progress"));
             row.add_suffix(&stack);
             row.set_activatable_widget(Some(&button));
             let weak = Rc::downgrade(self);
@@ -697,6 +721,13 @@ impl Browser {
                     browser.download(download_path.clone(), name.clone());
                 }
             });
+            let weak = Rc::downgrade(self);
+            let cancel_path = path.clone();
+            cancel.connect_clicked(move |_| {
+                if let Some(browser) = weak.upgrade() {
+                    browser.cancel_download(&cancel_path, true);
+                }
+            });
             self.rows.borrow_mut().insert(
                 path.clone(),
                 FileWidgets {
@@ -704,6 +735,7 @@ impl Browser {
                     subtitle,
                     button,
                     progress,
+                    cancel,
                     stack,
                 },
             );
@@ -722,6 +754,7 @@ impl Browser {
             Some(Download::Active {
                 received, total, ..
             }) => {
+                widgets.cancel.set_visible(true);
                 let fraction = if *total == 0 {
                     0.0
                 } else {
@@ -737,6 +770,7 @@ impl Browser {
                 widgets.stack.set_visible_child_name("progress");
             }
             Some(Download::Complete(saved)) => {
+                widgets.cancel.set_visible(false);
                 widgets
                     .row
                     .set_subtitle(&format!("{} · Скачано", widgets.subtitle));
@@ -748,6 +782,7 @@ impl Browser {
                 widgets.stack.set_visible_child_name("action");
             }
             Some(Download::Failed(message)) => {
+                widgets.cancel.set_visible(false);
                 widgets
                     .row
                     .set_subtitle(&format!("{} · Ошибка", widgets.subtitle));
@@ -758,6 +793,7 @@ impl Browser {
                 widgets.stack.set_visible_child_name("action");
             }
             None => {
+                widgets.cancel.set_visible(false);
                 widgets.row.set_subtitle(&widgets.subtitle);
                 widgets.button.set_icon_name("folder-download-symbolic");
                 widgets.button.set_tooltip_text(Some("Скачать"));
@@ -785,6 +821,10 @@ impl Browser {
             },
         );
         self.update_download(&path);
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        self.download_cancel
+            .borrow_mut()
+            .insert(path.clone(), cancel_tx);
         let (tx, rx) = async_channel::bounded::<(u64, u64)>(1);
         let weak = Rc::downgrade(self);
         let progress_path = path.clone();
@@ -819,22 +859,25 @@ impl Browser {
             let remote_path = path.clone();
             let result = run(async move {
                 let mut last = std::time::Instant::now();
-                files
-                    .fetch(&remote_path, &dir, move |received, total| {
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx => None,
+                    result = files.fetch(&remote_path, &dir, move |received, total| {
                         if last.elapsed().as_millis() >= 100 || received == total {
                             last = std::time::Instant::now();
                             let _ = tx.try_send((received, total));
                         }
-                    })
-                    .await
+                    }) => Some(result),
+                }
             })
             .await;
             if !matches!(this.downloads.borrow().get(&path), Some(Download::Active { id: current, .. }) if *current == id)
             {
                 return;
             }
+            this.download_cancel.borrow_mut().remove(&path);
             match result {
-                Ok(saved) => {
+                Some(Ok(saved)) => {
                     let saved_name = saved
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
@@ -844,18 +887,39 @@ impl Browser {
                         .insert(path.clone(), Download::Complete(saved_name.clone()));
                     this.window.toast(&format!("Скачано: {saved_name}"));
                 }
-                Err(error) => {
+                Some(Err(error)) => {
                     let message = describe(&error);
                     this.downloads
                         .borrow_mut()
                         .insert(path.clone(), Download::Failed(message.clone()));
                     this.window.toast(&format!("«{name}»: {message}"));
                 }
+                None => return,
             }
             if !this.gone.get() {
                 this.update_download(&path);
             }
         });
+    }
+
+    fn cancel_download(&self, path: &str, show_result: bool) {
+        let active = matches!(
+            self.downloads.borrow().get(path),
+            Some(Download::Active { .. })
+        );
+        if !active {
+            return;
+        }
+        if let Some(cancel) = self.download_cancel.borrow_mut().remove(path) {
+            let _ = cancel.send(());
+        }
+        self.downloads.borrow_mut().remove(path);
+        if !self.gone.get() {
+            self.update_download(path);
+            if show_result {
+                self.window.toast("Скачивание отменено");
+            }
+        }
     }
 }
 
