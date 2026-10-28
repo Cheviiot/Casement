@@ -54,6 +54,14 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.1.1" date="2026-10-28">
+      <description>
+        <p>On Windows Casement runs as a service: it accepts connections from the moment Windows
+          starts and shows the login screen, the lock screen and UAC prompts.</p>
+        <p>On Windows the application opens at once after installing and shares one settings
+          folder with casement-cli.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-10-28">
       <description>
         <p>First public release.</p>

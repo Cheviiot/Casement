@@ -10,7 +10,7 @@ publish.workspace = true
 
 [dependencies]
 argon2 = "0.5"
-casement-proto = { version = "0.1.0", path = "../casement-proto" }
+casement-proto = { version = "0.1.1", path = "../casement-proto" }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 libc = "0.2.191"
 mdns-sd = { version = "0.21.6", features = ["async"] }
