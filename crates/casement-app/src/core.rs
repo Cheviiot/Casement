@@ -93,7 +93,7 @@ pub fn config_dir() -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+mod cancellation_tests {
     use super::*;
     use std::time::Duration;
 

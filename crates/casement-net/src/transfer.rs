@@ -15,9 +15,6 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-#[cfg(target_os = "linux")]
-use std::{ffi::CString, os::unix::ffi::OsStrExt};
-
 use casement_proto::{
     control::Kind, Control, ErrorCode, FileDone, FileEntry, FileFetch, FileList, FileListing,
     FileOffer, FileReply, Message, MAX_CONTROL_FRAME,
@@ -79,7 +76,7 @@ impl TransferTemp {
             } else {
                 dir.join(format!("{stem} ({n}){ext}"))
             };
-            match rename_noreplace(&self.path, &candidate) {
+            match crate::files::rename_noreplace(&self.path, &candidate) {
                 Ok(()) => {
                     self.remove();
                     return Ok(candidate);
@@ -94,89 +91,6 @@ impl TransferTemp {
     fn remove(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
-}
-
-/// Atomically moves a completed temporary file to an unused destination path.
-#[cfg(target_os = "linux")]
-fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-    let from = CString::new(from.as_os_str().as_bytes())
-        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    let to = CString::new(to.as_os_str().as_bytes())
-        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    // SAFETY: both C strings are NUL-terminated and live through the call; paths share
-    // a destination directory, and renameat2 atomically refuses an existing target.
-    let result = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            from.as_ptr(),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(windows)]
-fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        #[link_name = "MoveFileW"]
-        fn move_file_w(existing: *const u16, new: *const u16) -> i32;
-    }
-
-    fn extended_path(path: &Path) -> Vec<u16> {
-        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-        const EXTENDED: &[u16] = &[92, 92, 63, 92]; // \\?\
-        const UNC: &[u16] = &[92, 92];
-        let mut result = if wide.starts_with(EXTENDED) {
-            wide
-        } else if wide.starts_with(UNC) {
-            [EXTENDED, &[85, 78, 67, 92], &wide[2..]].concat()
-        } else {
-            [EXTENDED, &wide].concat()
-        };
-        result.push(0);
-        result
-    }
-
-    let from_wide = extended_path(&std::fs::canonicalize(from)?);
-    let parent = to
-        .parent()
-        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-    let name = to
-        .file_name()
-        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-    let target = std::fs::canonicalize(parent)?.join(name);
-    let to_wide = extended_path(&target);
-    // SAFETY: both paths are valid, NUL-terminated UTF-16 strings for the duration of
-    // the call. MoveFileW is same-volume atomic and fails if the destination exists.
-    let result = unsafe { move_file_w(from_wide.as_ptr(), to_wide.as_ptr()) };
-    if result != 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-    std::fs::hard_link(from, to)?;
-    let _ = std::fs::remove_file(from);
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-    std::fs::hard_link(from, to)?;
-    let _ = std::fs::remove_file(from);
-    Ok(())
 }
 
 impl Drop for TransferTemp {
@@ -827,7 +741,7 @@ mod tests {
         .unwrap();
         let mut client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
         client_config.transport_config(Arc::new(crate::transport_config()));
-        let client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         client.set_default_client_config(client_config);
         let connection = client
             .connect(address, crate::tls::SERVER_NAME)
@@ -983,7 +897,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             }
             write_control(
                 &mut send,
@@ -994,6 +908,8 @@ mod tests {
             )
             .await
             .unwrap();
+            send.finish().unwrap();
+            let _ = send.stopped().await;
         });
         let dir = tempfile::tempdir().unwrap();
         let mut file = tokio::fs::File::create(dir.path().join("slow.bin"))
@@ -1004,10 +920,10 @@ mod tests {
             &mut file,
             4,
             |_, _| {},
-            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(200),
         )
         .await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
         assert_eq!(std::fs::read(dir.path().join("slow.bin")).unwrap(), b"abcd");
         peer_task.await.unwrap();
     }
@@ -1119,11 +1035,8 @@ mod tests {
             let (_peer_send, mut peer_recv) = peer.accept_bi().await.unwrap();
             let mut bytes = Vec::new();
             let mut buf = [0u8; 8];
-            loop {
-                match peer_recv.read(&mut buf).await {
-                    Ok(Some(n)) => bytes.extend_from_slice(&buf[..n]),
-                    Ok(None) | Err(_) => break,
-                }
+            while let Ok(Some(n)) = peer_recv.read(&mut buf).await {
+                bytes.extend_from_slice(&buf[..n]);
             }
             bytes_tx.send(bytes).unwrap();
         });
