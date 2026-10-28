@@ -40,10 +40,11 @@
 ## Get started
 
 1. Install Casement on both computers. Accepting connections is on by default.
-2. On the computer you will connect to, set an access password: **Этот компьютер →
+2. On the computer you will connect to, set an access password: **Настройки →
    Пароль доступа**, or `casement-cli setup` in a terminal.
-3. On your computer, pick it under **В этой сети**, or type its address or Tailscale
-   name. Enter the password once; from then on the device is trusted.
+3. On your computer, choose **Добавить**, then **В локальной сети** or **По адресу**.
+   Click the saved connection to connect. Enter the password once; from then on
+   the device is trusted.
 
 ## Without a desktop
 

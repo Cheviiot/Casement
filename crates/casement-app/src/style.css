@@ -1,0 +1,23 @@
+.remote-screen { background: #111318; }
+.device-icon {
+  background: alpha(@accent_bg_color, 0.10);
+  color: @accent_bg_color;
+  border-radius: 12px;
+}
+.device-row { padding: 12px 8px; }
+.device-row .title { font-weight: 600; }
+.device-row .subtitle { opacity: 0.64; }
+.primary-action { padding: 10px 22px; border-radius: 10px; font-weight: 700; }
+.section-heading { font-size: 26px; font-weight: 800; letter-spacing: -0.5px; }
+.page-caption { opacity: 0.65; }
+.fingerprint { font-size: 13px; line-height: 1.8; }
+.status-compact { min-height: 180px; }
+.status-compact .icon { -gtk-icon-size: 48px; }
+.empty-connections .icon { -gtk-icon-size: 64px; }
+.state-icon { color: @accent_bg_color; }
+.file-row { padding: 4px; }
+.session-tools { padding: 6px 12px; }
+.session-status { font-size: 12px; opacity: 0.65; }
+.transfer-row { padding: 8px 12px; }
+.transfer-progress { min-width: 80px; }
+.validation { font-size: 12px; margin: 6px 4px 0; }

@@ -81,21 +81,23 @@ pub fn config_dir() -> PathBuf {
 /// Russian text for people.
 pub fn describe(error: &NetError) -> String {
     match error {
-        NetError::Timeout | NetError::Connection(_) => {
-            "Компьютер не ответил. Проверьте адрес и что на нём разрешены подключения в Casement".into()
-        }
+        NetError::Timeout | NetError::Connection(_) => "Компьютер не ответил".into(),
         NetError::AuthFailed => "Неверный пароль".into(),
         NetError::PasswordRequired => "Нужен пароль доступа".into(),
-        NetError::Refused { code, retry_after, message } => match code {
-            ErrorCode::NoPasswordSet => {
-                "На том компьютере не задан пароль доступа: подключиться могут только доверенные устройства".into()
-            }
-            ErrorCode::RateLimited => format!("Слишком много неудачных попыток. Повторите через {retry_after} с"),
+        NetError::Refused {
+            code,
+            retry_after,
+            message,
+        } => match code {
+            ErrorCode::NoPasswordSet => "На том компьютере не задан пароль доступа".into(),
+            ErrorCode::RateLimited => format!("Повторите через {retry_after} с"),
             ErrorCode::VersionMismatch => format!("Другая версия протокола Casement: {message}"),
             ErrorCode::NotAllowed => "Тот компьютер не разрешает показ экрана".into(),
             _ => format!("Компьютер отказал: {message}"),
         },
-        NetError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => "Компьютер с таким именем не найден".into(),
+        NetError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            "Компьютер с таким именем не найден".into()
+        }
         NetError::Protocol(message) => match known_refusal(message) {
             Some(text) => text.into(),
             None => format!("Ошибка соединения: {message}"),

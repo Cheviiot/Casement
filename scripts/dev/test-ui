@@ -1,0 +1,14 @@
+#!/bin/sh
+# Real GTK signals in a private Broadway window, with a disposable settings profile.
+# Requires a debug build. No operating-system keyboard or pointer events are sent.
+set -eu
+cd "$(dirname "$0")/../.."
+mkdir -p _scratch/ui-tests
+work=$(mktemp -d "$PWD/_scratch/ui-tests/run.XXXXXX")
+mkdir "$work/config"
+: > "$work/config/.casement-ui-fixture"
+CASEMENT_CONFIG_DIR="$work/config" CASEMENT_UI_CHECK="$work/result.txt" \
+    scripts/dev/ui-check "$work/window.png"
+cat "$work/result.txt"
+test "$(head -n 1 "$work/result.txt")" = PASS
+echo "Report and snapshot: $work"

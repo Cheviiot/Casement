@@ -10,6 +10,17 @@ pub fn preferences(
     content: &adw::PreferencesPage,
     header_end: Option<&gtk::Widget>,
 ) -> adw::NavigationPage {
+    content.add_css_class("casement-preferences");
+    frame(title, tag, content, header_end)
+}
+
+/// The same chrome for forms, browsers and status pages. The title is shown once.
+pub fn frame(
+    title: &str,
+    tag: &str,
+    content: &impl IsA<gtk::Widget>,
+    header_end: Option<&gtk::Widget>,
+) -> adw::NavigationPage {
     let header = adw::HeaderBar::new();
     if let Some(widget) = header_end {
         header.pack_end(widget);
@@ -24,37 +35,67 @@ pub fn preferences(
         .build()
 }
 
-/// The top of a page: a large icon, a title and a line under it, centred.
+/// A restrained page identity; callers use a different page title, or omit this block.
 pub fn hero(icon: &str, title: &str, subtitle: &str) -> (gtk::Box, gtk::Label, gtk::Label) {
-    let image = gtk::Image::builder()
-        .icon_name(icon)
-        .pixel_size(72)
-        .css_classes(["dim-label"])
-        .margin_bottom(6)
-        .build();
+    let image = icon_tile(icon);
     let heading = gtk::Label::builder()
         .label(title)
         .wrap(true)
-        .justify(gtk::Justification::Center)
-        .css_classes(["title-1"])
+        .xalign(0.0)
+        .css_classes(["title-2"])
         .build();
     let line = gtk::Label::builder()
         .label(subtitle)
         .wrap(true)
-        .justify(gtk::Justification::Center)
+        .xalign(0.0)
         .css_classes(["dim-label"])
         .build();
     let column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(6)
-        .halign(gtk::Align::Center)
-        .margin_top(12)
+        .spacing(4)
+        .valign(gtk::Align::Center)
+        .hexpand(true)
         .build();
-    column.append(&image);
     column.append(&heading);
     column.append(&line);
+    let identity = gtk::Box::builder()
+        .spacing(16)
+        .margin_top(8)
+        .margin_bottom(8)
+        .build();
+    identity.append(&image);
+    identity.append(&column);
     line.set_visible(!subtitle.is_empty());
-    (column, heading, line)
+    (identity, heading, line)
+}
+
+pub fn icon_tile(icon: &str) -> gtk::Image {
+    gtk::Image::builder()
+        .icon_name(icon)
+        .pixel_size(24)
+        .width_request(48)
+        .height_request(48)
+        .valign(gtk::Align::Center)
+        .css_classes(["device-icon"])
+        .build()
+}
+
+pub fn scrolled(content: &impl IsA<gtk::Widget>, maximum: i32) -> gtk::ScrolledWindow {
+    let clamp = adw::Clamp::builder()
+        .maximum_size(maximum)
+        .tightening_threshold(560)
+        .child(content)
+        .margin_top(24)
+        .margin_bottom(32)
+        .margin_start(18)
+        .margin_end(18)
+        .valign(gtk::Align::Start)
+        .build();
+    gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&clamp)
+        .vexpand(true)
+        .build()
 }
 
 /// A preferences group holding one widget, without a frame: heroes and big buttons.
@@ -69,7 +110,7 @@ pub fn pill(label: &str, style: &str) -> gtk::Button {
     gtk::Button::builder()
         .label(label)
         .halign(gtk::Align::Center)
-        .css_classes(["pill", style])
+        .css_classes(["primary-action", style])
         .build()
 }
 
@@ -87,9 +128,11 @@ pub fn link_row(icon: &str, title: &str, subtitle: &str) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title(glib::markup_escape_text(title).as_str())
         .subtitle(glib::markup_escape_text(subtitle).as_str())
+        .title_lines(1)
+        .subtitle_lines(1)
         .activatable(true)
         .build();
-    row.add_prefix(&gtk::Image::from_icon_name(icon));
+    row.add_prefix(&icon_tile(icon));
     row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
     row
 }
@@ -107,20 +150,7 @@ pub fn fingerprint_label(display: &str) -> gtk::Label {
     gtk::Label::builder()
         .label(fingerprint_lines(display))
         .justify(gtk::Justification::Center)
-        .css_classes(["monospace", "title-3"])
-        .build()
-}
-
-pub fn placeholder(text: &str) -> gtk::Label {
-    gtk::Label::builder()
-        .label(text)
-        .margin_top(18)
-        .margin_bottom(18)
-        .margin_start(12)
-        .margin_end(12)
-        .wrap(true)
-        .justify(gtk::Justification::Center)
-        .css_classes(["dim-label"])
+        .css_classes(["monospace", "fingerprint"])
         .build()
 }
 

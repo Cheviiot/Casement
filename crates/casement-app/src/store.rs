@@ -17,6 +17,8 @@ pub struct Computer {
     pub fingerprint: String,
     /// Ask for a virtual monitor the size of the window instead of the host's screen.
     pub virtual_monitor: bool,
+    /// Most recent successful connection, as Unix seconds; zero means never.
+    pub last_connected: i64,
 }
 
 impl Computer {
@@ -28,6 +30,7 @@ impl Computer {
             port,
             fingerprint: String::new(),
             virtual_monitor: false,
+            last_connected: 0,
         }
     }
 
@@ -49,16 +52,35 @@ impl Computer {
             format!("{}:{}", self.host, self.port)
         }
     }
+
+    /// Record a successful connection using whole Unix seconds.
+    pub fn mark_connected(&mut self) {
+        self.last_connected = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .min(i64::MAX as u64) as i64;
+    }
 }
 
 /// Accepts "host", "host:port", "[ipv6]" and "[ipv6]:port".
 pub fn parse_address(text: &str) -> Option<(String, u16)> {
+    if text.chars().any(char::is_control) {
+        return None;
+    }
     let value = text.trim();
-    if value.is_empty() || value.contains([' ', '/', '@']) {
+    if value.is_empty()
+        || value.chars().any(char::is_whitespace)
+        || value.contains(['/', '@', '?', '#'])
+        || value.contains("://")
+    {
         return None;
     }
     let (host, port) = if let Some(rest) = value.strip_prefix('[') {
         let (host, after) = rest.split_once(']')?;
+        if !valid_ipv6(host) {
+            return None;
+        }
         match after {
             "" => (host, None),
             _ => (host, Some(after.strip_prefix(':')?)),
@@ -67,9 +89,12 @@ pub fn parse_address(text: &str) -> Option<(String, u16)> {
         let (host, port) = value.split_once(':')?;
         (host, Some(port))
     } else {
+        if value.contains(':') && !valid_ipv6(value) {
+            return None;
+        }
         (value, None)
     };
-    if host.is_empty() {
+    if host.is_empty() || (!host.contains(':') && !valid_hostname(host)) {
         return None;
     }
     let port = match port {
@@ -77,6 +102,45 @@ pub fn parse_address(text: &str) -> Option<(String, u16)> {
         None => DEFAULT_PORT,
     };
     Some((host.to_string(), port))
+}
+
+fn valid_hostname(host: &str) -> bool {
+    host.strip_suffix('.')
+        .unwrap_or(host)
+        .split('.')
+        .all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+        })
+}
+
+fn valid_ipv6(host: &str) -> bool {
+    let address = if let Some((address, zone)) = host.split_once('%') {
+        if zone.is_empty()
+            || !zone
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return false;
+        }
+        address
+    } else {
+        host
+    };
+    address.parse::<std::net::Ipv6Addr>().is_ok()
+}
+
+fn sort_computers(items: &mut [Computer]) {
+    items.sort_by(|a, b| {
+        a.title()
+            .to_lowercase()
+            .cmp(&b.title().to_lowercase())
+            .then_with(|| a.address().to_lowercase().cmp(&b.address().to_lowercase()))
+    });
 }
 
 fn is_fingerprint(text: &str) -> bool {
@@ -143,13 +207,18 @@ impl Store {
                             String::new()
                         },
                         virtual_monitor: file.boolean(group, "virtual-monitor").unwrap_or(false),
+                        last_connected: file
+                            .int64(group, "last-connected")
+                            .ok()
+                            .filter(|&seconds| seconds > 0)
+                            .unwrap_or(0),
                     });
                 }
             }
             Err(e) if e.matches(glib::FileError::Noent) => {}
             Err(e) => glib::g_warning!("Casement", "Cannot read {}: {}", path.display(), e),
         }
-        items.sort_by_key(|c| c.title().to_lowercase());
+        sort_computers(&mut items);
         self.0.borrow_mut().items = items;
         self.notify();
     }
@@ -166,6 +235,7 @@ impl Store {
             if item.virtual_monitor {
                 file.set_boolean(&item.id, "virtual-monitor", true);
             }
+            file.set_int64(&item.id, "last-connected", item.last_connected.max(0));
         }
         let path = self.path();
         if let Some(dir) = path.parent() {
@@ -210,22 +280,30 @@ impl Store {
     }
 
     pub fn put(&self, item: Computer) -> Result<(), String> {
+        let previous = self.0.borrow().items.clone();
         {
             let mut inner = self.0.borrow_mut();
             match inner.items.iter_mut().find(|c| c.id == item.id) {
                 Some(existing) => *existing = item,
                 None => inner.items.push(item),
             }
-            inner.items.sort_by_key(|c| c.title().to_lowercase());
+            sort_computers(&mut inner.items);
         }
-        self.save()?;
+        if let Err(error) = self.save() {
+            self.0.borrow_mut().items = previous;
+            return Err(error);
+        }
         self.notify();
         Ok(())
     }
 
     pub fn remove(&self, id: &str) -> Result<(), String> {
+        let previous = self.0.borrow().items.clone();
         self.0.borrow_mut().items.retain(|c| c.id != id);
-        self.save()?;
+        if let Err(error) = self.save() {
+            self.0.borrow_mut().items = previous;
+            return Err(error);
+        }
         self.notify();
         Ok(())
     }
@@ -259,6 +337,7 @@ mod tests {
         item.name = "Офис".into();
         item.fingerprint = "a".repeat(64);
         item.virtual_monitor = true;
+        item.last_connected = 1_800_000_000;
         store.put(item.clone()).unwrap();
         store.put(Computer::new("gem12", DEFAULT_PORT)).unwrap();
 
@@ -303,6 +382,113 @@ mod tests {
             ),
             ("good", DEFAULT_PORT, "")
         );
+        assert_eq!(items[0].last_connected, 0);
+    }
+
+    #[test]
+    fn old_entries_default_last_connected_and_new_value_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("connections.ini"),
+            "[legacy]\nhost=legacy.local\nport=47820\n\n[modern]\nhost=modern.local\nport=47820\nlast-connected=1234\n",
+        )
+        .unwrap();
+
+        let store = Store::open(dir.path());
+        let legacy = store.find("legacy").unwrap();
+        assert_eq!(legacy.last_connected, 0);
+        let modern = store.find("modern").unwrap();
+        assert_eq!(modern.last_connected, 1234);
+
+        store.put(legacy).unwrap();
+        let reloaded = Store::open(dir.path());
+        assert_eq!(reloaded.find("legacy").unwrap().last_connected, 0);
+        assert_eq!(reloaded.find("modern").unwrap().last_connected, 1234);
+    }
+
+    #[test]
+    fn sort_is_stable_by_unicode_title_and_address_not_connection_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path());
+        let mut alpha = Computer::new("z.example", DEFAULT_PORT);
+        alpha.id = "alpha".into();
+        alpha.name = "Альфа".into();
+        let mut title_tie_b = Computer::new("b.example", DEFAULT_PORT);
+        title_tie_b.id = "title-tie-b".into();
+        title_tie_b.name = "Яблоко".into();
+        title_tie_b.last_connected = 100;
+        let mut title_tie_a = title_tie_b.clone();
+        title_tie_a.id = "title-tie-a".into();
+        title_tie_a.host = "a.example".into();
+        title_tie_a.last_connected = 0;
+        let mut title_tie_same_address = title_tie_b.clone();
+        title_tie_same_address.id = "same-address".into();
+        title_tie_same_address.name = "яблоко".into();
+        title_tie_same_address.last_connected = 1;
+        for item in [title_tie_b, alpha, title_tie_same_address, title_tie_a] {
+            store.put(item).unwrap();
+        }
+
+        let before = store.items();
+        assert_eq!(
+            before
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "title-tie-a", "title-tie-b", "same-address"]
+        );
+        let mut changed_recency = store.find("title-tie-b").unwrap();
+        changed_recency.last_connected = 1_800_000_000;
+        store.put(changed_recency).unwrap();
+        assert_eq!(
+            store
+                .items()
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            before
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn failed_put_and_remove_restore_items_without_notifying() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path());
+        let existing = Computer::new("existing", DEFAULT_PORT);
+        store.put(existing.clone()).unwrap();
+        let notifications = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = notifications.clone();
+        store.connect_changed(move || observed.set(observed.get() + 1));
+
+        std::fs::remove_file(store.path()).unwrap();
+        std::fs::create_dir(store.path()).unwrap();
+
+        let mut changed = existing.clone();
+        changed.name = "changed".into();
+        assert!(store.put(changed).is_err());
+        assert_eq!(store.items().as_slice(), std::slice::from_ref(&existing));
+        assert_eq!(notifications.get(), 0);
+
+        assert!(store.remove(&existing.id).is_err());
+        assert_eq!(store.items(), [existing]);
+        assert_eq!(notifications.get(), 0);
+    }
+
+    #[test]
+    fn mark_connected_sets_positive_unix_seconds() {
+        let mut computer = Computer::new("pc", DEFAULT_PORT);
+        computer.mark_connected();
+        assert!(computer.last_connected > 0);
+        assert!(
+            computer.last_connected
+                <= std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64
+        );
     }
 
     #[test]
@@ -320,8 +506,45 @@ mod tests {
             parse_address("fe80::1"),
             Some(("fe80::1".into(), DEFAULT_PORT))
         );
+        assert_eq!(parse_address("[::1]"), Some(("::1".into(), DEFAULT_PORT)));
+        assert_eq!(
+            parse_address("server.local."),
+            Some(("server.local.".into(), DEFAULT_PORT))
+        );
+        assert_eq!(
+            parse_address("legacy_pc"),
+            Some(("legacy_pc".into(), DEFAULT_PORT))
+        );
+        assert_eq!(
+            parse_address("[fe80::1%enp1s0]:4000"),
+            Some(("fe80::1%enp1s0".into(), 4000))
+        );
+        assert_eq!(
+            parse_address("casement-device.tailnet-abc.ts.net"),
+            Some(("casement-device.tailnet-abc.ts.net".into(), DEFAULT_PORT))
+        );
         for bad in [
-            "", "pc:0", "pc:70000", "pc:abc", ":3389", "[]:1", "user@pc", "rdp://pc",
+            "",
+            "pc:0",
+            "pc:70000",
+            "pc:abc",
+            ":3389",
+            "[]:1",
+            "user@pc",
+            "rdp://pc",
+            "pc\n",
+            "pc\u{0000}",
+            "pc/path",
+            "pc?x",
+            "pc#x",
+            "pc..local",
+            "-pc",
+            "pc-",
+            "[fe80::1%]:4000",
+            "pc:80:90",
+            "[not-ipv6]:80",
+            "[::1]junk",
+            "2001:db8::zz",
         ] {
             assert_eq!(parse_address(bad), None, "{bad}");
         }

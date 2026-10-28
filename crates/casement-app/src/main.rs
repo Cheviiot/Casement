@@ -5,11 +5,15 @@
 
 mod computer;
 mod core;
+mod discovery;
+mod local_files;
 mod pages;
 mod remote_files;
 mod service;
 mod session;
 mod store;
+mod ui_check;
+mod viewport;
 mod window;
 
 use std::rc::Rc;
@@ -38,13 +42,6 @@ fn main() -> glib::ExitCode {
         .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
         .build();
     app.connect_startup(|app| {
-        let about = gtk::gio::SimpleAction::new("about", None);
-        about.connect_activate(glib::clone!(
-            #[weak]
-            app,
-            move |_, _| show_about(&app)
-        ));
-        app.add_action(&about);
         let quit = gtk::gio::SimpleAction::new("quit", None);
         quit.connect_activate(glib::clone!(
             #[weak]
@@ -52,9 +49,8 @@ fn main() -> glib::ExitCode {
             move |_, _| app.quit()
         ));
         app.add_action(&quit);
-        app.set_accels_for_action("app.quit", &["<Control>q"]);
         let css = gtk::CssProvider::new();
-        css.load_from_string(".remote-screen { background: black; }");
+        css.load_from_string(include_str!("style.css"));
         gtk::style_context_add_provider_for_display(
             &gtk::gdk::Display::default().expect("display"),
             &css,
@@ -69,14 +65,24 @@ fn activate(app: &adw::Application) {
     let core = match core::Core::open(core::config_dir()) {
         Ok(core) => Rc::new(core),
         Err(e) => {
-            let dialog = adw::AlertDialog::new(
-                Some("Casement не запустился"),
-                Some(&format!("Ключ устройства недоступен: {e}")),
-            );
-            dialog.add_response("close", "Закрыть");
-            let window = adw::ApplicationWindow::builder().application(app).build();
+            let close = pages::pill("Закрыть", "suggested-action");
+            let app2 = app.clone();
+            close.connect_clicked(move |_| app2.quit());
+            let status = adw::StatusPage::builder()
+                .icon_name("dialog-error-symbolic")
+                .title("Ключ устройства недоступен")
+                .description(glib::markup_escape_text(&e).as_str())
+                .child(&close)
+                .build();
+            let navigation = adw::NavigationView::new();
+            navigation.add(&pages::frame("Casement", "startup-error", &status, None));
+            let window = adw::ApplicationWindow::builder()
+                .application(app)
+                .default_width(600)
+                .default_height(460)
+                .content(&navigation)
+                .build();
             window.present();
-            dialog.present(Some(&window));
             return;
         }
     };
@@ -89,6 +95,25 @@ fn activate(app: &adw::Application) {
     }
     let window = window::Window::new(app, core);
     window.present();
+    if let (Ok(check_path), Ok(snapshot)) = (
+        std::env::var("CASEMENT_UI_CHECK"),
+        std::env::var("CASEMENT_SNAPSHOT"),
+    ) {
+        if !check_path.is_empty() {
+            let app = app.clone();
+            glib::spawn_future_local(async move {
+                let result = ui_check::run(&window).await;
+                let report = match result {
+                    Ok(checks) => format!("PASS\n{}\n", checks.join("\n")),
+                    Err(error) => format!("FAIL\n{error}\n"),
+                };
+                eprintln!("{report}");
+                let _ = std::fs::write(check_path, report);
+                snapshot_after_paint(window.widget(), snapshot, app);
+            });
+            return;
+        }
+    }
     if let Ok(page) = std::env::var("CASEMENT_OPEN") {
         if !page.is_empty() {
             window.open_dev_page(&page);
@@ -153,16 +178,4 @@ fn snapshot_after_paint(window: adw::ApplicationWindow, path: String, app: adw::
     ));
     handler.replace(Some(id));
     window.queue_draw();
-}
-
-fn show_about(app: &adw::Application) {
-    let about = adw::AboutDialog::builder()
-        .application_name("Casement")
-        .application_icon(APP_ID)
-        .developer_name("cheviiot")
-        .version(env!("CARGO_PKG_VERSION"))
-        .comments("Свой удалённый рабочий стол для локальной сети и Tailscale")
-        .debug_info(format!("Протокол {}", casement_net::PROTOCOL_VERSION))
-        .build();
-    about.present(app.active_window().as_ref());
 }
