@@ -272,6 +272,7 @@ impl Window {
         if self.0.accept_busy.replace(true) {
             return;
         }
+        self.0.accept.set_sensitive(false);
         let this = self.clone();
         glib::spawn_future_local(async move {
             if let Err(e) = service::configure_machine().await {
@@ -279,8 +280,9 @@ impl Window {
             }
             this.refresh_access();
             glib::timeout_future_seconds(3).await;
-            this.refresh_access();
+            this.set_accept_quietly(service::enabled().await);
             this.0.accept_busy.set(false);
+            this.0.accept.set_sensitive(true);
         });
     }
 
