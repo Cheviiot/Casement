@@ -3,6 +3,7 @@
 //! through `SendInput`. Clipboard text both ways through the Win32 clipboard, watched by
 //! its sequence number.
 
+use crate::keyboard::scancode;
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Duration;
 
@@ -417,33 +418,6 @@ fn send(inputs: &[INPUT]) {
             std::mem::size_of::<INPUT>() as i32,
         );
     }
-}
-
-/// Linux evdev key code → PC set 1 scancode and whether it needs the E0 prefix.
-fn scancode(code: u32) -> Option<(u16, bool)> {
-    Some(match code {
-        // The main block, function keys and keypad: evdev numbers are set 1 scancodes.
-        1..=83 | 86..=88 => (code as u16, false),
-        96 => (0x1C, true),  // keypad Enter
-        97 => (0x1D, true),  // right Ctrl
-        98 => (0x35, true),  // keypad /
-        99 => (0x37, true),  // Print Screen
-        100 => (0x38, true), // right Alt
-        102 => (0x47, true), // Home
-        103 => (0x48, true), // Up
-        104 => (0x49, true), // Page Up
-        105 => (0x4B, true), // Left
-        106 => (0x4D, true), // Right
-        107 => (0x4F, true), // End
-        108 => (0x50, true), // Down
-        109 => (0x51, true), // Page Down
-        110 => (0x52, true), // Insert
-        111 => (0x53, true), // Delete
-        125 => (0x5B, true), // left Windows
-        126 => (0x5C, true), // right Windows
-        127 => (0x5D, true), // Menu
-        _ => return None,
-    })
 }
 
 impl ScreenControl for Control {

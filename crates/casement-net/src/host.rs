@@ -12,7 +12,7 @@ use crate::auth::{self, FailureLimiter, StoredPassword, TrustStore};
 use crate::identity::{Fingerprint, Identity};
 use crate::screen::{self, ScreenControl, ScreenProvider};
 use crate::{framing, tls, transport_config, NetError};
-use casement_proto::{Input, Message, ScreenStarted};
+use casement_proto::ScreenStarted;
 
 /// The host's UDP socket. On an IPv6 address it also takes IPv4: Windows makes `[::]`
 /// IPv6-only by default (Linux does not), which left Windows hosts deaf to IPv4 clients.
@@ -31,6 +31,7 @@ struct Sharing {
     control: Arc<dyn ScreenControl>,
     pump: tokio::task::JoinHandle<()>,
     input: tokio::task::JoinHandle<()>,
+    reliable_input: tokio::task::JoinHandle<()>,
 }
 
 /// How long a client may take for each login step before it is dropped.
@@ -245,6 +246,7 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
         name: shared.config.name.clone(),
         os: shared.config.os.clone(),
         password: None,
+        reliable_input: true,
     };
 
     if let Some(dir) = &shared.config.settings_dir {
@@ -376,7 +378,7 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
         })
     };
 
-    // Session: pings, the screen on request, input as datagrams.
+    // Session: pings, the screen on request, reliable transitions and motion datagrams.
     let mut sharing: Option<Sharing> = None;
     // Reads happen in their own task: a read cancelled half-way inside select! would lose
     // bytes and desynchronise the stream.
@@ -393,7 +395,8 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
     });
     let mut screen_events: Option<tokio::sync::mpsc::UnboundedReceiver<screen::ScreenEvent>> = None;
     let mut audio: Option<tokio::task::JoinHandle<()>> = None;
-    let result = loop {
+    // Keep fallible writes inside this scope so every exit reaches task cleanup.
+    let result = async { loop {
         let message = tokio::select! {
             message = control_rx.recv() => match message {
                 Some(Ok(Some(message))) => message,
@@ -545,32 +548,53 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
                     }
                     let _ = video.finish();
                 });
-                let input_control = control.clone();
+                let input_state = Arc::new(crate::input::Receiver::new(control.clone()));
+                let input_control = input_state.clone();
                 let datagrams = connection.clone();
                 let input = tokio::spawn(async move {
                     while let Ok(bytes) = datagrams.read_datagram().await {
-                        if let Ok(input) = Input::decode(bytes.as_ref()) {
-                            input_control.input(input);
+                        input_control.datagram(&bytes);
+                    }
+                });
+                let input_peer = connection.clone();
+                let reliable_input = tokio::spawn(async move {
+                    // Reads are not cancelled in a select: a frame may be partially read.
+                    if let Ok(mut stream) = input_peer.accept_uni().await {
+                        while let Ok(Some(message)) = framing::read(&mut stream).await {
+                            if let Some(Kind::ReliableInput(input)) = message.kind {
+                                input_state.reliable(input);
+                            } else {
+                                break;
+                            }
                         }
                     }
+                    input_peer.close(0u32.into(), b"input stream ended");
                 });
                 sharing = Some(Sharing {
                     control,
                     pump,
                     input,
+                    reliable_input,
                 });
             }
             _ => {}
         }
-    };
+    } }.await;
     reader.abort();
     files.abort();
     if let Some(pump) = audio {
         pump.abort();
     }
-    if let Some(Sharing { pump, input, .. }) = sharing {
+    if let Some(Sharing {
+        pump,
+        input,
+        reliable_input,
+        ..
+    }) = sharing
+    {
         pump.abort();
         input.abort();
+        reliable_input.abort();
     }
     result
 }

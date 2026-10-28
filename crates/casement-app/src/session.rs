@@ -246,6 +246,40 @@ impl Remote {
         }
     }
 
+    fn pointer_press(&self, button: u32, x: f64, y: f64) {
+        self.picture.grab_focus();
+        if !self.viewport().is_some_and(|v| v.contains((x, y))) {
+            return;
+        }
+        if let Some((x, y)) = self.to_remote(x, y) {
+            self.send(input::Kind::Motion(PointerMotion { x, y }));
+        }
+        if let Some(button) = evdev_button(button) {
+            self.buttons.borrow_mut().insert(button);
+            self.send(input::Kind::Button(PointerButton {
+                button,
+                pressed: true,
+            }));
+        }
+    }
+
+    fn pointer_release(&self, button: u32, x: f64, y: f64) {
+        let Some(button) = evdev_button(button) else {
+            return;
+        };
+        if !self.buttons.borrow_mut().remove(&button) {
+            return;
+        }
+        // A drag begun inside the image must end even when it leaves the viewport.
+        if let Some((x, y)) = self.to_remote(x, y) {
+            self.send(input::Kind::Motion(PointerMotion { x, y }));
+        }
+        self.send(input::Kind::Button(PointerButton {
+            button,
+            pressed: false,
+        }));
+    }
+
     fn attach_controllers(self: &Rc<Self>) {
         let motion = gtk::EventControllerMotion::new();
         let this = Rc::downgrade(self);
@@ -280,28 +314,12 @@ impl Remote {
         let this = Rc::downgrade(self);
         click.connect_pressed(move |gesture, _, x, y| {
             let Some(this) = this.upgrade() else { return };
-            this.picture.grab_focus();
-            if let Some((x, y)) = this.to_remote(x, y) {
-                this.send(input::Kind::Motion(PointerMotion { x, y }));
-            }
-            if let Some(button) = evdev_button(gesture.current_button()) {
-                this.buttons.borrow_mut().insert(button);
-                this.send(input::Kind::Button(PointerButton {
-                    button,
-                    pressed: true,
-                }));
-            }
+            this.pointer_press(gesture.current_button(), x, y);
         });
         let this = Rc::downgrade(self);
-        click.connect_released(move |gesture, _, _, _| {
+        click.connect_released(move |gesture, _, x, y| {
             let Some(this) = this.upgrade() else { return };
-            if let Some(button) = evdev_button(gesture.current_button()) {
-                this.buttons.borrow_mut().remove(&button);
-                this.send(input::Kind::Button(PointerButton {
-                    button,
-                    pressed: false,
-                }));
-            }
+            this.pointer_release(gesture.current_button(), x, y);
         });
         self.picture.add_controller(click);
 
@@ -309,24 +327,35 @@ impl Remote {
         let this = Rc::downgrade(self);
         scroll.connect_scroll(move |_, dx, dy| {
             if let Some(this) = this.upgrade() {
-                this.send(input::Kind::Scroll(Scroll { dx, dy }));
+                if let Some(point) = this
+                    .pointer
+                    .get()
+                    .filter(|p| this.viewport().is_some_and(|v| v.contains(*p)))
+                {
+                    if let Some((x, y)) = this.to_remote(point.0, point.1) {
+                        this.send(input::Kind::Motion(PointerMotion { x, y }));
+                        this.send(input::Kind::Scroll(Scroll { dx, dy }));
+                    }
+                }
             }
             glib::Propagation::Stop
         });
         self.picture.add_controller(scroll);
 
-        // Physical keys: GDK hardware keycodes are evdev codes + 8 on Linux.
+        // GDK uses different hardware keycode namespaces on Linux and Windows.
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let this = Rc::downgrade(self);
-        keys.connect_key_pressed(move |_, _, keycode, _| {
+        keys.connect_key_pressed(move |_, key, keycode, _| {
             let Some(this) = this.upgrade() else {
                 return glib::Propagation::Proceed;
             };
-            if this.input.borrow().is_none() || keycode < 8 {
+            if this.input.borrow().is_none() {
                 return glib::Propagation::Proceed;
             }
-            let code = keycode - 8;
+            let Some(code) = crate::keyboard::evdev(key, keycode) else {
+                return glib::Propagation::Proceed;
+            };
             this.pressed.borrow_mut().insert(code);
             this.send(input::Kind::Key(Key {
                 code,
@@ -335,11 +364,12 @@ impl Remote {
             glib::Propagation::Stop
         });
         let this = Rc::downgrade(self);
-        keys.connect_key_released(move |_, _, keycode, _| {
+        keys.connect_key_released(move |_, key, keycode, _| {
             let Some(this) = this.upgrade() else { return };
-            if keycode >= 8 {
-                let code = keycode - 8;
-                this.pressed.borrow_mut().remove(&code);
+            if let Some(code) = crate::keyboard::evdev(key, keycode) {
+                if !this.pressed.borrow_mut().remove(&code) {
+                    return;
+                }
                 this.send(input::Kind::Key(Key {
                     code,
                     pressed: false,
@@ -1263,7 +1293,7 @@ pub async fn check_session_lifetime(window: &Window) -> Result<Vec<String>, Stri
         glib::timeout_future(std::time::Duration::from_millis(10)).await;
     }
 
-    let computer = Computer::new("\0", 47999);
+    let computer = Computer::new("127.0.0.1", 47999);
     let page = session_page(window, &computer);
     let weak = Rc::downgrade(&page);
     let reconnect_started = Rc::new(Cell::new(false));
@@ -1348,6 +1378,18 @@ pub async fn check_cursor(window: &Window) -> Result<Vec<String>, String> {
     if remote.cursor_hidden.get() {
         return Err("cursor: stationary pointer over a new margin stayed hidden".into());
     }
+    remote.pointer_press(1, 1.0, center.1);
+    if !remote.buttons.borrow().is_empty() {
+        return Err("input: clicking a letterbox margin pressed a remote button".into());
+    }
+    remote.pointer_press(1, center.0, center.1);
+    if !remote.buttons.borrow().contains(&0x110) {
+        return Err("input: pressing inside the image did not start the drag".into());
+    }
+    remote.pointer_release(1, 900.0, 700.0);
+    if !remote.buttons.borrow().is_empty() {
+        return Err("input: releasing a drag outside the image left the button held".into());
+    }
     remote.picture.set_paintable(None::<&gtk::gdk::Paintable>);
     glib::timeout_future(std::time::Duration::from_millis(30)).await;
     if remote.picture.cursor().is_some() {
@@ -1359,6 +1401,7 @@ pub async fn check_cursor(window: &Window) -> Result<Vec<String>, String> {
         "cursor is an explicit transparent texture".into(),
         "cursor follows image geometry while stationary".into(),
         "cursor restores when the picture ends".into(),
+        "image margins ignore clicks and an outside drag release clears the button".into(),
     ])
 }
 

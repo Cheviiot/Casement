@@ -325,8 +325,67 @@ async fn screen_frames_and_input() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     let got = inputs.lock().unwrap().clone();
-    assert_eq!(got.len(), 2, "both datagrams arrived on loopback");
+    assert_eq!(
+        got.len(),
+        2,
+        "motion and the reliable key arrived on loopback"
+    );
     assert_eq!(keyframes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // A legacy client still uses datagrams. New key/button/scroll commands share an
+    // ordered reliable stream; the provider sees the original input kinds.
+    sender
+        .legacy()
+        .send(&Input {
+            kind: Some(input::Kind::Key(Key {
+                code: 30,
+                pressed: false,
+            })),
+        })
+        .unwrap();
+    for pressed in [true, false] {
+        sender
+            .send(&Input {
+                kind: Some(input::Kind::Key(Key { code: 42, pressed })),
+            })
+            .unwrap();
+        sender
+            .send(&Input {
+                kind: Some(input::Kind::Button(casement_proto::PointerButton {
+                    button: 272,
+                    pressed,
+                })),
+            })
+            .unwrap();
+    }
+    sender
+        .send(&Input {
+            kind: Some(input::Kind::Scroll(casement_proto::Scroll {
+                dx: 0.0,
+                dy: 1.0,
+            })),
+        })
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while inputs.lock().unwrap().len() < 8 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let keys: Vec<_> = inputs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|input| match &input.kind {
+            Some(input::Kind::Key(key)) if key.code == 42 => Some(key.pressed),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keys, [true, false]);
+    assert!(inputs.lock().unwrap().iter().any(
+        |input| matches!(&input.kind, Some(input::Kind::Key(key)) if key.code == 30 && !key.pressed)
+    ));
 
     // Clipboard both ways, through the split session.
     let (mut sender, mut receiver, handle) = session.split();
@@ -340,8 +399,84 @@ async fn screen_frames_and_input() {
         Some(client::HostMessage::Clipboard("host: привет".into()))
     );
     assert_eq!(clipboard.lock().unwrap().as_slice(), ["привет".to_string()]);
+    let sender = handle.input_sender();
+    sender
+        .send(&Input {
+            kind: Some(input::Kind::Key(Key {
+                code: 29,
+                pressed: true,
+            })),
+        })
+        .unwrap();
+    sender
+        .send(&Input {
+            kind: Some(input::Kind::Button(casement_proto::PointerButton {
+                button: 272,
+                pressed: true,
+            })),
+        })
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let pressed = {
+                let events = inputs.lock().unwrap();
+                matches!(&events[events.len()-2].kind, Some(input::Kind::Key(key)) if key.code == 29 && key.pressed)
+                    && matches!(&events[events.len()-1].kind, Some(input::Kind::Button(button)) if button.button == 272 && button.pressed)
+            };
+            if pressed { break }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
     handle.close();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let released = {
+                let events = inputs.lock().unwrap();
+                matches!(&events[events.len()-2].kind, Some(input::Kind::Key(key)) if key.code == 29 && !key.pressed)
+                    && matches!(&events[events.len()-1].kind, Some(input::Kind::Button(button)) if !button.pressed)
+            };
+            if released { break }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
     host.close();
+}
+
+#[tokio::test]
+async fn reliable_input_queue_overload_closes_instead_of_losing_transitions() {
+    use casement_proto::{input, Input, Key};
+    let dir = tempfile::tempdir().unwrap();
+    let host = start_host(dir.path(), Some(PASSWORD));
+    let identity = client_identity(dir.path(), "client");
+    let session = client::connect(&identity, host.addr, None, &info(false))
+        .await
+        .unwrap()
+        .login(Some(PASSWORD))
+        .await
+        .unwrap();
+    let sender = session.input_sender();
+    // This current-thread runtime cannot drain the worker during the synchronous
+    // burst, making queue exhaustion deterministic without an OS input target.
+    let mut stopped = false;
+    for _ in 0..1024 {
+        if sender
+            .send(&Input {
+                kind: Some(input::Kind::Key(Key {
+                    code: 30,
+                    pressed: true,
+                })),
+            })
+            .is_err()
+        {
+            stopped = true;
+            break;
+        }
+    }
+    assert!(stopped, "typing queue must be bounded");
+    tokio::time::timeout(std::time::Duration::from_secs(1), session.closed())
+        .await
+        .unwrap();
+    host.host.close();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

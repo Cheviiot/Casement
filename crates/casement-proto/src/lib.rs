@@ -65,6 +65,9 @@ pub struct ServerHello {
     /// Absent when this client is already trusted and logged in.
     #[prost(message, optional, tag = "4")]
     pub password: Option<PasswordParams>,
+    /// Keys, buttons and scrolling may use a separate ordered input stream.
+    #[prost(bool, tag = "5")]
+    pub reliable_input: bool,
 }
 
 /// One SPAKE2 message.
@@ -269,7 +272,7 @@ pub struct ResizeScreen {
 pub struct Control {
     #[prost(
         oneof = "control::Kind",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22"
     )]
     pub kind: Option<control::Kind>,
 }
@@ -319,6 +322,8 @@ pub mod control {
         StartAudio(super::StartAudio),
         #[prost(message, tag = "21")]
         AudioStarted(super::AudioStarted),
+        #[prost(message, tag = "22")]
+        ReliableInput(super::ReliableInput),
     }
 }
 
@@ -331,10 +336,36 @@ pub const FRAME_FLAG_KEYFRAME: u8 = 1;
 pub const AUDIO_DATAGRAM: u8 = 1;
 pub const AUDIO_HEADER_LEN: usize = 1 + 8;
 
+/// Client → host motion datagram. This byte is not a valid protobuf field key, so
+/// legacy Input datagrams and audio cannot be confused with the new envelope.
+pub const MOTION_DATAGRAM: u8 = 2;
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct SequencedMotion {
+    #[prost(message, optional, tag = "1")]
+    pub position: Option<PointerMotion>,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+}
+
+/// Sent only after reliable_input was advertised, on a dedicated client → host
+/// unidirectional stream. Position binds clicks/scrolling to their original target
+/// even when newer motion datagrams overtake the reliable command.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ReliableInput {
+    #[prost(message, optional, tag = "1")]
+    pub input: Option<Input>,
+    #[prost(message, optional, tag = "2")]
+    pub position: Option<PointerMotion>,
+    #[prost(uint64, tag = "3")]
+    pub motion_sequence: u64,
+}
+
 /// Largest encoded frame accepted (a 4K keyframe at high quality stays well below).
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 
-/// Input from the client, sent as QUIC datagrams: small, latest-wins, never queued.
+/// Input from the client. Legacy peers use datagrams; capable peers deliver
+/// transitions reliably and send latest-wins motion separately.
 /// Coordinates are pixels of the screen as announced in `ScreenStarted`.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Input {
@@ -421,6 +452,7 @@ mod tests {
                 iterations: 3,
                 parallelism: 1,
             }),
+            reliable_input: true,
         }));
         let bytes = msg.encode_to_vec();
         assert_eq!(Control::decode(bytes.as_slice()).unwrap(), msg);
@@ -433,6 +465,34 @@ mod tests {
         bytes.extend_from_slice(&[0xC0, 0x3E, 0x01]);
         let decoded = Control::decode(bytes.as_slice()).unwrap();
         assert_eq!(decoded.kind, Some(control::Kind::Ping(Ping { nonce: 7 })));
+    }
+
+    #[test]
+    fn reliable_input_capability_is_optional_for_legacy_greetings() {
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct LegacyHello {
+            #[prost(uint32, tag = "1")]
+            version: u32,
+            #[prost(string, tag = "2")]
+            name: String,
+            #[prost(string, tag = "3")]
+            os: String,
+            #[prost(message, optional, tag = "4")]
+            password: Option<PasswordParams>,
+        }
+        let legacy = LegacyHello {
+            version: PROTOCOL_VERSION,
+            name: "host".into(),
+            os: "linux".into(),
+            password: None,
+        };
+        let mut current = ServerHello::decode(legacy.encode_to_vec().as_slice()).unwrap();
+        assert!(!current.reliable_input);
+        current.reliable_input = true;
+        assert_eq!(
+            LegacyHello::decode(current.encode_to_vec().as_slice()).unwrap(),
+            legacy
+        );
     }
 
     #[test]

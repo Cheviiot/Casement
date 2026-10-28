@@ -11,6 +11,7 @@ mod framing;
 pub mod glibc_compat;
 pub mod host;
 pub mod identity;
+mod input;
 pub mod policy;
 pub mod screen;
 #[cfg(test)]

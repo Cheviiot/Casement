@@ -11,9 +11,10 @@ use casement_proto::{
 
 use crate::auth;
 use crate::identity::{Fingerprint, Identity};
+pub use crate::input::InputSender;
 use crate::tls::{self, HostKeyVerifier, SeenKey};
 use crate::{framing, transport_config, NetError};
-use casement_proto::{Input, Message, RequestKeyframe, StartScreen};
+use casement_proto::{RequestKeyframe, StartScreen};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -34,6 +35,7 @@ pub struct Handshake {
     pub host_name: String,
     pub host_os: String,
     password: Option<PasswordParams>,
+    reliable_input: bool,
     _endpoint: quinn::Endpoint,
 }
 
@@ -43,6 +45,7 @@ pub struct Session {
     recv: quinn::RecvStream,
     pub host_name: String,
     pub remembered: bool,
+    input: InputSender,
     _endpoint: quinn::Endpoint,
 }
 
@@ -143,6 +146,7 @@ pub async fn connect_with_version(
         host_name: auth::sanitize_name(&hello.name),
         host_os: auth::sanitize_name(&hello.os),
         password: hello.password,
+        reliable_input: hello.reliable_input,
         _endpoint: endpoint,
     })
 }
@@ -203,6 +207,7 @@ impl Handshake {
             _ => return Err(NetError::Protocol("expected the login result".into())),
         };
         Ok(Session {
+            input: InputSender::new(self.connection.clone(), self.reliable_input),
             connection: self.connection,
             send: self.send,
             recv: self.recv,
@@ -227,18 +232,6 @@ pub struct Screen {
     /// The host's monitors and the id of the one shown ("" for a virtual monitor).
     pub monitors: Vec<crate::screen::Monitor>,
     pub monitor: String,
-}
-
-/// Sends input as QUIC datagrams; cheap to clone, usable from any task.
-#[derive(Clone)]
-pub struct InputSender(quinn::Connection);
-
-impl InputSender {
-    pub fn send(&self, input: &Input) -> Result<(), NetError> {
-        self.0
-            .send_datagram(input.encode_to_vec().into())
-            .map_err(|e| NetError::Stream(e.to_string()))
-    }
 }
 
 impl Session {
@@ -321,7 +314,7 @@ impl Session {
     }
 
     pub fn input_sender(&self) -> InputSender {
-        InputSender(self.connection.clone())
+        self.input.clone()
     }
 
     /// Asks for the host's sound; packets then arrive through `audio_receiver`.
@@ -402,6 +395,7 @@ pub struct ControlReceiver {
 /// The connection itself after the split: input, closing, waiting for the end.
 pub struct SessionHandle {
     connection: quinn::Connection,
+    input: InputSender,
     _endpoint: quinn::Endpoint,
 }
 
@@ -412,6 +406,7 @@ impl Session {
             ControlReceiver { recv: self.recv },
             SessionHandle {
                 connection: self.connection,
+                input: self.input,
                 _endpoint: self._endpoint,
             },
         )
@@ -518,7 +513,7 @@ impl SessionHandle {
     }
 
     pub fn input_sender(&self) -> InputSender {
-        InputSender(self.connection.clone())
+        self.input.clone()
     }
 
     pub fn audio_receiver(&self) -> crate::audio::AudioReceiver {

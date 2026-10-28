@@ -6,6 +6,7 @@
 mod computer;
 mod core;
 mod discovery;
+mod keyboard;
 mod local_files;
 mod pages;
 mod remote_files;
@@ -102,8 +103,19 @@ fn activate(app: &adw::Application) {
     ) {
         if !check_path.is_empty() {
             let app = app.clone();
+            // A panic in a local future otherwise leaves the headless application
+            // running forever without a report.
+            let deadline_app = app.clone();
+            let deadline_path = check_path.clone();
+            let deadline = glib::timeout_add_local_once(Duration::from_secs(60), move || {
+                let report = "FAIL\nUI checks did not finish within 60 seconds\n";
+                eprintln!("{report}");
+                let _ = std::fs::write(deadline_path, report);
+                deadline_app.quit();
+            });
             glib::spawn_future_local(async move {
                 let result = ui_check::run(&window).await;
+                deadline.remove();
                 let report = match result {
                     Ok(checks) => format!("PASS\n{}\n", checks.join("\n")),
                     Err(error) => format!("FAIL\n{error}\n"),
