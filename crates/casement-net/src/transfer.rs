@@ -713,13 +713,28 @@ fn refusal(kind: Option<Kind>, expected: &str) -> NetError {
 
 /// Client side: the entries of `path` in the host's shared folder.
 pub async fn list(connection: &quinn::Connection, path: &str) -> Result<FileListing, NetError> {
-    let (mut send, mut recv) = connection.open_bi().await?;
+    list_with_timeout(connection, path, IO_IDLE_TIMEOUT).await
+}
+
+async fn list_with_timeout(
+    connection: &quinn::Connection,
+    path: &str,
+    idle_timeout: std::time::Duration,
+) -> Result<FileListing, NetError> {
+    let (mut send, mut recv) = tokio::time::timeout(idle_timeout, connection.open_bi())
+        .await
+        .map_err(|_| NetError::Timeout)??;
     let request = FileList {
         path: path.to_string(),
     };
-    framing::write(&mut send, &Control::new(Kind::FileList(request))).await?;
+    write_control(
+        &mut send,
+        &Control::new(Kind::FileList(request)),
+        idle_timeout,
+    )
+    .await?;
     let _ = send.finish();
-    match framing::expect(&mut recv).await?.kind {
+    match expect_control(&mut recv, idle_timeout).await?.kind {
         Some(Kind::FileListing(listing)) => Ok(listing),
         other => Err(refusal(other, "the folder listing")),
     }
@@ -897,6 +912,24 @@ mod tests {
         assert!(matches!(result, Err(NetError::Timeout)));
         peer_task.await.unwrap();
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stalled_listing_response_times_out() {
+        let (_client, _server, connection, peer) = loopback_pair().await;
+        let peer_task = tokio::spawn(async move {
+            let (_send, mut recv) = peer.accept_bi().await.unwrap();
+            let request = read_control(&mut recv, std::time::Duration::from_secs(1))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(request.kind, Some(Kind::FileList(_))));
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+        let result =
+            list_with_timeout(&connection, "", std::time::Duration::from_millis(100)).await;
+        assert!(matches!(result, Err(NetError::Timeout)));
+        peer_task.await.unwrap();
     }
 
     #[tokio::test]
