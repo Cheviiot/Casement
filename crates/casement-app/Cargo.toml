@@ -16,9 +16,9 @@ gstreamer-app = "0.24.5"
 gtk = { package = "gtk4", version = "0.10.3", features = ["v4_14"] }
 adw = { package = "libadwaita", version = "0.8", features = ["v1_6"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "time", "net"] }
-casement-net = { version = "0.1.1", path = "../casement-net" }
-casement-media = { version = "0.1.1", path = "../casement-media" }
-casement-proto = { version = "0.1.1", path = "../casement-proto" }
+casement-net = { version = "0.1.2", path = "../casement-net" }
+casement-media = { version = "0.1.2", path = "../casement-media" }
+casement-proto = { version = "0.1.2", path = "../casement-proto" }
 
 [dev-dependencies]
 tempfile = "3"

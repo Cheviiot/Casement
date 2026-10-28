@@ -8,8 +8,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-casement-media = { version = "0.1.1", path = "../casement-media" }
-casement-net = { version = "0.1.1", path = "../casement-net" }
+casement-media = { version = "0.1.2", path = "../casement-media" }
+casement-net = { version = "0.1.2", path = "../casement-net" }
 glib = "0.21.5"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tracing = "0.1.44"

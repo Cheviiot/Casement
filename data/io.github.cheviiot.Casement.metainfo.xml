@@ -54,6 +54,12 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.1.2" date="2026-10-28">
+      <description>
+        <p>On Windows the window no longer has a black border, and it follows the system's
+          light or dark mode and accent colour.</p>
+      </description>
+    </release>
     <release version="0.1.1" date="2026-10-28">
       <description>
         <p>On Windows Casement runs as a service: it accepts connections from the moment Windows

@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "casement"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-channel",
  "casement-media",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "casement-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "casement-media",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "casement-host"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "casement-media",
  "casement-net",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "casement-media"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "casement-net",
  "casement-proto",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "casement-net"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "argon2",
  "casement-proto",
@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "casement-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "prost",
 ]

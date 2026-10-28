@@ -9,12 +9,12 @@ publish.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
-casement-net = { version = "0.1.1", path = "../casement-net" }
-casement-proto = { version = "0.1.1", path = "../casement-proto" }
+casement-net = { version = "0.1.2", path = "../casement-net" }
+casement-proto = { version = "0.1.2", path = "../casement-proto" }
 clap = { version = "4.6.7", features = ["derive"] }
 rpassword = "7.5.4"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [target.'cfg(any(target_os = "linux", windows))'.dependencies]
-casement-media = { version = "0.1.1", path = "../casement-media" }
+casement-media = { version = "0.1.2", path = "../casement-media" }

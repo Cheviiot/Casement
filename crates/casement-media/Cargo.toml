@@ -8,8 +8,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-casement-net = { version = "0.1.1", path = "../casement-net" }
-casement-proto = { version = "0.1.1", path = "../casement-proto" }
+casement-net = { version = "0.1.2", path = "../casement-net" }
+casement-proto = { version = "0.1.2", path = "../casement-proto" }
 futures-util = "0.3.34"
 gstreamer = "0.24.5"
 gstreamer-app = "0.24.5"
