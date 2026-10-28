@@ -17,6 +17,7 @@ pub mod screen;
 mod tests;
 pub mod tls;
 pub mod transfer;
+pub mod video;
 
 use std::time::Duration;
 

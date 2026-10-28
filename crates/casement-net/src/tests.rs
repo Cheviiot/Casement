@@ -111,6 +111,7 @@ impl crate::screen::ScreenProvider for FakeScreen {
         };
         Box::pin(async move {
             let (tx, frames) = tokio::sync::mpsc::channel(4);
+            let frame_overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             tokio::spawn(async move {
                 for n in 0..5u64 {
                     let frame = crate::screen::EncodedFrame {
@@ -128,6 +129,7 @@ impl crate::screen::ScreenProvider for FakeScreen {
                 height: 1080,
                 codec: "h264".into(),
                 frames,
+                frame_overflow,
                 control: Box::new(control),
                 events: Some(events),
                 monitors,

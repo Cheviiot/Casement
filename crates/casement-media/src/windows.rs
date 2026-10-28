@@ -3,7 +3,7 @@
 //! through `SendInput`. Clipboard text both ways through the Win32 clipboard, watched by
 //! its sequence number.
 
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Duration;
 
 use gstreamer as gst;
@@ -156,7 +156,7 @@ impl ScreenProvider for WindowsScreen {
                 }
                 for encoder in [*tuned, *name] {
                     match start_with(&display, encoder).await {
-                        Ok((frames, control, width, height)) => {
+                        Ok((frames, frame_overflow, control, width, height)) => {
                             let events = control.clipboard.watch();
                             tracing::info!("sharing {width}x{height} with {encoder}");
                             return Ok(ScreenStream {
@@ -164,6 +164,7 @@ impl ScreenProvider for WindowsScreen {
                                 height,
                                 codec: "h264".into(),
                                 frames,
+                                frame_overflow,
                                 control: Box::new(control),
                                 events: Some(events),
                                 monitors: all.iter().map(|d| d.monitor.clone()).collect(),
@@ -185,12 +186,21 @@ impl ScreenProvider for WindowsScreen {
 async fn start_with(
     display: &Display,
     encoder: &str,
-) -> Result<(tokio::sync::mpsc::Receiver<EncodedFrame>, Control, u32, u32), String> {
+) -> Result<
+    (
+        tokio::sync::mpsc::Receiver<EncodedFrame>,
+        Arc<AtomicBool>,
+        Control,
+        u32,
+        u32,
+    ),
+    String,
+> {
     let description = format!(
         "d3d11screencapturesrc monitor-handle={} show-cursor=true ! d3d11convert ! {encoder} \
          ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au \
-         ! appsink name=sink sync=false max-buffers=8 drop=false",
-        display.handle
+         ! appsink name=sink sync=false max-buffers={} drop=false",
+        display.handle, QUEUE
     );
     let pipeline = gst::parse::launch(&description)
         .map_err(|e| format!("GStreamer pipeline: {e}"))?
@@ -205,11 +215,13 @@ async fn start_with(
         return Err(format!("cannot start capture: {e}"));
     }
     let (frames_tx, frames) = tokio::sync::mpsc::channel::<EncodedFrame>(QUEUE);
+    let frame_overflow = Arc::new(AtomicBool::new(false));
     let (size_tx, size_rx) = tokio::sync::oneshot::channel::<(u32, u32)>();
     let puller = sink.clone();
+    let overflow = frame_overflow.clone();
     std::thread::Builder::new()
         .name("casement-capture".into())
-        .spawn(move || pull_frames(puller, frames_tx, size_tx))
+        .spawn(move || pull_frames(puller, frames_tx, overflow, size_tx))
         .map_err(|e| e.to_string())?;
     let (width, height) = match tokio::time::timeout(Duration::from_secs(10), size_rx).await {
         Ok(Ok(size)) => size,
@@ -225,7 +237,7 @@ async fn start_with(
         scroll: std::sync::Mutex::new((0.0, 0.0)),
         clipboard: Arc::new(Clipboard::default()),
     };
-    Ok((frames, control, width, height))
+    Ok((frames, frame_overflow, control, width, height))
 }
 
 struct Control {

@@ -261,7 +261,7 @@ pub async fn start(
     let description = format!(
         "pipewiresrc path={} do-timestamp=true keepalive-time=500 {}! {} ! {} \
          ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au \
-         ! appsink name=sink sync=false max-buffers=8 drop=false",
+         ! appsink name=sink sync=false max-buffers={} drop=false",
         session.node_id,
         // A virtual monitor takes the size its consumer negotiates.
         virtual_size
@@ -270,7 +270,8 @@ pub async fn start(
             ))
             .unwrap_or_default(),
         converter(encoder),
-        encoder_description(encoder)
+        encoder_description(encoder),
+        QUEUE
     );
     tracing::info!("capture: {description}");
     let pipeline = gst::parse::launch(&description)
@@ -299,11 +300,13 @@ pub async fn start(
         .map_err(|e| format!("cannot start capture: {e}"))?;
 
     let (frames_tx, frames) = tokio::sync::mpsc::channel::<EncodedFrame>(QUEUE);
+    let frame_overflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (size_tx, size_rx) = tokio::sync::oneshot::channel::<(u32, u32)>();
     let puller = sink.clone();
+    let overflow = frame_overflow.clone();
     std::thread::Builder::new()
         .name("casement-capture".into())
-        .spawn(move || pull_frames(puller, frames_tx, size_tx))
+        .spawn(move || pull_frames(puller, frames_tx, overflow, size_tx))
         .map_err(|e| e.to_string())?;
 
     let (width, height) = match tokio::time::timeout(Duration::from_secs(10), size_rx).await {
@@ -321,6 +324,7 @@ pub async fn start(
         height,
         codec: "h264".into(),
         frames,
+        frame_overflow,
         control: Box::new(control),
         events: Some(events),
         monitors,

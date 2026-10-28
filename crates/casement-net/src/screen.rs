@@ -4,6 +4,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{atomic::AtomicBool, Arc};
 
 pub use casement_proto::Monitor;
 use casement_proto::{Input, FRAME_FLAG_KEYFRAME, FRAME_HEADER_LEN, MAX_FRAME};
@@ -41,6 +42,9 @@ pub struct ScreenStream {
     /// Bounded: when the network is slower than the encoder the provider must drop frames
     /// and continue from the next keyframe, never stall capture.
     pub frames: tokio::sync::mpsc::Receiver<EncodedFrame>,
+    /// Set by the provider when it drops a frame because this queue is full. The network
+    /// pump uses it to discard stale queued frames and restart from a fresh keyframe.
+    pub frame_overflow: Arc<AtomicBool>,
     pub control: Box<dyn ScreenControl>,
     pub events: Option<tokio::sync::mpsc::UnboundedReceiver<ScreenEvent>>,
     /// The host's monitors and the id of the one shown ("" for a virtual monitor).

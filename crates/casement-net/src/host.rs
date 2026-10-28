@@ -525,9 +525,20 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
                 screen_events = stream.events;
                 let control: Arc<dyn ScreenControl> = Arc::from(stream.control);
                 let mut frames = stream.frames;
+                let frame_overflow = stream.frame_overflow;
+                let video_control = control.clone();
                 let mut video = connection.open_uni().await?;
+                let _ = video.set_priority(1);
                 let pump = tokio::spawn(async move {
-                    while let Some(frame) = frames.recv().await {
+                    let mut waiting_for_keyframe = false;
+                    while let Some(frame) = next_video_frame(
+                        &mut frames,
+                        &frame_overflow,
+                        video_control.as_ref(),
+                        &mut waiting_for_keyframe,
+                    )
+                    .await
+                    {
                         if screen::write_frame(&mut video, &frame).await.is_err() {
                             break;
                         }
@@ -564,8 +575,96 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
     result
 }
 
+/// Drops queued stale frames after a provider overflow and resumes only at a keyframe.
+async fn next_video_frame(
+    frames: &mut tokio::sync::mpsc::Receiver<screen::EncodedFrame>,
+    overflow: &std::sync::atomic::AtomicBool,
+    control: &dyn ScreenControl,
+    waiting_for_keyframe: &mut bool,
+) -> Option<screen::EncodedFrame> {
+    loop {
+        let frame = frames.recv().await?;
+        if overflow.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            while frames.try_recv().is_ok() {}
+            *waiting_for_keyframe = true;
+            control.request_keyframe();
+            continue;
+        }
+        if *waiting_for_keyframe {
+            if !frame.keyframe {
+                continue;
+            }
+            *waiting_for_keyframe = false;
+        }
+        return Some(frame);
+    }
+}
+
 #[cfg(test)]
 mod socket_tests {
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use crate::screen::{EncodedFrame, ScreenControl};
+    use casement_proto::Input;
+
+    struct RecoveryControl(AtomicUsize);
+
+    impl ScreenControl for RecoveryControl {
+        fn request_keyframe(&self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn input(&self, _: Input) {}
+    }
+
+    fn frame(id: u8, keyframe: bool) -> EncodedFrame {
+        EncodedFrame {
+            pts_us: u64::from(id),
+            keyframe,
+            data: vec![id],
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_discards_stale_queue_and_waits_for_keyframe() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(3);
+        tx.try_send(frame(1, true)).unwrap();
+        tx.try_send(frame(2, false)).unwrap();
+        tx.try_send(frame(3, false)).unwrap();
+        let overflow = Arc::new(AtomicBool::new(false));
+        assert!(matches!(
+            tx.try_send(frame(4, false)),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+        ));
+        overflow.store(true, Ordering::Release);
+        let control = RecoveryControl(AtomicUsize::new(0));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let overflow_for_task = overflow.clone();
+        let task = tokio::spawn(async move {
+            let mut waiting = false;
+            let next = super::next_video_frame(&mut rx, &overflow_for_task, &control, &mut waiting);
+            let _ = ready_tx.send(());
+            let keyframe = next.await.unwrap();
+            let following =
+                super::next_video_frame(&mut rx, &overflow_for_task, &control, &mut waiting)
+                    .await
+                    .unwrap();
+            (keyframe, following, control.0.load(Ordering::Relaxed))
+        });
+        ready_rx.await.unwrap();
+        tx.send(frame(5, false)).await.unwrap();
+        tx.send(frame(6, true)).await.unwrap();
+        tx.send(frame(7, false)).await.unwrap();
+        let (keyframe, following, requests) = task.await.unwrap();
+        assert_eq!(keyframe.data, [6]);
+        assert!(keyframe.keyframe);
+        assert_eq!(following.data, [7]);
+        assert_eq!(requests, 1);
+    }
+
     #[test]
     fn ipv6_socket_hears_ipv4() {
         let socket = super::dual_stack_socket("[::]:0".parse().unwrap()).unwrap();
