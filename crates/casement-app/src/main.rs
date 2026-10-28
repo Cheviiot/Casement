@@ -21,6 +21,12 @@ const APP_ID: &str = "io.github.cheviiot.Casement";
 
 fn main() -> glib::ExitCode {
     casement_media::use_bundled_gstreamer();
+    // Windows: GTK's GL and Vulkan renderers paint the window's shadow black (GTK issue
+    // 7567; from 4.23 GTK itself falls back to Cairo there). The remote screen comes
+    // scaled to fit on the GPU, so Cairo only copies it.
+    if cfg!(windows) && std::env::var_os("GSK_RENDERER").is_none() {
+        std::env::set_var("GSK_RENDERER", "cairo");
+    }
     if let Err(e) = gstreamer::init() {
         eprintln!("GStreamer: {e}");
     }

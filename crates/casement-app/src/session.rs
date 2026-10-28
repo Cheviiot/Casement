@@ -4,6 +4,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use adw::prelude::*;
 use gstreamer as gst;
@@ -40,8 +42,12 @@ fn decoder() -> &'static str {
         "vah264dec ! vapostproc ! video/x-raw,format=BGRA"
     } else if has("vah264dec") {
         "vah264dec ! videoconvert"
+    } else if has("d3d11h264dec") && has("d3d11convert") && has("d3d11download") {
+        // Windows: Direct3D 11 decoding, colour conversion and scaling to the size the
+        // picture is shown at (the caps of `fit`, see Remote::refit).
+        "d3d11h264dec name=decoder ! d3d11convert add-borders=false \
+         ! capsfilter name=fit caps=video/x-raw(memory:D3D11Memory),format=BGRA ! d3d11download"
     } else if has("d3d11h264dec") {
-        // Windows: Direct3D 11 hardware decoding.
         "d3d11h264dec ! videoconvert"
     } else if has("avdec_h264") {
         "avdec_h264 ! videoconvert"
@@ -57,6 +63,13 @@ struct Remote {
     picture: gtk::Picture,
     width: Cell<u32>,
     height: Cell<u32>,
+    /// The decoded picture's size, when the pipeline scales it to fit (`fit`): width in
+    /// the high half, height in the low one.
+    source: Arc<AtomicU64>,
+    fit: RefCell<Option<gst::Element>>,
+    /// The size asked of `fit`, and a new one waiting for the window to stop resizing.
+    fitted: Cell<(i32, i32)>,
+    pending: Cell<Option<((i32, i32), i64)>>,
     input: RefCell<Option<InputSender>>,
     pressed: RefCell<HashSet<u32>>,
 }
@@ -75,11 +88,75 @@ impl Remote {
             picture,
             width: Cell::new(0),
             height: Cell::new(0),
+            source: Arc::new(AtomicU64::new(0)),
+            fit: RefCell::new(None),
+            fitted: Cell::new((0, 0)),
+            pending: Cell::new(None),
             input: RefCell::new(None),
             pressed: RefCell::new(HashSet::new()),
         });
         remote.attach_controllers();
+        let weak = Rc::downgrade(&remote);
+        remote.picture.add_tick_callback(move |_, clock| {
+            if let Some(remote) = weak.upgrade() {
+                remote.refit(clock.frame_time());
+            }
+            glib::ControlFlow::Continue
+        });
         remote
+    }
+
+    fn source_size(&self) -> Option<(u32, u32)> {
+        let packed = self.source.load(Ordering::Relaxed);
+        let (w, h) = ((packed >> 32) as u32, packed as u32);
+        (w > 0 && h > 0).then_some((w, h))
+    }
+
+    /// Asks the pipeline for the picture at the size it is shown at, in device pixels,
+    /// once the size has held for 100 ms (not on every step of a window resize).
+    fn refit(&self, now: i64) {
+        let Some(fit) = self.fit.borrow().clone() else {
+            return;
+        };
+        let Some((sw, sh)) = self.source_size() else {
+            return;
+        };
+        let scale = self.picture.scale_factor() as f64;
+        let (ww, wh) = (
+            self.picture.width() as f64 * scale,
+            self.picture.height() as f64 * scale,
+        );
+        if ww < 2.0 || wh < 2.0 {
+            return;
+        }
+        let ratio = (ww / sw as f64).min(wh / sh as f64);
+        let even = |v: f64| ((v.round() as i32) & !1).max(2);
+        let size = (even(sw as f64 * ratio), even(sh as f64 * ratio));
+        if size == self.fitted.get() {
+            self.pending.set(None);
+            return;
+        }
+        match self.pending.get() {
+            Some((waiting, since)) if waiting == size => {
+                if now - since < 100_000 {
+                    return;
+                }
+            }
+            _ => {
+                self.pending.set(Some((size, now)));
+                return;
+            }
+        }
+        self.pending.set(None);
+        self.fitted.set(size);
+        let caps = gst::Caps::builder("video/x-raw")
+            .features(["memory:D3D11Memory"])
+            .field("format", "BGRA")
+            .field("width", size.0)
+            .field("height", size.1)
+            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+            .build();
+        fit.set_property("caps", caps);
     }
 
     fn send(&self, kind: input::Kind) {
@@ -92,8 +169,9 @@ impl Remote {
     fn to_remote(&self, x: f64, y: f64) -> Option<(f64, f64)> {
         // The picture's own size follows a resized virtual monitor; fall back to the
         // size the host announced.
-        let (rw, rh) = match self.picture.paintable() {
-            Some(p) if p.intrinsic_width() > 0 && p.intrinsic_height() > 0 => {
+        let (rw, rh) = match (self.source_size(), self.picture.paintable()) {
+            (Some((w, h)), _) => (w as f64, h as f64),
+            (None, Some(p)) if p.intrinsic_width() > 0 && p.intrinsic_height() > 0 => {
                 (p.intrinsic_width() as f64, p.intrinsic_height() as f64)
             }
             _ => (self.width.get() as f64, self.height.get() as f64),
@@ -945,13 +1023,43 @@ impl SessionPage {
         Ok(src)
     }
 
+    /// When the pipeline scales to fit (`fit`), follows the decoded size, which pointer
+    /// positions are mapped to.
+    fn watch_fit(&self, pipeline: &gst::Pipeline) {
+        let remote = &self.remote;
+        remote.source.store(0, Ordering::Relaxed);
+        remote.fitted.set((0, 0));
+        remote.pending.set(None);
+        let fit = pipeline.by_name("fit");
+        let pad = pipeline
+            .by_name("decoder")
+            .and_then(|decoder| decoder.static_pad("src"));
+        if let (Some(_), Some(pad)) = (&fit, pad) {
+            let source = remote.source.clone();
+            pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+                if let Some(gst::PadProbeData::Event(event)) = &info.data {
+                    if let gst::EventView::Caps(caps) = event.view() {
+                        if let Some(s) = caps.caps().structure(0) {
+                            let w = s.get::<i32>("width").unwrap_or(0).max(0) as u64;
+                            let h = s.get::<i32>("height").unwrap_or(0).max(0) as u64;
+                            source.store(w << 32 | h, Ordering::Relaxed);
+                        }
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
+        remote.fit.replace(fit);
+    }
+
     /// Decoder pipeline whose sink paints into the picture; returns its appsrc.
     fn start_decoder(&self) -> Result<gst_app::AppSrc, String> {
+        // $CASEMENT_DECODER replaces the decoding part, for comparing pipelines.
+        let decoding = std::env::var("CASEMENT_DECODER").unwrap_or_else(|_| decoder().into());
         let description = format!(
             "appsrc name=src is-live=true format=time do-timestamp=true \
              caps=video/x-h264,stream-format=byte-stream,alignment=au \
-             ! h264parse ! {} ! gtk4paintablesink name=sink sync=false",
-            decoder()
+             ! h264parse ! {decoding} ! gtk4paintablesink name=sink sync=false"
         );
         let pipeline = gst::parse::launch(&description)
             .map_err(|e| e.to_string())?
@@ -960,6 +1068,7 @@ impl SessionPage {
         let sink = pipeline.by_name("sink").ok_or("no sink")?;
         let paintable = sink.property::<gtk::gdk::Paintable>("paintable");
         self.remote.picture.set_paintable(Some(&paintable));
+        self.watch_fit(&pipeline);
         let src = pipeline
             .by_name("src")
             .and_then(|e| e.downcast::<gst_app::AppSrc>().ok())
