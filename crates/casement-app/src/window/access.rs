@@ -153,69 +153,73 @@ impl Window {
         ));
     }
 
-    fn password_set(&self) -> bool {
-        if self.0.machine {
-            service::machine_access().is_some_and(|m| m.password)
-        } else {
-            has_password(&self.0.core.dir)
-        }
-    }
-
     pub(super) fn refresh_access(&self) {
-        let password = self.password_set();
-        self.0.password_row.set_subtitle(if password {
-            "Задан"
+        let machine_access = self.0.machine.then(service::machine_access).flatten();
+        let password = if self.0.machine {
+            machine_access
+                .as_ref()
+                .map(|access| access.password)
+                .ok_or(())
         } else {
-            "Не задан"
+            has_password(&self.0.core.dir).map_err(|_| ())
+        };
+        self.0.password_row.set_subtitle(match password {
+            Ok(true) => "Задан",
+            Ok(false) => "Не задан",
+            Err(()) => "Не удалось прочитать",
         });
         let store = if self.0.machine {
-            TrustStore::default()
+            None
         } else {
-            TrustStore::load(&self.0.core.dir).unwrap_or_default()
+            TrustStore::load(&self.0.core.dir).ok()
         };
-        let count = if self.0.machine {
-            service::machine_access().map_or(0, |m| m.trusted)
+        let trusted_count = if self.0.machine {
+            machine_access.as_ref().map(|access| access.trusted)
         } else {
-            store.devices().len()
+            store.as_ref().map(|store| store.devices().len())
         };
-        self.0.trusted_row.set_subtitle(&if count == 0 {
-            "Нет устройств".into()
-        } else {
-            count.to_string()
+        self.0.trusted_row.set_subtitle(&match trusted_count {
+            Some(0) => "Нет устройств".into(),
+            Some(count) => count.to_string(),
+            None => "Не удалось прочитать".into(),
         });
-        self.0
-            .access_status
-            .set_label(if !self.0.accept.is_active() {
-                "Приём выключен"
-            } else if !password {
-                "Только доверенные устройства"
-            } else {
-                "Приём включён"
-            });
+        self.0.access_status.set_label(
+            match (self.0.accept.is_active(), password, trusted_count) {
+                (false, _, _) => "Приём выключен",
+                (true, Ok(false), Some(_)) => "Только доверенные устройства",
+                (true, Err(()), _) | (true, _, None) => "Настройки доступа недоступны",
+                (true, Ok(true), Some(_)) => "Приём включён",
+            },
+        );
         if self.0.trusted_stack.child_by_name("list").is_some() {
-            self.0
-                .trusted_stack
-                .set_visible_child_name(if count == 0 { "empty" } else { "list" });
+            let child = match trusted_count {
+                None => "error",
+                Some(0) => "empty",
+                Some(_) => "list",
+            };
+            self.0.trusted_stack.set_visible_child_name(child);
         }
         self.0.trusted_list.remove_all();
-        for (fingerprint, name) in store.devices() {
-            let name = if name.is_empty() {
-                "Без имени".to_string()
-            } else {
-                name.clone()
-            };
-            let row = adw::ActionRow::builder()
-                .title(glib::markup_escape_text(&name).as_str())
-                .subtitle(fingerprint.display())
-                .title_lines(1)
-                .subtitle_lines(1)
-                .build();
-            row.add_prefix(&pages::icon_tile("computer-symbolic"));
-            let remove = flat_icon("user-trash-symbolic", "Отозвать доверие");
-            let (this, fingerprint) = (self.clone(), *fingerprint);
-            remove.connect_clicked(move |_| this.distrust(fingerprint, name.clone()));
-            row.add_suffix(&remove);
-            self.0.trusted_list.append(&row);
+        if let Some(store) = store {
+            for (fingerprint, name) in store.devices() {
+                let name = if name.is_empty() {
+                    "Без имени".to_string()
+                } else {
+                    name.clone()
+                };
+                let row = adw::ActionRow::builder()
+                    .title(glib::markup_escape_text(&name).as_str())
+                    .subtitle(fingerprint.display())
+                    .title_lines(1)
+                    .subtitle_lines(1)
+                    .build();
+                row.add_prefix(&pages::icon_tile("computer-symbolic"));
+                let remove = flat_icon("user-trash-symbolic", "Отозвать доверие");
+                let (this, fingerprint) = (self.clone(), *fingerprint);
+                remove.connect_clicked(move |_| this.distrust(fingerprint, name.clone()));
+                row.add_suffix(&remove);
+                self.0.trusted_list.append(&row);
+            }
         }
     }
 
@@ -252,6 +256,18 @@ impl Window {
                         .build(),
                     Some("empty"),
                 );
+                let retry = gtk::Button::builder()
+                    .label("Повторить")
+                    .css_classes(["suggested-action"])
+                    .build();
+                let status = adw::StatusPage::builder()
+                    .icon_name("dialog-error-symbolic")
+                    .title("Не удалось прочитать")
+                    .child(&retry)
+                    .build();
+                let this = self.clone();
+                retry.connect_clicked(move |_| this.refresh_access());
+                self.0.trusted_stack.add_named(&status, Some("error"));
                 pages::frame(
                     "Доверенные устройства",
                     "trusted",

@@ -10,7 +10,13 @@ use crate::core;
 use crate::pages;
 
 pub(super) fn open(window: &Window) {
-    let remove_password = has_password(&window.0.core.dir);
+    let remove_password = match has_password(&window.0.core.dir) {
+        Ok(has_password) => has_password,
+        Err(_) => {
+            window.toast("Не удалось прочитать пароль доступа");
+            return;
+        }
+    };
     let content = adw::PreferencesPage::new();
     let first = adw::PasswordEntryRow::builder()
         .title("Новый пароль")

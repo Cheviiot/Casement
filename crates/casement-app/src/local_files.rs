@@ -206,8 +206,8 @@ pub fn open(window: &Window, on_selected: impl Fn(Vec<PathBuf>) + 'static) {
         .tag("local-files")
         .child(&view)
         .build();
-    let initial =
-        glib::user_special_dir(glib::UserDirectory::Downloads).unwrap_or_else(glib::home_dir);
+    let initial = glib::user_special_dir(glib::UserDirectory::Downloads)
+        .unwrap_or_else(|| glib::home_dir().join("Downloads"));
     let browser = Rc::new(Browser {
         window: window.clone(),
         page: page.clone(),

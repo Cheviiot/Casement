@@ -45,8 +45,8 @@ struct Inner {
 
 const ACCEPT_OFF: &str = "accept-off";
 
-fn has_password(dir: &std::path::Path) -> bool {
-    matches!(StoredPassword::load(dir), Ok(Some(_)))
+fn has_password(dir: &std::path::Path) -> Result<bool, casement_net::auth::AuthError> {
+    StoredPassword::load(dir).map(|password| password.is_some())
 }
 
 #[derive(Clone)]
