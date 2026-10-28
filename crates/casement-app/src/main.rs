@@ -65,13 +65,13 @@ fn activate(app: &adw::Application) {
     let core = match core::Core::open(core::config_dir()) {
         Ok(core) => Rc::new(core),
         Err(e) => {
+            eprintln!("Casement: {e}");
             let close = pages::pill("Закрыть", "suggested-action");
             let app2 = app.clone();
             close.connect_clicked(move |_| app2.quit());
             let status = adw::StatusPage::builder()
-                .icon_name("dialog-error-symbolic")
+                .icon_name("dialog-password-symbolic")
                 .title("Ключ устройства недоступен")
-                .description(glib::markup_escape_text(&e).as_str())
                 .child(&close)
                 .build();
             let navigation = adw::NavigationView::new();
@@ -83,6 +83,7 @@ fn activate(app: &adw::Application) {
                 .content(&navigation)
                 .build();
             window.present();
+            schedule_snapshot(window, app.clone());
             return;
         }
     };
@@ -119,15 +120,17 @@ fn activate(app: &adw::Application) {
             window.open_dev_page(&page);
         }
     }
+    schedule_snapshot(window.widget(), app.clone());
+}
+
+fn schedule_snapshot(window: adw::ApplicationWindow, app: adw::Application) {
     if let Ok(path) = std::env::var("CASEMENT_SNAPSHOT") {
         let delay = std::env::var("CASEMENT_SNAPSHOT_DELAY")
             .ok()
             .and_then(|d| d.parse().ok())
             .unwrap_or(2500u64);
-        let widget = window.widget();
-        let app = app.clone();
         glib::timeout_add_local_once(Duration::from_millis(delay), move || {
-            snapshot_after_paint(widget, path, app)
+            snapshot_after_paint(window, path, app)
         });
     }
 }

@@ -11,4 +11,12 @@ CASEMENT_CONFIG_DIR="$work/config" CASEMENT_UI_CHECK="$work/result.txt" \
     scripts/dev/ui-check "$work/window.png"
 cat "$work/result.txt"
 test "$(head -n 1 "$work/result.txt")" = PASS
+mkdir "$work/broken"
+printf '%s\n' 'damaged fixture' > "$work/broken/device.key"
+cp "$work/broken/device.key" "$work/expected-damaged-key"
+CASEMENT_CONFIG_DIR="$work/broken" CASEMENT_UI_CHECK= \
+    scripts/dev/ui-check "$work/startup-error.png"
+test -s "$work/startup-error.png"
+cmp "$work/expected-damaged-key" "$work/broken/device.key"
+echo "Startup error page preserves the damaged key and completes its snapshot: PASS"
 echo "Report and snapshot: $work"
