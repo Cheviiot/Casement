@@ -1,0 +1,701 @@
+//! Host and client in one process over loopback: every login path of stage 1.
+
+use std::net::SocketAddr;
+use std::path::Path;
+
+use casement_proto::ErrorCode;
+
+use crate::auth::{StoredPassword, TrustStore};
+use crate::client::{self, ClientInfo};
+use crate::host::{Host, HostConfig, HostEvent};
+use crate::identity::{Fingerprint, Identity};
+use crate::NetError;
+
+const PASSWORD: &str = "correct horse battery";
+
+/// A screen that sends numbered frames and records the input it gets.
+#[derive(Default)]
+struct FakeScreen {
+    inputs: std::sync::Arc<std::sync::Mutex<Vec<casement_proto::Input>>>,
+    keyframes: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    clipboard: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+/// Sound that sends numbered packets every 5 ms until the stream is dropped.
+struct FakeAudio;
+
+impl crate::audio::AudioProvider for FakeAudio {
+    fn start(&self) -> crate::audio::AudioStartFuture {
+        let (tx, packets) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            for n in 0u64.. {
+                let packet = crate::audio::AudioPacket {
+                    pts_us: n * 5000,
+                    data: vec![n as u8; 200],
+                };
+                if tx.send(packet).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+        Box::pin(async move {
+            Ok(crate::audio::AudioStream {
+                format: crate::audio::AudioFormat {
+                    codec: "opus".into(),
+                    rate: 48000,
+                    channels: 2,
+                },
+                packets,
+            })
+        })
+    }
+}
+
+struct FakeControl {
+    inputs: std::sync::Arc<std::sync::Mutex<Vec<casement_proto::Input>>>,
+    keyframes: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    clipboard: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    events: tokio::sync::mpsc::UnboundedSender<crate::screen::ScreenEvent>,
+}
+
+impl crate::screen::ScreenControl for FakeControl {
+    fn request_keyframe(&self) {
+        self.keyframes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn input(&self, input: casement_proto::Input) {
+        self.inputs.lock().unwrap().push(input);
+    }
+    fn clipboard(&self, text: String) {
+        // Echo it back changed, as if an application on the host copied something.
+        let _ = self
+            .events
+            .send(crate::screen::ScreenEvent::Clipboard(format!(
+                "host: {text}"
+            )));
+        self.clipboard.lock().unwrap().push(text);
+    }
+}
+
+impl crate::screen::ScreenProvider for FakeScreen {
+    fn start(&self, request: crate::screen::ScreenRequest) -> crate::screen::StartFuture {
+        let max_width = request.max_width;
+        let monitors = vec![
+            crate::screen::Monitor {
+                id: "FAKE-1".into(),
+                name: "Первый".into(),
+                width: 1920,
+                height: 1080,
+                primary: true,
+            },
+            crate::screen::Monitor {
+                id: "FAKE-2".into(),
+                name: "Второй".into(),
+                width: 1280,
+                height: 1024,
+                primary: false,
+            },
+        ];
+        let monitor = if request.monitor.is_empty() {
+            "FAKE-1".to_string()
+        } else {
+            request.monitor.clone()
+        };
+        let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let control = FakeControl {
+            inputs: self.inputs.clone(),
+            keyframes: self.keyframes.clone(),
+            clipboard: self.clipboard.clone(),
+            events: events_tx,
+        };
+        Box::pin(async move {
+            let (tx, frames) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                for n in 0..5u64 {
+                    let frame = crate::screen::EncodedFrame {
+                        pts_us: n * 16_666,
+                        keyframe: n == 0,
+                        data: vec![n as u8; 1000 + n as usize],
+                    };
+                    if tx.send(frame).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            Ok(crate::screen::ScreenStream {
+                width: max_width.min(1920),
+                height: 1080,
+                codec: "h264".into(),
+                frames,
+                control: Box::new(control),
+                events: Some(events),
+                monitors,
+                monitor,
+            })
+        })
+    }
+}
+
+struct Running {
+    addr: SocketAddr,
+    fingerprint: Fingerprint,
+    host: std::sync::Arc<Host>,
+    events: tokio::sync::mpsc::UnboundedReceiver<HostEvent>,
+}
+
+fn start_host(dir: &Path, password: Option<&str>) -> Running {
+    let identity = Identity::load_or_create(&dir.join("host")).unwrap();
+    let fingerprint = identity.fingerprint();
+    let password = password.map(|p| StoredPassword::create(p).unwrap());
+    let trust = TrustStore::load(&dir.join("host")).unwrap();
+    let config = HostConfig {
+        name: "test-host".into(),
+        os: "linux".into(),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        allow_any_source: false,
+        screen: Some(std::sync::Arc::new(FakeScreen::default())),
+        files_dir: Some(dir.join("host").join("downloads")),
+        shared_dir: Some(dir.join("host").join("shared")),
+        audio: Some(std::sync::Arc::new(FakeAudio)),
+    };
+    let (host, events) = Host::bind(identity, config, password, trust).unwrap();
+    let host = std::sync::Arc::new(host);
+    let addr = host.local_addr().unwrap();
+    let runner = host.clone();
+    tokio::spawn(async move { runner.run().await });
+    Running {
+        addr,
+        fingerprint,
+        host,
+        events,
+    }
+}
+
+fn client_identity(dir: &Path, name: &str) -> Identity {
+    Identity::load_or_create(&dir.join(name)).unwrap()
+}
+
+fn info(remember: bool) -> ClientInfo {
+    ClientInfo {
+        name: "test-client".into(),
+        os: "linux".into(),
+        remember,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_use_password_then_trusted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut host = start_host(dir.path(), Some(PASSWORD));
+    let me = client_identity(dir.path(), "client");
+
+    // First contact: nothing expected, the key is shown, a password is needed.
+    let handshake = client::connect(&me, host.addr, None, &info(true))
+        .await
+        .unwrap();
+    assert_eq!(handshake.host_fingerprint, host.fingerprint);
+    assert_eq!(handshake.host_name, "test-host");
+    assert!(handshake.needs_password());
+    let mut session = handshake.login(Some(PASSWORD)).await.unwrap();
+    assert!(session.remembered);
+    session.ping().await.unwrap();
+    match host.events.recv().await.unwrap() {
+        HostEvent::LoggedIn {
+            fingerprint,
+            trusted,
+            name,
+            ..
+        } => {
+            assert_eq!(fingerprint, me.fingerprint());
+            assert!(!trusted);
+            assert_eq!(name, "test-client");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    session.close();
+
+    // Second time: the host knows this device, no password at all.
+    let handshake = client::connect(&me, host.addr, Some(host.fingerprint), &info(true))
+        .await
+        .unwrap();
+    assert!(!handshake.needs_password());
+    let mut session = handshake.login(None).await.unwrap();
+    session.ping().await.unwrap();
+    session.close();
+    host.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn screen_frames_and_input() {
+    use casement_proto::{input, Input, Key, PointerMotion};
+    let dir = tempfile::tempdir().unwrap();
+    let identity = Identity::load_or_create(&dir.path().join("host")).unwrap();
+    let fake = std::sync::Arc::new(FakeScreen::default());
+    let (inputs, keyframes, clipboard) = (
+        fake.inputs.clone(),
+        fake.keyframes.clone(),
+        fake.clipboard.clone(),
+    );
+    let config = HostConfig {
+        name: "screen-host".into(),
+        os: "linux".into(),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        allow_any_source: false,
+        screen: Some(fake),
+        files_dir: None,
+        shared_dir: None,
+        audio: None,
+    };
+    let password = StoredPassword::create(PASSWORD).unwrap();
+    let (host, _events) =
+        Host::bind(identity, config, Some(password), TrustStore::default()).unwrap();
+    let host = std::sync::Arc::new(host);
+    let addr = host.local_addr().unwrap();
+    let runner = host.clone();
+    tokio::spawn(async move { runner.run().await });
+
+    let me = client_identity(dir.path(), "client");
+    let handshake = client::connect(&me, addr, None, &info(false))
+        .await
+        .unwrap();
+    let mut session = handshake.login(Some(PASSWORD)).await.unwrap();
+    let mut screen = session
+        .start_screen_with(crate::screen::ScreenRequest {
+            max_width: 1280,
+            max_height: 720,
+            monitor: "FAKE-2".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(screen.monitors.len(), 2);
+    assert_eq!(
+        (screen.monitors[0].name.as_str(), screen.monitors[0].primary),
+        ("Первый", true)
+    );
+    assert_eq!(screen.monitor, "FAKE-2");
+    assert_eq!(
+        client::clip_text(&"ж".repeat(600_000)).len(),
+        casement_proto::MAX_CLIPBOARD_TEXT
+    );
+    assert_eq!(
+        (screen.width, screen.height, screen.codec.as_str()),
+        (1280, 1080, "h264")
+    );
+    for n in 0..5u64 {
+        let frame = crate::screen::read_frame(&mut screen.video)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.pts_us, n * 16_666);
+        assert_eq!(frame.keyframe, n == 0);
+        assert_eq!(frame.data.len(), 1000 + n as usize);
+    }
+    assert!(
+        crate::screen::read_frame(&mut screen.video)
+            .await
+            .unwrap()
+            .is_none(),
+        "stream ends with the source"
+    );
+
+    let sender = session.input_sender();
+    sender
+        .send(&Input {
+            kind: Some(input::Kind::Motion(PointerMotion { x: 10.5, y: 20.0 })),
+        })
+        .unwrap();
+    sender
+        .send(&Input {
+            kind: Some(input::Kind::Key(Key {
+                code: 30,
+                pressed: true,
+            })),
+        })
+        .unwrap();
+    session.request_keyframe().await.unwrap();
+    session.ping().await.unwrap(); // the keyframe request is handled before this answer
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while inputs.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let got = inputs.lock().unwrap().clone();
+    assert_eq!(got.len(), 2, "both datagrams arrived on loopback");
+    assert_eq!(keyframes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Clipboard both ways, through the split session.
+    let (mut sender, mut receiver, handle) = session.split();
+    sender.clipboard("привет").await.unwrap();
+    let message = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        message,
+        Some(client::HostMessage::Clipboard("host: привет".into()))
+    );
+    assert_eq!(clipboard.lock().unwrap().as_slice(), ["привет".to_string()]);
+    handle.close();
+    host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrong_password_then_rate_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = start_host(dir.path(), Some(PASSWORD));
+    let me = client_identity(dir.path(), "client");
+
+    for _ in 0..3 {
+        let handshake = client::connect(&me, host.addr, None, &info(false))
+            .await
+            .unwrap();
+        let err = handshake
+            .login(Some("wrong password!"))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, NetError::AuthFailed), "{err:?}");
+    }
+    let err = client::connect(&me, host.addr, None, &info(false))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(
+            err,
+            NetError::Refused {
+                code: ErrorCode::RateLimited,
+                retry_after: 1..,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+
+    // Not remembered after failures: the right password still needs to be typed.
+    assert!(!TrustStore::load(&dir.path().join("host"))
+        .unwrap()
+        .contains(&me.fingerprint()));
+    host.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changed_key_is_refused_before_login() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = start_host(dir.path(), Some(PASSWORD));
+    let me = client_identity(dir.path(), "client");
+    let impostor_expectation = Fingerprint([0x42; 32]);
+    let err = client::connect(&me, host.addr, Some(impostor_expectation), &info(false))
+        .await
+        .err()
+        .unwrap();
+    match err {
+        NetError::KeyChanged { expected, seen } => {
+            assert_eq!(expected, impostor_expectation);
+            assert_eq!(seen, host.fingerprint);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    host.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_password_means_no_strangers() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = start_host(dir.path(), None);
+    let me = client_identity(dir.path(), "client");
+    let err = client::connect(&me, host.addr, None, &info(true))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(
+            err,
+            NetError::Refused {
+                code: ErrorCode::NoPasswordSet,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    host.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_password_is_reported_locally() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = start_host(dir.path(), Some(PASSWORD));
+    let me = client_identity(dir.path(), "client");
+    let handshake = client::connect(&me, host.addr, None, &info(false))
+        .await
+        .unwrap();
+    assert!(matches!(
+        handshake.login(None).await,
+        Err(NetError::PasswordRequired)
+    ));
+    host.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn other_protocol_version_is_refused_politely() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = start_host(dir.path(), Some(PASSWORD));
+    let me = client_identity(dir.path(), "client");
+    let err = client::connect_with_version(&me, host.addr, None, &info(false), 99)
+        .await
+        .err()
+        .unwrap();
+    match err {
+        NetError::Refused {
+            code: ErrorCode::VersionMismatch,
+            message,
+            ..
+        } => {
+            assert!(message.contains("99"), "{message}")
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    host.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nobody_listening_times_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let me = client_identity(dir.path(), "client");
+    // A bound but silent UDP socket: QUIC gets no answer.
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = silent.local_addr().unwrap();
+    let err = client::connect(&me, addr, None, &info(false))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(err, NetError::Timeout | NetError::Connection(_)),
+        "{err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn files_arrive_whole_and_never_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = start_host(dir.path(), Some(PASSWORD));
+    let me = client_identity(dir.path(), "client");
+    let handshake = client::connect(&me, host.addr, None, &info(false))
+        .await
+        .unwrap();
+    let session = handshake.login(Some(PASSWORD)).await.unwrap();
+
+    let source = dir.path().join("отчёт.bin");
+    let data: Vec<u8> = (0..3_000_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+        .collect();
+    std::fs::write(&source, &data).unwrap();
+    let mut last = (0, 0);
+    let saved = session
+        .send_file(&source, |sent, total| last = (sent, total))
+        .await
+        .unwrap();
+    assert_eq!(saved, "отчёт.bin");
+    assert_eq!(last, (3_000_000, 3_000_000));
+    let downloads = dir.path().join("host").join("downloads");
+    assert_eq!(std::fs::read(downloads.join("отчёт.bin")).unwrap(), data);
+
+    let again = session.send_file(&source, |_, _| {}).await.unwrap();
+    assert_eq!(again, "отчёт (1).bin");
+    let leftovers: Vec<_> = std::fs::read_dir(&downloads)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".casement-part"))
+        .collect();
+    assert!(leftovers.is_empty(), "no partial files stay behind");
+    session.close();
+    host.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_folder_lists_and_downloads_but_never_escapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared = dir.path().join("host").join("shared");
+    std::fs::create_dir_all(shared.join("Документы")).unwrap();
+    let data: Vec<u8> = (0..2_500_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(shared.join("Документы").join("план.bin"), &data).unwrap();
+    std::fs::write(shared.join("b.txt"), b"bee").unwrap();
+    std::fs::write(dir.path().join("secret.txt"), b"outside").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(dir.path(), shared.join("escape")).unwrap();
+
+    let host = start_host(dir.path(), Some(PASSWORD));
+    let me = client_identity(dir.path(), "client");
+    let handshake = client::connect(&me, host.addr, None, &info(false))
+        .await
+        .unwrap();
+    let session = handshake.login(Some(PASSWORD)).await.unwrap();
+
+    let top = session.list_files("").await.unwrap();
+    let names: Vec<_> = top
+        .entries
+        .iter()
+        .map(|e| (e.name.as_str(), e.is_dir))
+        .collect();
+    assert_eq!(names, [("Документы", true), ("b.txt", false)]);
+    assert!(names.contains(&("b.txt", false)));
+    let inner = session.list_files("Документы/").await.unwrap();
+    assert_eq!(inner.entries.len(), 1);
+    assert_eq!(inner.entries[0].size, data.len() as u64);
+
+    let target = dir.path().join("client-downloads");
+    let mut last = (0, 0);
+    let saved = session
+        .fetch_file("Документы/план.bin", &target, |got, total| {
+            last = (got, total)
+        })
+        .await
+        .unwrap();
+    assert_eq!(saved, target.join("план.bin"));
+    assert_eq!(std::fs::read(&saved).unwrap(), data);
+    assert_eq!(last, (data.len() as u64, data.len() as u64));
+    let again = session
+        .fetch_file("b.txt", &target, |_, _| {})
+        .await
+        .unwrap();
+    let twice = session
+        .fetch_file("b.txt", &target, |_, _| {})
+        .await
+        .unwrap();
+    assert_eq!(again, target.join("b.txt"));
+    assert_eq!(twice, target.join("b (1).txt"));
+
+    for bad in [
+        "../secret.txt",
+        "Документы/../../secret.txt",
+        "escape/secret.txt",
+        "nope.txt",
+    ] {
+        #[cfg(not(unix))]
+        if bad.starts_with("escape") {
+            continue;
+        }
+        let err = session
+            .fetch_file(bad, &target, |_, _| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NetError::Protocol(_)), "{bad}: {err:?}");
+    }
+    assert!(session.list_files("..").await.is_err());
+    assert!(session
+        .fetch_file("Документы", &target, |_, _| {})
+        .await
+        .is_err());
+    session.close();
+    host.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sound_arrives_as_datagrams() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = start_host(dir.path(), Some(PASSWORD));
+    let me = client_identity(dir.path(), "client");
+    let handshake = client::connect(&me, host.addr, None, &info(false))
+        .await
+        .unwrap();
+    let mut session = handshake.login(Some(PASSWORD)).await.unwrap();
+    let format = session.start_audio().await.unwrap();
+    assert_eq!(
+        (format.codec.as_str(), format.rate, format.channels),
+        ("opus", 48000, 2)
+    );
+    let audio = session.audio_receiver();
+    let mut last = None;
+    for _ in 0..20 {
+        let packet = tokio::time::timeout(std::time::Duration::from_secs(5), audio.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(packet.data.len(), 200);
+        assert_eq!(packet.data[0] as u64, packet.pts_us / 5000 % 256);
+        if let Some(previous) = last {
+            assert!(packet.pts_us > previous, "packets in order on loopback");
+        }
+        last = Some(packet.pts_us);
+    }
+    // The control stream still works alongside the sound.
+    session.ping().await.unwrap();
+    session.close();
+    host.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sound_is_refused_when_not_shared() {
+    let dir = tempfile::tempdir().unwrap();
+    let identity = Identity::load_or_create(&dir.path().join("host")).unwrap();
+    let config = HostConfig {
+        name: "quiet-host".into(),
+        os: "linux".into(),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        allow_any_source: false,
+        screen: None,
+        files_dir: None,
+        shared_dir: None,
+        audio: None,
+    };
+    let password = StoredPassword::create(PASSWORD).unwrap();
+    let (host, _events) =
+        Host::bind(identity, config, Some(password), TrustStore::default()).unwrap();
+    let host = std::sync::Arc::new(host);
+    let addr = host.local_addr().unwrap();
+    let runner = host.clone();
+    tokio::spawn(async move { runner.run().await });
+    let me = client_identity(dir.path(), "client");
+    let handshake = client::connect(&me, addr, None, &info(false))
+        .await
+        .unwrap();
+    let mut session = handshake.login(Some(PASSWORD)).await.unwrap();
+    let err = session.start_audio().await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            NetError::Refused {
+                code: ErrorCode::NotAllowed,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    session.ping().await.unwrap();
+    session.close();
+    host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandoned_password_attempts_count_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = start_host(dir.path(), Some(PASSWORD));
+    let me = client_identity(dir.path(), "client");
+    // Start logins and drop them half-way, as a guesser hiding failures would.
+    for _ in 0..3 {
+        let handshake = client::connect(&me, host.addr, None, &info(false))
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(400),
+            handshake.login(Some("guess-guess-1")),
+        )
+        .await;
+    }
+    let err = client::connect(&me, host.addr, None, &info(false))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(
+            err,
+            NetError::Refused {
+                code: ErrorCode::RateLimited,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    host.host.close();
+}

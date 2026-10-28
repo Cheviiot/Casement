@@ -1,0 +1,9 @@
+#!/bin/sh
+# Runs a command from the repository root inside the Distrobox container oriel-dev
+# (Fedora 44, see docs/DEVELOPMENT.md) at low priority, with the project's cargo:
+#   scripts/dev/in-box scripts/package-windows
+set -e
+cd "$(dirname "$0")/../.."
+exec podman exec --user "$(id -un)" -w "$PWD" \
+    -e CARGO="$PWD/scripts/cargo" -e JOBS="${JOBS:-4}" \
+    oriel-dev ionice -c 3 nice -n 19 "$@"

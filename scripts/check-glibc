@@ -1,0 +1,11 @@
+#!/bin/sh
+# Fails when a binary needs a newer glibc than the oldest system we run on
+# (ALT p11: 2.38). Building in Fedora can bind weak symbols to newer versions.
+#   check-glibc BINARY [MAX_MINOR]
+binary=$1 max=${2:-38}
+newer=$(objdump -T "$binary" | grep -oE 'GLIBC_2\.[0-9]+' | sort -u | awk -F. -v max="$max" '$2 > max')
+if [ -n "$newer" ]; then
+	echo "$binary needs $newer (allowed up to GLIBC_2.$max):"
+	objdump -T "$binary" | grep -E "$(echo "$newer" | tr '\n' '|' | sed 's/|$//')"
+	exit 1
+fi

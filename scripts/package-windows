@@ -1,0 +1,70 @@
+#!/bin/sh
+# Cross-builds casement.exe, casement-host.exe and casement-cli.exe, collects them with
+# the GTK, Libadwaita and GStreamer DLLs, plugins and data they need (bin/ and
+# lib/gstreamer-1.0/, the layout GStreamer finds its plugins in) and makes
+# dist/casement-VERSION-windows-x86_64-setup.exe (NSIS) and a portable zip of the same. Runs in a Fedora environment with the mingw
+# packages listed in docs/DEVELOPMENT.md (mingw32-nsis for the installer) and Libadwaita from build-libadwaita-mingw
+# (MINGW_ADWAITA, default ~/.local/share/toolchains/mingw-libadwaita).
+set -e
+cd "$(dirname "$0")/.."
+cargo=${CARGO:-cargo}
+version=$(scripts/version)
+mingw=/usr/x86_64-w64-mingw32/sys-root/mingw
+adw=${MINGW_ADWAITA:-$HOME/.local/share/toolchains/mingw-libadwaita}
+PKG_CONFIG_ALLOW_CROSS=1 \
+PKG_CONFIG_x86_64_pc_windows_gnu=x86_64-w64-mingw32-pkg-config \
+PKG_CONFIG_PATH="$adw/lib/pkgconfig" \
+CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-L $adw/lib" \
+    "$cargo" build --release -j "${JOBS:-$(nproc)}" --target x86_64-pc-windows-gnu \
+    -p casement -p casement-cli -p casement-host
+
+out=build/windows/Casement
+rm -rf build/windows && mkdir -p "$out/bin" "$out/lib/gstreamer-1.0"
+for exe in casement casement-cli casement-host; do
+    cp "target/x86_64-pc-windows-gnu/release/$exe.exe" "$out/bin/"
+done
+cp "$adw/bin/libadwaita-1-0.dll" "$out/bin/"
+# Capture, encoders, decoding and display, parsing, appsink, sound.
+for p in coreelements app videoconvertscale videoparsersbad d3d11 d3d12 amfcodec qsv \
+    nvcodec mediafoundation wasapi wasapi2 audioconvert audioresample opusparse \
+    autodetect volume playback typefindfunctions; do
+    f="$mingw/lib/gstreamer-1.0/libgst$p.dll"
+    if [ -e "$f" ]; then cp "$f" "$out/lib/gstreamer-1.0/"; else echo "plugin $p not available"; fi
+done
+if [ -d "$mingw/libexec/gstreamer-1.0" ]; then
+    mkdir -p "$out/libexec" && cp -r "$mingw/libexec/gstreamer-1.0" "$out/libexec/"
+fi
+# Every DLL the programs, Libadwaita and the plugins import, transitively.
+todo=$(ls "$out"/bin/*.exe "$out"/bin/*.dll "$out"/lib/gstreamer-1.0/*.dll \
+    "$out"/libexec/gstreamer-1.0/*.exe 2>/dev/null)
+while [ -n "$todo" ]; do
+    next=""
+    for f in $todo; do
+        for dll in $(x86_64-w64-mingw32-objdump -p "$f" | sed -n 's/.*DLL Name: //p'); do
+            [ -e "$out/bin/$dll" ] && continue
+            src="$mingw/bin/$dll"
+            [ -e "$src" ] || src="$adw/bin/$dll"
+            [ -e "$src" ] || continue   # a Windows system DLL
+            cp "$src" "$out/bin/"
+            next="$next $out/bin/$dll"
+        done
+    done
+    todo=$next
+done
+# GTK data: settings schemas (compiled) and the icon themes.
+mkdir -p "$out/share/glib-2.0/schemas" "$out/share/icons"
+cp "$mingw"/share/glib-2.0/schemas/*.xml "$out/share/glib-2.0/schemas/"
+glib-compile-schemas "$out/share/glib-2.0/schemas"
+cp -r "$mingw/share/icons/Adwaita" "$mingw/share/icons/hicolor" "$out/share/icons/"
+cp LICENSE data/casement.ico "$out/"
+
+mkdir -p dist
+# The installer, and the same files as a portable archive.
+setup="dist/casement-$version-windows-x86_64-setup.exe"
+makensis -V2 -DVERSION="$version" -DSOURCE="$PWD/$out" -DOUTFILE="$PWD/$setup" \
+    -DLICENSE="$PWD/LICENSE" -DICON="$PWD/data/casement.ico" packaging/windows/casement.nsi
+zip="dist/casement-$version-windows-x86_64-portable.zip"
+rm -f "$zip"
+(cd build/windows && zip -qr "../../$zip" Casement)
+echo "$setup"
+echo "$zip"

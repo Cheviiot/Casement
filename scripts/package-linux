@@ -1,0 +1,23 @@
+#!/bin/sh
+# Packs the release build (cargo build --release) with its desktop files and the
+# installer into dist/casement-VERSION-linux-x86_64.tar.gz.
+set -e
+cd "$(dirname "$0")/.."
+version=$(scripts/version)
+name=casement-$version-linux-x86_64
+stage=build/linux/$name
+rm -rf build/linux && mkdir -p "$stage/bin" "$stage/share/applications" \
+    "$stage/share/icons/hicolor/scalable/apps" "$stage/share/casement" "$stage/share/metainfo"
+for b in casement casement-host casement-cli; do
+    scripts/check-glibc "target/release/$b"
+    install -m 755 "target/release/$b" "$stage/bin/"
+done
+install -m 644 data/io.github.cheviiot.Casement.desktop "$stage/share/applications/"
+install -m 644 data/io.github.cheviiot.Casement.svg "$stage/share/icons/hicolor/scalable/apps/"
+install -m 644 data/casement-host.service "$stage/share/casement/"
+install -m 644 data/io.github.cheviiot.Casement.metainfo.xml "$stage/share/metainfo/"
+install -m 755 packaging/linux/install.sh packaging/linux/uninstall.sh "$stage/"
+install -m 644 LICENSE "$stage/"
+mkdir -p dist
+tar -C build/linux -czf "dist/$name.tar.gz" "$name"
+echo "dist/$name.tar.gz"

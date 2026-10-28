@@ -1,0 +1,3 @@
+#!/bin/sh
+# Prints the version from the workspace Cargo.toml.
+sed -n 's/^version = "\(.*\)"/\1/p' "$(dirname "$0")/../Cargo.toml" | head -1

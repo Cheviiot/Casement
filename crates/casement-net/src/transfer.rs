@@ -1,0 +1,486 @@
+//! Files between client and host: one bidirectional QUIC stream per request.
+//!
+//! Upload — client: FileOffer{name, size} → host: FileReply{accepted} → client: the
+//! bytes, then FileDone{sha256} → host: FileReply{accepted, message = saved name}.
+//! Browse — client: FileList{path} → host: FileListing.
+//! Download — client: FileFetch{path} → host: FileOffer{name, size}, the bytes, then
+//! FileDone{sha256}.
+//! Refusals on browse and download are a Failure. The receiving side writes to a hidden
+//! temporary file and renames it only when the size and SHA-256 match, never overwriting
+//! an existing file. Browsing and downloading stay inside the host's shared folder.
+
+use std::path::{Path, PathBuf};
+
+use casement_proto::{
+    control::Kind, Control, ErrorCode, FileDone, FileEntry, FileFetch, FileList, FileListing,
+    FileOffer, FileReply,
+};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use crate::{framing, NetError};
+
+const CHUNK: usize = 256 * 1024;
+/// Most entries in one listing; keeps the answer well below the control frame limit.
+pub const MAX_LISTING: usize = 4000;
+
+/// Where the host keeps files: uploads go to `incoming`, browsing and downloads stay in
+/// `shared`; None refuses that direction.
+#[derive(Clone, Debug, Default)]
+pub struct HostFiles {
+    pub incoming: Option<PathBuf>,
+    pub shared: Option<PathBuf>,
+}
+
+/// What a host-side file stream did, for the host's owner.
+pub(crate) enum Served {
+    Received(PathBuf, u64),
+    Sent(PathBuf, u64),
+    Listed,
+}
+
+/// The file name to use on the host, or None if nothing usable is left: no directories,
+/// no control characters, at most 200 characters.
+pub fn safe_name(name: &str) -> Option<String> {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let clean: String = base.chars().filter(|c| !c.is_control()).take(200).collect();
+    let clean = clean.trim().trim_start_matches('.').to_string();
+    (!clean.is_empty()).then_some(clean)
+}
+
+/// `dir/name`, or `dir/stem (N).ext` when that exists.
+pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
+        _ => (name.to_string(), String::new()),
+    };
+    (1..)
+        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
+        .find(|p| !p.exists())
+        .expect("some name is free")
+}
+
+async fn reply(
+    send: &mut quinn::SendStream,
+    accepted: bool,
+    message: &str,
+) -> Result<(), NetError> {
+    let reply = FileReply {
+        accepted,
+        message: message.to_string(),
+    };
+    framing::write(send, &Control::new(Kind::FileReply(reply))).await
+}
+
+/// Host side: answers one file stream.
+pub(crate) async fn serve(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    files: &HostFiles,
+) -> Result<Served, NetError> {
+    let first = framing::expect(&mut recv).await?.kind;
+    let result = match (first, files) {
+        (
+            Some(Kind::FileOffer(offer)),
+            HostFiles {
+                incoming: Some(dir),
+                ..
+            },
+        ) => {
+            return receive(send, recv, offer, dir)
+                .await
+                .map(|(p, n)| Served::Received(p, n))
+        }
+        (Some(Kind::FileOffer(_)), _) => {
+            reply(&mut send, false, "this computer does not accept files").await?;
+            let _ = send.finish();
+            return Err(NetError::Protocol("files are not accepted".into()));
+        }
+        (
+            Some(Kind::FileList(list)),
+            HostFiles {
+                shared: Some(root), ..
+            },
+        ) => list_folder(&mut send, root, &list.path)
+            .await
+            .map(|_| Served::Listed),
+        (
+            Some(Kind::FileFetch(fetch)),
+            HostFiles {
+                shared: Some(root), ..
+            },
+        ) => send_shared(&mut send, root, &fetch.path).await,
+        (Some(Kind::FileList(_) | Kind::FileFetch(_)), _) => Err(NetError::Protocol(
+            "this computer does not share its files".into(),
+        )),
+        _ => Err(NetError::Protocol("unexpected first message".into())),
+    };
+    if let Err(e) = &result {
+        let message = match e {
+            NetError::Protocol(m) => m.clone(),
+            other => other.to_string(),
+        };
+        let _ = framing::write(&mut send, &Control::failure(ErrorCode::NotAllowed, message)).await;
+    }
+    let _ = send.finish();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), send.stopped()).await;
+    result
+}
+
+/// `rel` ('/'-separated, relative) inside `root`, with links resolved; refuses anything
+/// that ends up outside.
+pub(crate) async fn resolve(root: &Path, rel: &str) -> Result<PathBuf, NetError> {
+    let outside = || NetError::Protocol("that is outside the shared folder".into());
+    let mut path = root.to_path_buf();
+    for part in rel.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return Err(outside()),
+            p if p.contains(['\\', '\0']) || (cfg!(windows) && p.contains(':')) => {
+                return Err(outside())
+            }
+            p => path.push(p),
+        }
+    }
+    let missing = |_| NetError::Protocol("no such file or folder".into());
+    let real = tokio::fs::canonicalize(&path).await.map_err(missing)?;
+    let root = tokio::fs::canonicalize(root).await.map_err(missing)?;
+    if !real.starts_with(&root) {
+        return Err(outside());
+    }
+    Ok(real)
+}
+
+fn seconds(time: std::io::Result<std::time::SystemTime>) -> u64 {
+    time.ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs())
+}
+
+async fn list_folder(send: &mut quinn::SendStream, root: &Path, rel: &str) -> Result<(), NetError> {
+    let dir = resolve(root, rel).await?;
+    let real_root = tokio::fs::canonicalize(root).await?;
+    let mut read = tokio::fs::read_dir(&dir)
+        .await
+        .map_err(|e| NetError::Protocol(format!("cannot open the folder: {e}")))?;
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    while let Some(entry) = read.next_entry().await? {
+        if entries.len() == MAX_LISTING {
+            truncated = true;
+            break;
+        }
+        // Follow links so a linked folder opens like a folder; skip broken ones and
+        // those that lead out of the shared folder.
+        let Ok(meta) = tokio::fs::metadata(entry.path()).await else {
+            continue;
+        };
+        if entry.file_type().await.is_ok_and(|t| t.is_symlink()) {
+            match tokio::fs::canonicalize(entry.path()).await {
+                Ok(real) if real.starts_with(&real_root) => {}
+                _ => continue,
+            }
+        }
+        if !(meta.is_dir() || meta.is_file()) {
+            continue;
+        }
+        entries.push(FileEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            is_dir: meta.is_dir(),
+            size: if meta.is_file() { meta.len() } else { 0 },
+            modified: seconds(meta.modified()),
+        });
+    }
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    let listing = FileListing {
+        path: rel.trim_matches('/').to_string(),
+        entries,
+        truncated,
+    };
+    framing::write(send, &Control::new(Kind::FileListing(listing))).await
+}
+
+async fn send_shared(
+    send: &mut quinn::SendStream,
+    root: &Path,
+    rel: &str,
+) -> Result<Served, NetError> {
+    let path = resolve(root, rel).await?;
+    let mut file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| NetError::Protocol(format!("cannot open the file: {e}")))?;
+    let meta = file.metadata().await?;
+    if !meta.is_file() {
+        return Err(NetError::Protocol("that is a folder, not a file".into()));
+    }
+    let size = meta.len();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    framing::write(
+        send,
+        &Control::new(Kind::FileOffer(FileOffer { name, size })),
+    )
+    .await?;
+    let sha256 = write_bytes(send, &mut file, size, |_, _| {}).await?;
+    framing::write(send, &Control::new(Kind::FileDone(FileDone { sha256 }))).await?;
+    Ok(Served::Sent(path, size))
+}
+
+/// Copies exactly `size` bytes of `file` to the stream; returns their SHA-256.
+async fn write_bytes(
+    send: &mut quinn::SendStream,
+    file: &mut tokio::fs::File,
+    size: u64,
+    mut progress: impl FnMut(u64, u64) + Send,
+) -> Result<Vec<u8>, NetError> {
+    let mut hasher = Sha256::new();
+    let mut sent = 0u64;
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let got = file.read(&mut buf).await?;
+        if got == 0 {
+            break;
+        }
+        hasher.update(&buf[..got]);
+        send.write_all(&buf[..got])
+            .await
+            .map_err(|e| NetError::Stream(e.to_string()))?;
+        sent += got as u64;
+        progress(sent, size);
+    }
+    if sent != size {
+        return Err(NetError::Protocol(
+            "the file changed while it was being sent".into(),
+        ));
+    }
+    Ok(hasher.finalize().to_vec())
+}
+
+/// Reads exactly `size` bytes from the stream into `file`, then the FileDone that must
+/// carry their SHA-256.
+async fn read_bytes(
+    recv: &mut quinn::RecvStream,
+    file: &mut tokio::fs::File,
+    size: u64,
+    mut progress: impl FnMut(u64, u64) + Send,
+) -> Result<(), NetError> {
+    let mut hasher = Sha256::new();
+    let mut left = size;
+    let mut buf = vec![0u8; CHUNK];
+    while left > 0 {
+        let want = buf.len().min(left as usize);
+        let got = recv
+            .read(&mut buf[..want])
+            .await
+            .map_err(|e| NetError::Stream(e.to_string()))?
+            .ok_or_else(|| NetError::Protocol("the file ended early".into()))?;
+        hasher.update(&buf[..got]);
+        file.write_all(&buf[..got]).await?;
+        left -= got as u64;
+        progress(size - left, size);
+    }
+    file.flush().await?;
+    file.sync_all().await?;
+    let done = match framing::expect(recv).await?.kind {
+        Some(Kind::FileDone(done)) => done,
+        _ => return Err(NetError::Protocol("expected the file checksum".into())),
+    };
+    if done.sha256 != hasher.finalize().as_slice() {
+        return Err(NetError::Protocol(
+            "the file arrived damaged (checksum differs)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Host side: receives one offered file into `dir`; returns where it was saved and its
+/// size.
+async fn receive(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    offer: FileOffer,
+    dir: &Path,
+) -> Result<(PathBuf, u64), NetError> {
+    let Some(name) = safe_name(&offer.name) else {
+        reply(&mut send, false, "unusable file name").await?;
+        return Err(NetError::Protocol("unusable file name".into()));
+    };
+    tokio::fs::create_dir_all(dir).await?;
+    let partial = dir.join(format!(".{name}.casement-part"));
+    let mut file = tokio::fs::File::create(&partial).await?;
+    reply(&mut send, true, "").await?;
+
+    let result: Result<(PathBuf, u64), NetError> = async {
+        read_bytes(&mut recv, &mut file, offer.size, |_, _| {}).await?;
+        let path = unique_path(dir, &name);
+        tokio::fs::rename(&partial, &path).await?;
+        Ok((path, offer.size))
+    }
+    .await;
+    match &result {
+        Ok((path, _)) => {
+            let saved = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            reply(&mut send, true, &saved).await?;
+        }
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&partial).await;
+            let _ = reply(&mut send, false, &e.to_string()).await;
+        }
+    }
+    let _ = send.finish();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), send.stopped()).await;
+    result
+}
+
+/// Client side: sends `path`; `progress(sent, total)` is called as it goes. Returns the
+/// name the host saved it under.
+pub async fn send(
+    connection: &quinn::Connection,
+    path: &Path,
+    progress: impl FnMut(u64, u64) + Send,
+) -> Result<String, NetError> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let size = file.metadata().await?.len();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (mut send, mut recv) = connection.open_bi().await?;
+    framing::write(
+        &mut send,
+        &Control::new(Kind::FileOffer(FileOffer { name, size })),
+    )
+    .await?;
+    match framing::expect(&mut recv).await?.kind {
+        Some(Kind::FileReply(reply)) if reply.accepted => {}
+        Some(Kind::FileReply(reply)) => {
+            return Err(NetError::Protocol(format!(
+                "the host refused the file: {}",
+                reply.message
+            )))
+        }
+        Some(Kind::Failure(failure)) => return Err(NetError::Protocol(failure.message)),
+        _ => return Err(NetError::Protocol("expected the host's answer".into())),
+    }
+    let sha256 = write_bytes(&mut send, &mut file, size, progress).await?;
+    framing::write(
+        &mut send,
+        &Control::new(Kind::FileDone(FileDone { sha256 })),
+    )
+    .await?;
+    match framing::expect(&mut recv).await?.kind {
+        Some(Kind::FileReply(reply)) if reply.accepted => Ok(reply.message),
+        Some(Kind::FileReply(reply)) => Err(NetError::Protocol(reply.message)),
+        _ => Err(NetError::Protocol(
+            "expected the host's confirmation".into(),
+        )),
+    }
+}
+
+fn refusal(kind: Option<Kind>, expected: &str) -> NetError {
+    match kind {
+        Some(Kind::Failure(failure)) => NetError::Protocol(failure.message),
+        _ => NetError::Protocol(format!("expected {expected}")),
+    }
+}
+
+/// Client side: the entries of `path` in the host's shared folder.
+pub async fn list(connection: &quinn::Connection, path: &str) -> Result<FileListing, NetError> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    let request = FileList {
+        path: path.to_string(),
+    };
+    framing::write(&mut send, &Control::new(Kind::FileList(request))).await?;
+    let _ = send.finish();
+    match framing::expect(&mut recv).await?.kind {
+        Some(Kind::FileListing(listing)) => Ok(listing),
+        other => Err(refusal(other, "the folder listing")),
+    }
+}
+
+/// Client side: downloads `path` from the host's shared folder into `dir`, never
+/// overwriting; `progress(received, total)` as it goes. Returns where it was saved.
+pub async fn fetch(
+    connection: &quinn::Connection,
+    path: &str,
+    dir: &Path,
+    progress: impl FnMut(u64, u64) + Send,
+) -> Result<PathBuf, NetError> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    let request = FileFetch {
+        path: path.to_string(),
+    };
+    framing::write(&mut send, &Control::new(Kind::FileFetch(request))).await?;
+    let _ = send.finish();
+    let offer = match framing::expect(&mut recv).await?.kind {
+        Some(Kind::FileOffer(offer)) => offer,
+        other => return Err(refusal(other, "the file")),
+    };
+    let name = safe_name(&offer.name).unwrap_or_else(|| "file".into());
+    tokio::fs::create_dir_all(dir).await?;
+    let partial = dir.join(format!(".{name}.casement-part"));
+    let mut file = tokio::fs::File::create(&partial).await?;
+    let result = async {
+        read_bytes(&mut recv, &mut file, offer.size, progress).await?;
+        let path = unique_path(dir, &name);
+        tokio::fs::rename(&partial, &path).await?;
+        Ok(path)
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&partial).await;
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_are_cleaned() {
+        assert_eq!(safe_name("../../etc/passwd").as_deref(), Some("passwd"));
+        assert_eq!(
+            safe_name("C:\\Users\\x\\отчёт.pdf").as_deref(),
+            Some("отчёт.pdf")
+        );
+        assert_eq!(safe_name(".bashrc").as_deref(), Some("bashrc"));
+        assert_eq!(safe_name("a\u{7}b.txt").as_deref(), Some("ab.txt"));
+        assert_eq!(safe_name(".."), None);
+        assert_eq!(safe_name("dir/"), None);
+    }
+
+    #[test]
+    fn existing_files_are_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(unique_path(dir.path(), "a.txt"), dir.path().join("a.txt"));
+        std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        assert_eq!(
+            unique_path(dir.path(), "a.txt"),
+            dir.path().join("a (1).txt")
+        );
+        std::fs::write(dir.path().join("a (1).txt"), b"x").unwrap();
+        assert_eq!(
+            unique_path(dir.path(), "a.txt"),
+            dir.path().join("a (2).txt")
+        );
+        std::fs::write(dir.path().join("README"), b"x").unwrap();
+        assert_eq!(
+            unique_path(dir.path(), "README"),
+            dir.path().join("README (1)")
+        );
+    }
+}

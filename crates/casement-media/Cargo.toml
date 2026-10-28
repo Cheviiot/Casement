@@ -1,0 +1,33 @@
+[package]
+name = "casement-media"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+casement-net = { version = "0.1.0", path = "../casement-net" }
+casement-proto = { version = "0.1.0", path = "../casement-proto" }
+futures-util = "0.3.34"
+gstreamer = "0.24.5"
+gstreamer-app = "0.24.5"
+gstreamer-video = "0.24.5"
+tokio = { version = "1.54.1", features = ["rt", "sync", "macros"] }
+tracing = "0.1.44"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.191"
+zbus = { version = "5.13.2", default-features = false, features = ["tokio"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

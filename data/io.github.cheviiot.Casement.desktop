@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Casement
+GenericName=Remote Desktop
+GenericName[ru]=Удалённый рабочий стол
+Comment=Remote desktop for the local network and Tailscale
+Comment[ru]=Удалённый рабочий стол для локальной сети и Tailscale
+Exec=casement
+Icon=io.github.cheviiot.Casement
+Terminal=false
+Categories=GTK;GNOME;Network;RemoteAccess;
+Keywords=remote;desktop;control;lan;tailscale;
+Keywords[ru]=удалённый;рабочий;стол;управление;сеть;
+StartupNotify=true

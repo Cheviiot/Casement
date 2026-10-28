@@ -1,0 +1,8 @@
+#!/bin/sh
+# Builds the ALT p11 RPM of the release build (cargo build --release) in a throwaway
+# container from the official ALT image: rpm-build goes only inside it. Output: dist/.
+# CI runs packaging/alt/build.sh in the same image directly.
+set -e
+cd "$(dirname "$0")/.."
+podman run --rm --cpus 4 -v "$PWD:/src" -w /src -e REL="${REL:-alt1}" \
+    registry.altlinux.org/p11/base:latest sh packaging/alt/build.sh

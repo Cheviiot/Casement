@@ -1,0 +1,28 @@
+#!/bin/sh
+# Runs Casement under GTK's headless Broadway backend inside the oriel-dev container and saves
+# a PNG of its window: nothing appears on the desktop.
+#   scripts/dev/ui-check OUT.png [PAGE]
+# PAGE: new-device, computer (the first saved one), this-computer, set-password, trusted,
+# key-changed, password (the questions while connecting, without a network),
+# connect-first, connect-files (connect, then the other computer's files),
+# connect-monitors (connect, then the monitor page when the host has several),
+# connect-switch-monitor (connect, then switch to another monitor once).
+# Settings come from $CASEMENT_CONFIG_DIR (default _scratch/cfg); CASEMENT_SNAPSHOT_DELAY in ms.
+set -e
+cd "$(dirname "$0")/../.."
+out="$1"
+page="${2:-}"
+display=${BROADWAY_DISPLAY_NUMBER:-7}
+exec podman exec --user "$(id -un)" -w "$PWD" \
+    -e CASEMENT_CONFIG_DIR="${CASEMENT_CONFIG_DIR:-$PWD/_scratch/cfg}" \
+    -e CASEMENT_SNAPSHOT="$out" -e CASEMENT_OPEN="$page" \
+    -e CASEMENT_SNAPSHOT_DELAY="${CASEMENT_SNAPSHOT_DELAY:-2500}" \
+    oriel-dev sh -c '
+    gtk4-broadwayd :'"$display"' >/dev/null 2>&1 &
+    bp=$!
+    sleep 1.5
+    GDK_BACKEND=broadway BROADWAY_DISPLAY=:'"$display"' ./target/debug/casement
+    status=$?
+    kill $bp 2>/dev/null
+    wait $bp 2>/dev/null
+    exit $status'

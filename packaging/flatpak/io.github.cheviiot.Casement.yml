@@ -1,0 +1,49 @@
+# Flatpak of Casement, built from this checkout (CI: flatpak-builder in the Flathub
+# GNOME image; locally: flatpak-builder --user --install build-flatpak this-file).
+id: io.github.cheviiot.Casement
+runtime: org.gnome.Platform
+runtime-version: "51"
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: casement
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --device=dri
+  # Files sent here land in Downloads; the home folder is what others may browse.
+  - --filesystem=home
+  # Accepting connections: the screen and input through Mutter, the picture over PipeWire.
+  - --talk-name=org.gnome.Mutter.RemoteDesktop
+  - --talk-name=org.gnome.Mutter.ScreenCast
+  - --talk-name=org.gnome.Mutter.DisplayConfig
+  - --filesystem=xdg-run/pipewire-0
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  # Crates come from crates.io during the build (Cargo.lock pins them).
+  build-args:
+    - --share=network
+  env:
+    CARGO_HOME: /run/build/casement/cargo
+modules:
+  - name: casement
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --locked -p casement -p casement-host -p casement-cli
+      - install -Dm755 -t /app/bin target/release/casement target/release/casement-host target/release/casement-cli
+      - install -Dm644 -t /app/share/applications data/io.github.cheviiot.Casement.desktop
+      - install -Dm644 -t /app/share/icons/hicolor/scalable/apps data/io.github.cheviiot.Casement.svg
+      - install -Dm644 -t /app/share/metainfo data/io.github.cheviiot.Casement.metainfo.xml
+      - install -Dm644 -t /app/share/licenses/io.github.cheviiot.Casement LICENSE
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - build
+          - dist
+          - _scratch
+          - .git

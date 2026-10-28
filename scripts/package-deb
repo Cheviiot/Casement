@@ -1,0 +1,7 @@
+#!/bin/sh
+# Builds the .deb of the release build (cargo build --release) in a throwaway Debian 13
+# container. Output: dist/. CI runs packaging/debian/build.sh directly.
+set -e
+cd "$(dirname "$0")/.."
+podman run --rm --cpus 4 -v "$PWD:/src" -w /src docker.io/library/debian:13 \
+    sh packaging/debian/build.sh

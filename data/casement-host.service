@@ -1,0 +1,13 @@
+[Unit]
+Description=Casement: accept remote desktop connections
+Documentation=https://github.com/Cheviiot/Casement
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=@BINDIR@/casement-host
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
