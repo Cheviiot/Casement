@@ -38,7 +38,9 @@ install -m 644 "$here/share/metainfo/io.github.cheviiot.Casement.metainfo.xml" "
 install -m 755 "$here/uninstall.sh" "$share/casement-uninstall.sh"
 if command -v systemctl >/dev/null 2>&1; then
     systemctl --user daemon-reload 2>/dev/null || true
-    systemctl --user try-restart casement-host.service 2>/dev/null || true
+    # Accepting connections is on by default; "casement-cli accept off" turns it off.
+    systemctl --user enable casement-host.service 2>/dev/null || true
+    systemctl --user restart casement-host.service 2>/dev/null || true
 fi
 
 missing=$(ldd "$bin/casement" 2>/dev/null | sed -n 's/^\s*\(\S*\) => not found/\1/p' | tr '\n' ' ')

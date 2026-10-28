@@ -28,8 +28,9 @@ VIAddVersionKey /LANG=0 "LegalCopyright" "MIT License"
 !define MUI_UNICON "${ICON}"
 !define MUI_ABORTWARNING
 !define MUI_COMPONENTSPAGE_NODESC
-!define MUI_FINISHPAGE_RUN "$INSTDIR\bin\casement.exe"
+!define MUI_FINISHPAGE_RUN
 !define MUI_FINISHPAGE_RUN_TEXT "$(RunText)"
+!define MUI_FINISHPAGE_RUN_FUNCTION LaunchAsUser
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "${LICENSE}"
@@ -58,6 +59,12 @@ LangString DesktopSection ${LANG_ENGLISH} "Desktop shortcut"
   Sleep 500
 !macroend
 
+; The installer runs elevated; started through Explorer the application runs as the
+; user instead, and starts casement-host the same way.
+Function LaunchAsUser
+  Exec '"$WINDIR\explorer.exe" "$INSTDIR\bin\casement.exe"'
+FunctionEnd
+
 Function .onInit
   SetRegView 64
 FunctionEnd
@@ -80,6 +87,10 @@ Section "!$(MainSection)" SecMain
 
   SetShellVarContext all
   CreateShortcut "$SMPROGRAMS\Casement.lnk" "$INSTDIR\bin\casement.exe" "" "$INSTDIR\casement.ico"
+
+  ; Accepting connections is on by default: casement-host starts at this user's login.
+  ; "Принимать подключения" in the application switches it.
+  WriteRegStr HKCU "${RUN_KEY}" "Casement host" '"$INSTDIR\bin\casement-host.exe"'
 
   WriteRegStr HKLM "Software\Casement" "InstallDir" "$INSTDIR"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayName" "Casement"

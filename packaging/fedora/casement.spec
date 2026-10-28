@@ -44,6 +44,16 @@ install -Dm644 casement-host.service %{buildroot}%{_userunitdir}/casement-host.s
 install -Dm644 %{SOURCE6} %{buildroot}%{_licensedir}/%{name}/LICENSE
 install -Dm644 %{SOURCE7} %{buildroot}%{_metainfodir}/io.github.cheviiot.Casement.metainfo.xml
 
+
+%post
+# Accepting connections is on by default, for every user from their next login.
+systemctl --global enable casement-host.service >/dev/null 2>&1 || :
+
+%preun
+if [ "$1" = 0 ]; then
+    systemctl --global disable casement-host.service >/dev/null 2>&1 || :
+fi
+
 %files
 %license %{_licensedir}/%{name}/LICENSE
 %{_bindir}/casement

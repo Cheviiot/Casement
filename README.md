@@ -1,117 +1,69 @@
 <div align="center">
 
+<img src="data/io.github.cheviiot.Casement.svg" width="96" alt="">
+
 # Casement
 
-**Удалённый рабочий стол для своей сети: локальной или Tailscale**
+**Remote desktop for your own network — local or Tailscale.**
 
-[![CI](https://github.com/Cheviiot/Casement/actions/workflows/build.yml/badge.svg)](https://github.com/Cheviiot/Casement/actions/workflows/build.yml)
+[Русский](README.ru.md) · English
+
+[![Build](https://github.com/Cheviiot/Casement/actions/workflows/build.yml/badge.svg)](https://github.com/Cheviiot/Casement/actions/workflows/build.yml)
 [![Release](https://img.shields.io/github/v/release/Cheviiot/Casement)](https://github.com/Cheviiot/Casement/releases/latest)
 [![MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 
-<img src="docs/images/home.png" width="720" alt="Главное окно Casement">
+<img src="docs/images/home.png" width="760" alt="Casement in the light and dark styles">
+
+[![Windows](https://img.shields.io/badge/Windows-installer-0078D4?style=for-the-badge)](https://github.com/Cheviiot/Casement/releases/latest/download/casement-windows-x86_64-setup.exe)
+[![ALT](https://img.shields.io/badge/ALT_p11-rpm-F5A623?style=for-the-badge)](https://github.com/Cheviiot/Casement/releases/latest/download/casement-alt-p11.x86_64.rpm)
+[![Fedora](https://img.shields.io/badge/Fedora-rpm-51A2DA?style=for-the-badge)](https://github.com/Cheviiot/Casement/releases/latest/download/casement-fedora.x86_64.rpm)
+[![Debian](https://img.shields.io/badge/Debian_|_Ubuntu-deb-A81D33?style=for-the-badge)](https://github.com/Cheviiot/Casement/releases/latest/download/casement_amd64.deb)
+[![Flatpak](https://img.shields.io/badge/Flatpak-any_Linux-4A90D9?style=for-the-badge)](https://github.com/Cheviiot/Casement/releases/latest/download/casement-x86_64.flatpak)
 
 </div>
 
-Casement показывает экран другого компьютера и даёт управлять им мышью и клавиатурой.
-Компьютеры соединяются напрямую: в локальной сети или через
-[Tailscale](https://tailscale.com), без серверов-посредников, учётных записей и облака.
-Одно приложение и подключается к другим, и пускает к себе.
+## Why Casement
 
-## Возможности
+- **Direct.** Computers talk to each other over your LAN or Tailscale — no relay
+  servers, no accounts, no cloud.
+- **Fast.** Hardware H.264 over QUIC: about 26 ms from a mouse move to the new frame on a
+  home network.
+- **Complete.** Screen, mouse and keyboard, sound, clipboard text, files both ways,
+  several monitors, automatic reconnect.
+- **Private.** TLS 1.3 with a key per device; the access password is checked with OPAQUE
+  and never leaves your computer.
+- **Native.** One GTK 4 / Libadwaita application for Linux and Windows that both connects
+  and lets others in.
 
-- Экран в H.264 с аппаратным кодированием (VA-API на Linux; AMD, Intel, NVIDIA или
-  Media Foundation на Windows), мышь, колесо и клавиатура.
-- Звук того компьютера с кнопкой «выключить звук».
-- Общий буфер обмена для текста в обе стороны.
-- Файлы в обе стороны: отправка кнопкой или перетаскиванием на экран, просмотр папок
-  того компьютера и скачивание. Целостность проверяется по SHA-256.
-- Выбор монитора, если их несколько. На GNOME можно попросить отдельный виртуальный
-  экран ровно под размер окна, он меняется вместе с окном.
-- Компьютеры с Casement в локальной сети находятся сами (mDNS); через Tailscale
-  подключение идёт по имени.
-- Автоматическое переподключение при обрыве связи.
+> The interface is in Russian for now.
 
-## Установка
+## Get started
 
-Все файлы — в [последнем релизе](https://github.com/Cheviiot/Casement/releases/latest).
+1. Install Casement on both computers. Accepting connections is on by default.
+2. On the computer you will connect to, set an access password: **Этот компьютер →
+   Пароль доступа**, or `casement-cli setup` in a terminal.
+3. On your computer, pick it under **В этой сети**, or type its address or Tailscale
+   name. Enter the password once; from then on the device is trusted.
 
-### Windows 10 и 11
-
-Скачайте и запустите
-[`casement-windows-x86_64-setup.exe`](https://github.com/Cheviiot/Casement/releases/latest/download/casement-windows-x86_64-setup.exe).
-Мастер установки поставит Casement в Program Files, добавит в меню «Пуск», разрешит
-входящие подключения в частных сетях и появится в «Установка и удаление программ».
-Без установки — архив `-portable.zip`: распакуйте и запустите `bin\casement.exe`.
-
-### Linux
-
-| Система | Пакет | Установка |
-|---|---|---|
-| ALT p11 | `casement-*-alt1.x86_64.rpm` | `su - -c 'apt-get install ./casement-*.rpm'` |
-| Fedora 44 | `casement-*.fc44.x86_64.rpm` | `sudo dnf install ./casement-*.rpm` |
-| Debian 13, Ubuntu 25.04+ | `casement_*_amd64.deb` | `sudo apt install ./casement_*.deb` |
-| Любой дистрибутив | `casement-*-x86_64.flatpak` | `flatpak install --user ./casement-*.flatpak` |
-
-Пакеты сами подтягивают GTK, Libadwaita и плагины GStreamer. Без root можно поставить
-в домашнюю папку:
+## Without a desktop
 
 ```sh
-curl -fsSL https://github.com/Cheviiot/Casement/releases/latest/download/install.sh | sh
+casement-cli setup        # step-by-step: password, accepting connections, trusted devices
+casement-cli status       # how this computer is set up
+casement-cli accept off   # stop accepting connections
 ```
 
-Чтобы пускать к себе, нужен GNOME на Wayland. Во Flatpak подключения принимаются,
-пока открыто окно Casement; в остальных пакетах — и без окна, службой
-`casement-host`, которую включает переключатель «Принимать подключения».
+## Requirements
 
-> Для обновления поставьте новую версию поверх. Настройки сохраняются.
+- **Windows** 10 or 11.
+- **Linux** with GTK 4.14+, Libadwaita 1.6+ and GStreamer 1.24+ (the packages pull them
+  in). Accepting connections needs GNOME on Wayland.
 
-## Как пользоваться
+Every file is in the [latest release](https://github.com/Cheviiot/Casement/releases/latest),
+including a portable Windows archive and `install.sh` for a per-user install on any
+distribution.
 
-1. На компьютере, к которому будете подключаться, откройте **Этот компьютер**, задайте
-   **Пароль доступа** и включите **Принимать подключения**.
-2. На своём компьютере выберите его в разделе **В этой сети** или введите адрес либо
-   имя в Tailscale в поле **Подключиться**.
-3. При первом входе введите пароль. Дальше устройство считается доверенным и входит
-   без пароля.
+## More
 
-<div align="center">
-<img src="docs/images/computer.png" width="600" alt="Страница компьютера">
-</div>
-
-## Безопасность
-
-- Соединение — QUIC с TLS 1.3. У каждого устройства свой ключ Ed25519, он не покидает
-  `device.key`.
-- Пароль доступа проверяется по OPAQUE: он не передаётся по сети, а на компьютере
-  хранится только запись, по которой войти нельзя. Перебор ограничен паузами.
-- Ключ нового компьютера запоминается при первом подключении. Если у знакомого
-  компьютера ключ сменится, подключение остановится и спросит, что делать.
-- По умолчанию принимаются подключения только из частных сетей и Tailscale (UDP 47820).
-
-## Командная строка
-
-`casement-cli` нужен для проверок и для компьютеров без графического сеанса:
-
-```sh
-casement-cli password set                 # пароль доступа этого компьютера
-casement-cli listen                       # принимать подключения из терминала
-casement-cli discover                     # компьютеры с Casement в сети
-casement-cli connect office --record a.h264 --frames 120  # записать экран в файл
-casement-cli connect office --send отчёт.pdf              # отправить файл
-```
-
-## Ограничения
-
-- Пустить к себе на Linux можно только из сеанса GNOME на Wayland: экран и ввод идут
-  через Mutter. Экран входа в систему не показывается.
-- На Windows не показываются окна UAC и экран входа: для этого нужна системная служба.
-- macOS и Android пока не поддерживаются.
-
-## Сборка
-
-Как собрать и проверить из исходников, в [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
-Устройство программы описано в [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
-## Лицензия
-
-[MIT](LICENSE).
+[How it works](docs/ARCHITECTURE.md) · [Building and checks](docs/DEVELOPMENT.md) ·
+[MIT license](LICENSE)

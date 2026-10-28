@@ -32,6 +32,22 @@ depends=$(cd "$root" && dpkg-shlibdeps -O "pkg/usr/bin/casement" "pkg/usr/bin/ca
     "pkg/usr/bin/casement-cli" | sed -n 's/^shlibs:Depends=//p')
 
 mkdir -p "$pkg/DEBIAN"
+# Accepting connections is on by default, for every user from their next login.
+cat > "$pkg/DEBIAN/postinst" <<'SCRIPT'
+#!/bin/sh
+set -e
+if [ "$1" = configure ]; then
+    systemctl --global enable casement-host.service >/dev/null 2>&1 || true
+fi
+SCRIPT
+cat > "$pkg/DEBIAN/prerm" <<'SCRIPT'
+#!/bin/sh
+set -e
+if [ "$1" = remove ]; then
+    systemctl --global disable casement-host.service >/dev/null 2>&1 || true
+fi
+SCRIPT
+chmod 755 "$pkg/DEBIAN/postinst" "$pkg/DEBIAN/prerm"
 cat > "$pkg/DEBIAN/control" <<CONTROL
 Package: casement
 Version: $version

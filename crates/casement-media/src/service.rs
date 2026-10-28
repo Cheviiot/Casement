@@ -56,6 +56,7 @@ pub fn start_host(
         screen,
         files_dir: files.incoming,
         shared_dir: files.shared,
+        settings_dir: Some(dir.to_path_buf()),
         // Sound does not need the screen: it is offered whenever this system can encode it.
         audio: crate::DesktopAudio::new()
             .map_err(|e| tracing::info!("sound not shared: {e}"))

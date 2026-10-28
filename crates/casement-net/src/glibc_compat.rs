@@ -6,7 +6,7 @@
 //! references to GLIBC_2.39 and the loader then refuses the binary on older systems.
 //! These local definitions satisfy the references instead. std calls them only through
 //! the unstable pidfd API (`CommandExt::create_pidfd`), which Casement never uses; normal
-//! spawning goes through posix_spawn. The meson `glibc` test guards this.
+//! spawning goes through posix_spawn. scripts/check-glibc guards this.
 
 #[no_mangle]
 pub extern "C" fn pidfd_spawnp(

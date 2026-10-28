@@ -50,6 +50,10 @@ pub struct HostConfig {
     pub shared_dir: Option<std::path::PathBuf>,
     /// The sound to send; None answers sound requests with a refusal.
     pub audio: Option<Arc<dyn crate::audio::AudioProvider>>,
+    /// Where the access password and the trusted devices are kept. They are read again
+    /// before each login, so changes made by the application or casement-cli apply to a
+    /// running host at once.
+    pub settings_dir: Option<std::path::PathBuf>,
 }
 
 /// What the host tells its owner as things happen.
@@ -243,6 +247,15 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
         password: None,
     };
 
+    if let Some(dir) = &shared.config.settings_dir {
+        // A file that cannot be read keeps what the host already had.
+        if let Ok(trust) = TrustStore::load(dir) {
+            *shared.trust.lock().unwrap() = trust;
+        }
+        if let Ok(password) = StoredPassword::load(dir) {
+            *shared.password.lock().unwrap() = password;
+        }
+    }
     let trusted = shared.trust.lock().unwrap().contains(&client);
     let mut remembered = trusted;
     if !trusted {

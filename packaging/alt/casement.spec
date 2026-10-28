@@ -58,6 +58,16 @@ sed 's|@BINDIR@|%{_bindir}|' %{SOURCE5} > casement-host.service
 install -Dm644 casement-host.service %{buildroot}/usr/lib/systemd/user/casement-host.service
 install -Dm644 %{SOURCE6} %{buildroot}%{_datadir}/metainfo/io.github.cheviiot.Casement.metainfo.xml
 
+
+%post
+# Accepting connections is on by default, for every user from their next login.
+systemctl --global enable casement-host.service >/dev/null 2>&1 || :
+
+%preun
+if [ "$1" = 0 ]; then
+    systemctl --global disable casement-host.service >/dev/null 2>&1 || :
+fi
+
 %files
 %{_bindir}/casement
 %{_bindir}/casement-host

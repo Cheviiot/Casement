@@ -76,6 +76,8 @@ git tag v0.1.0 && git push origin v0.1.0
 
 - `scripts/dev/ui-check OUT.png [СТРАНИЦА]` — снимок окна под headless Broadway, ничего
   не появляется на экране. Список страниц — в начале скрипта.
+- `scripts/dev/screenshots` — картинки для README в `docs/images`: каждая страница с
+  выдуманными компьютерами, левая половина в светлом оформлении, правая в тёмном.
 - `casement-cli listen` на одной машине и `casement-cli connect АДРЕС --record a.h264
   --wiggle` на другой: вход, запись экрана, движение указателя. `--latency N` меряет
   задержку от движения до кадра, `--audio N` — звук, `--clipboard` — буфер обмена.

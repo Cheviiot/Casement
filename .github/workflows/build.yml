@@ -189,20 +189,25 @@ jobs:
           mkdir dist
           cp artifacts/* dist/
           mv dist/casement-x86_64.flatpak "dist/casement-$version-x86_64.flatpak"
-          # Stable names for the "latest" download links.
+          # Stable names for the "latest" download links of the README and installers.
           cp dist/casement-*-linux-x86_64.tar.gz dist/casement-linux-x86_64.tar.gz
           cp dist/casement-*-windows-x86_64-setup.exe dist/casement-windows-x86_64-setup.exe
+          cp dist/casement-*-alt1.x86_64.rpm dist/casement-alt-p11.x86_64.rpm
+          cp dist/casement-*.fc*.x86_64.rpm dist/casement-fedora.x86_64.rpm
+          cp dist/casement_*_amd64.deb dist/casement_amd64.deb
+          cp "dist/casement-$version-x86_64.flatpak" dist/casement-x86_64.flatpak
           cp packaging/linux/install.sh dist/
           (cd dist && sha256sum * > SHA256SUMS)
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "Casement $version" --notes-file - <<'NOTES'
           | Система | Файл |
           |---|---|
-          | Windows 10 и 11 | `casement-*-windows-x86_64-setup.exe` (мастер установки) или `-portable.zip` |
-          | ALT p11 | `casement-*-alt1.x86_64.rpm` |
-          | Fedora | `casement-*.fc44.x86_64.rpm` |
-          | Debian 13, Ubuntu 25.04+ | `casement_*_amd64.deb` |
-          | Любой Linux | `casement-*-x86_64.flatpak` или `install.sh` |
+          | Windows 10 и 11 | `casement-windows-x86_64-setup.exe` (установщик) или `-portable.zip` |
+          | ALT p11 | `casement-alt-p11.x86_64.rpm` |
+          | Fedora 44 | `casement-fedora.x86_64.rpm` |
+          | Debian 13, Ubuntu 25.04+ | `casement_amd64.deb` |
+          | Любой Linux | `casement-x86_64.flatpak` или `install.sh` |
 
-          Подробности — в [README](https://github.com/Cheviiot/Casement#установка).
+          [README](https://github.com/Cheviiot/Casement/blob/main/README.ru.md) ·
+          [English](https://github.com/Cheviiot/Casement#readme)
           NOTES

@@ -158,6 +158,7 @@ fn start_host(dir: &Path, password: Option<&str>) -> Running {
         files_dir: Some(dir.join("host").join("downloads")),
         shared_dir: Some(dir.join("host").join("shared")),
         audio: Some(std::sync::Arc::new(FakeAudio)),
+        settings_dir: None,
     };
     let (host, events) = Host::bind(identity, config, password, trust).unwrap();
     let host = std::sync::Arc::new(host);
@@ -246,6 +247,7 @@ async fn screen_frames_and_input() {
         files_dir: None,
         shared_dir: None,
         audio: None,
+        settings_dir: None,
     };
     let password = StoredPassword::create(PASSWORD).unwrap();
     let (host, _events) =
@@ -638,6 +640,7 @@ async fn sound_is_refused_when_not_shared() {
         files_dir: None,
         shared_dir: None,
         audio: None,
+        settings_dir: None,
     };
     let password = StoredPassword::create(PASSWORD).unwrap();
     let (host, _events) =
@@ -664,6 +667,69 @@ async fn sound_is_refused_when_not_shared() {
     );
     session.ping().await.unwrap();
     session.close();
+    host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_on_disk_apply_without_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = dir.path().join("host");
+    let identity = Identity::load_or_create(&settings).unwrap();
+    let config = HostConfig {
+        name: "headless".into(),
+        os: "linux".into(),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        allow_any_source: false,
+        screen: None,
+        files_dir: None,
+        shared_dir: None,
+        audio: None,
+        settings_dir: Some(settings.clone()),
+    };
+    // Started without a password, as a freshly installed computer is.
+    let (host, _events) = Host::bind(identity, config, None, TrustStore::default()).unwrap();
+    let host = std::sync::Arc::new(host);
+    let addr = host.local_addr().unwrap();
+    let runner = host.clone();
+    tokio::spawn(async move { runner.run().await });
+    let me = client_identity(dir.path(), "client");
+
+    let err = match client::connect(&me, addr, None, &info(true)).await {
+        Err(e) => e,
+        Ok(handshake) => match handshake.login(None).await {
+            Err(e) => e,
+            Ok(_) => panic!("logged in without a password or trust"),
+        },
+    };
+    assert!(
+        matches!(
+            err,
+            NetError::Refused {
+                code: ErrorCode::NoPasswordSet,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+
+    // As `casement-cli password set` does, with the host running.
+    StoredPassword::create(PASSWORD)
+        .unwrap()
+        .save(&settings)
+        .unwrap();
+    let handshake = client::connect(&me, addr, None, &info(true)).await.unwrap();
+    assert!(handshake.needs_password());
+    let session = handshake.login(Some(PASSWORD)).await.unwrap();
+    assert!(session.remembered);
+    session.close();
+    assert_eq!(TrustStore::load(&settings).unwrap().devices().len(), 1);
+
+    // Removing the device on disk makes it ask for the password again.
+    let mut trust = TrustStore::load(&settings).unwrap();
+    trust.remove(&me.fingerprint()).unwrap();
+    let handshake = client::connect(&me, addr, None, &info(true)).await.unwrap();
+    assert!(handshake.needs_password());
+    handshake.close();
     host.close();
 }
 

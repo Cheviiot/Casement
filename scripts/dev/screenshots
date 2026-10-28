@@ -1,0 +1,55 @@
+#!/bin/sh
+# Makes the README's screenshots in docs/images: each page of the application with
+# made-up computers, left half in the light style and right half in the dark one, with
+# rounded corners and a soft shadow on a transparent background. Needs a debug build
+# (cargo build) and ImageMagick in oriel-dev.
+set -e
+cd "$(dirname "$0")/../.."
+work=_scratch/screenshots
+rm -rf "$work" && mkdir -p "$work/config"
+cp _scratch/cfg/device.key "$work/config/" 2>/dev/null || true
+key_a=$(printf 'a%.0s' $(seq 64))
+key_b=$(printf 'b%.0s' $(seq 64))
+cat > "$work/config/connections.ini" <<INI
+[office]
+name=Рабочий компьютер
+host=office.tail1234.ts.net
+fingerprint=$key_a
+
+[laptop]
+name=Ноутбук
+host=192.168.1.24
+fingerprint=$key_b
+
+[media]
+name=Медиацентр
+host=192.168.1.40
+INI
+
+# PAGE (ui-check) and the image it becomes.
+for shot in "home:" "computer:computer"; do
+    name=${shot%%:*}
+    page=${shot#*:}
+    for scheme in prefer-light prefer-dark; do
+        CASEMENT_CONFIG_DIR="$PWD/$work/config" ADW_DEBUG_COLOR_SCHEME=$scheme \
+            BROADWAY_DISPLAY_NUMBER=7 scripts/dev/ui-check "$work/$name-$scheme.png" $page \
+            >/dev/null 2>&1
+    done
+    podman exec --user "$(id -un)" -w "$PWD" oriel-dev sh -ec "
+        light=$work/$name-prefer-light.png dark=$work/$name-prefer-dark.png
+        w=\$(magick identify -format %w \"\$light\"); h=\$(magick identify -format %h \"\$light\")
+        half=\$((w / 2))
+        magick \"\$light\" -crop \${half}x\${h}+0+0 +repage $work/left.png
+        magick \"\$dark\" -crop \$((w - half))x\${h}+\${half}+0 +repage $work/right.png
+        magick $work/left.png $work/right.png +append $work/split.png
+        # Rounded corners like a GNOME window, then a soft shadow around them.
+        magick -size \${w}x\${h} xc:none -fill white \
+            -draw \"roundrectangle 0,0 \$((w - 1)),\$((h - 1)) 14,14\" $work/mask.png
+        magick $work/split.png $work/mask.png -alpha off -compose CopyOpacity -composite \
+            $work/rounded.png
+        magick $work/rounded.png \\( +clone -background black -shadow 35x18+0+8 \\) \
+            +swap -background none -layers merge +repage \
+            -strip -define png:compression-level=9 docs/images/$name.png"
+    echo "docs/images/$name.png"
+done
+rm -rf "$work"

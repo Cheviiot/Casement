@@ -1,10 +1,6 @@
-//! casement-cli: the network core without the GUI, for checks between machines.
-//!
-//!   casement-cli fingerprint
-//!   casement-cli password set | clear
-//!   casement-cli listen [--port P] [--any-source]
-//!   casement-cli connect HOST[:PORT] [--fingerprint HEX] [--pings N]
-//!   casement-cli discover [--seconds N]
+//! casement-cli: setting up this computer without the window (`setup`, `status`,
+//! `accept`, `password`, `trusted`, see setup.rs) and the network core for checks between
+//! machines (`listen`, `connect`, `discover` and the probes).
 
 use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -14,16 +10,20 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use casement_net::auth::StoredPassword;
 use casement_net::client::{self, ClientInfo};
 use casement_net::discovery::{Browser, DiscoveryEvent};
 use casement_net::host::HostEvent;
 use casement_net::{Fingerprint, Identity, NetError, DEFAULT_PORT};
 
+mod setup;
+
 #[derive(Parser)]
-#[command(version, about = "Casement network core without the GUI")]
+#[command(
+    version,
+    about = "Casement без окна: настройка этого компьютера и проверки"
+)]
 struct Cli {
-    /// Settings directory (default: the application's, ~/.config/casement)
+    /// Папка настроек (по умолчанию та же, что у приложения)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -34,14 +34,28 @@ struct Cli {
 // Parsed once at start: the size of the largest variant does not matter.
 #[allow(clippy::large_enum_variant)]
 enum Command {
-    /// Print this device's key fingerprint
-    Fingerprint,
-    /// Set or remove the access password of this computer
+    /// Мастер настройки: пароль, приём подключений, доверенные устройства
+    Setup,
+    /// Как настроен этот компьютер
+    Status,
+    /// Принимать подключения (служба casement-host) или нет
+    Accept {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// Задать (set) или убрать (clear) пароль доступа
     Password {
         #[arg(value_parser = ["set", "clear"])]
         action: String,
     },
-    /// Accept connections (until Ctrl+C) and announce this computer on the LAN
+    /// Доверенные устройства: list, remove НОМЕР|ИМЯ|НАЧАЛО_ОТПЕЧАТКА
+    Trusted {
+        #[command(subcommand)]
+        action: Trusted,
+    },
+    /// Отпечаток ключа этого устройства
+    Fingerprint,
+    /// Принимать подключения из терминала (до Ctrl+C) и объявлять компьютер в сети
     Listen {
         #[arg(long, default_value_t = DEFAULT_PORT)]
         port: u16,
@@ -58,7 +72,7 @@ enum Command {
         #[arg(long)]
         shared_dir: Option<PathBuf>,
     },
-    /// Connect, log in and measure the round trip
+    /// Подключиться, войти и проверить связь, экран, звук, буфер, файлы
     Connect {
         target: String,
         /// Expected key fingerprint (64 hex digits); without it you confirm the key shown
@@ -115,22 +129,31 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         latency: u32,
     },
-    /// On a host: read this computer's clipboard (or offer --set TEXT for --hold seconds)
-    /// through a separate GNOME session, to check clipboard sharing without a keyboard
+    /// Проверка: прочитать буфер обмена этого компьютера через GNOME (или положить --set)
     ClipboardProbe {
         #[arg(long)]
         set: Option<String>,
         #[arg(long, default_value_t = 10)]
         hold: u64,
     },
-    /// Decode an H.264 file (from connect --record) through each decoding variant and
-    /// report time and CPU: which way to the screen is cheapest on this computer
+    /// Проверка: сравнить способы декодирования H.264 из файла connect --record
     #[cfg(target_os = "linux")]
     DecodeBench { file: PathBuf },
-    /// List Casement computers announced on the LAN
+    /// Компьютеры с Casement в локальной сети
     Discover {
         #[arg(long, default_value_t = 5)]
         seconds: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum Trusted {
+    /// Список доверенных устройств
+    List,
+    /// Перестать доверять устройству: оно снова спросит пароль
+    Remove {
+        /// Номер из списка, имя или начало отпечатка
+        device: String,
     },
 }
 
@@ -181,7 +204,17 @@ fn resolve(target: &str) -> Result<SocketAddr> {
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Ошибка: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     #[cfg(windows)]
     casement_media::use_bundled_gstreamer();
     tracing_subscriber::fmt()
@@ -193,27 +226,17 @@ async fn main() -> Result<()> {
     let identity = Identity::load_or_create(&dir)?;
 
     match cli.command {
+        Command::Setup => setup::wizard(&dir, &identity, &host_name())?,
+        Command::Status => setup::status(&dir, &identity, &host_name())?,
+        Command::Accept { state } => setup::accept(state == "on")?,
+        Command::Password { action } => setup::password(&dir, &action)?,
+        Command::Trusted { action } => match action {
+            Trusted::List => setup::trusted_list(&dir)?,
+            Trusted::Remove { device } => setup::trusted_remove(&dir, &device)?,
+        },
         Command::Fingerprint => {
             println!("{}", identity.fingerprint().display());
             println!("{}", identity.fingerprint().to_hex());
-        }
-        Command::Password { action } => {
-            if action == "clear" {
-                StoredPassword::remove(&dir)?;
-                println!("Password removed: only trusted devices can connect.");
-            } else {
-                let first = read_password("New access password: ")?;
-                let second = if std::env::var_os(PASSWORD_ENV).is_some() {
-                    first.clone()
-                } else {
-                    read_password("Repeat: ")?
-                };
-                if first != second {
-                    bail!("the passwords differ");
-                }
-                StoredPassword::create(&first)?.save(&dir)?;
-                println!("Password set.");
-            }
         }
         Command::Listen {
             port,
@@ -671,14 +694,7 @@ async fn receive_audio(
     Ok(())
 }
 
-const PASSWORD_ENV: &str = "CASEMENT_CLI_PASSWORD";
-
-fn read_password(prompt: &str) -> Result<String> {
-    if let Ok(password) = std::env::var(PASSWORD_ENV) {
-        return Ok(password);
-    }
-    Ok(rpassword::prompt_password(prompt)?)
-}
+use setup::read_password;
 
 // The screen comes from casement-media on Linux (GNOME) and Windows; the clipboard probe is
 // GNOME only. Elsewhere the CLI still listens, logs in and moves files.
@@ -726,7 +742,7 @@ fn start_host(
     use casement_net::auth::TrustStore;
     use casement_net::host::{Host, HostConfig};
     let identity = Identity::load_or_create(dir).map_err(|e| e.to_string())?;
-    let password = StoredPassword::load(dir).map_err(|e| e.to_string())?;
+    let password = casement_net::auth::StoredPassword::load(dir).map_err(|e| e.to_string())?;
     let trust = TrustStore::load(dir).map_err(|e| e.to_string())?;
     let has_password = password.is_some();
     let fingerprint = identity.fingerprint();
@@ -739,6 +755,7 @@ fn start_host(
         files_dir: files.incoming,
         shared_dir: files.shared,
         audio: None,
+        settings_dir: Some(dir.to_path_buf()),
     };
     let (host, events) =
         Host::bind(identity, config, password, trust).map_err(|e| e.to_string())?;

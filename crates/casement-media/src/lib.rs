@@ -4,6 +4,7 @@
 //! back through the same Mutter session. On Windows: see `windows.rs`.
 
 mod audio;
+pub mod autostart;
 #[cfg(target_os = "linux")]
 mod capture;
 mod frames;

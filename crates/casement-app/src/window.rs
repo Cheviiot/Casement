@@ -55,6 +55,23 @@ struct Inner {
     updating_accept: std::cell::Cell<bool>,
 }
 
+/// Without the background service the window accepts connections itself: on unless the
+/// user switched it off, which leaves this marker.
+const ACCEPT_OFF: &str = "accept-off";
+
+fn accepting_in_app(dir: &std::path::Path) -> bool {
+    !dir.join(ACCEPT_OFF).exists()
+}
+
+fn set_accepting_in_app(dir: &std::path::Path, on: bool) {
+    let marker = dir.join(ACCEPT_OFF);
+    let _ = if on {
+        std::fs::remove_file(marker)
+    } else {
+        std::fs::write(marker, b"")
+    };
+}
+
 fn has_password(dir: &std::path::Path) -> bool {
     matches!(StoredPassword::load(dir), Ok(Some(_)))
 }
@@ -137,10 +154,19 @@ impl Window {
         if this.0.service {
             let this2 = this.clone();
             glib::spawn_future_local(async move {
-                let active = service::is_active().await;
+                service::ensure_running().await;
+                let active = service::enabled().await;
                 this2.set_accept_quietly(active);
                 this2.refresh_access();
             });
+        } else if accepting_in_app(&this.0.core.dir) {
+            // Without the service the window itself accepts, on by default.
+            this.set_accept_quietly(true);
+            if let Err(e) = this.start_host() {
+                this.set_accept_quietly(false);
+                this.toast(&format!("Не удалось принимать подключения: {e}"));
+            }
+            this.refresh_access();
         }
         this
     }
@@ -552,7 +578,6 @@ impl Window {
                 return self.toast(&format!("Не удалось: {e}"));
             }
         }
-        self.restart_host();
         self.refresh_access();
         let this = self.clone();
         let again = name.clone();
@@ -562,7 +587,6 @@ impl Window {
                 if let Ok(mut store) = TrustStore::load(&dir) {
                     let _ = store.add(fingerprint, &again);
                 }
-                this.restart_host();
                 this.refresh_access();
             },
         );
@@ -658,7 +682,6 @@ impl Window {
             let this = self.clone();
             button.connect_clicked(move |_| {
                 let _ = StoredPassword::remove(&this.0.core.dir);
-                this.restart_host();
                 this.refresh_access();
                 this.0.navigation.pop();
                 this.toast("Пароль убран: подключаться могут только доверенные устройства");
@@ -699,6 +722,7 @@ impl Window {
             });
             return;
         }
+        set_accepting_in_app(&self.0.core.dir, active);
         if !active {
             if let Some(running) = self.0.host.take() {
                 running.host.close();
@@ -715,23 +739,6 @@ impl Window {
                 }
             }
             Err(e) => {
-                self.0.accept.set_active(false);
-                self.toast(&format!("Не удалось принимать подключения: {e}"));
-            }
-        }
-    }
-
-    /// The host reads the password and the trust list when it starts.
-    fn restart_host(&self) {
-        if self.0.service {
-            glib::spawn_future_local(async move {
-                service::restart().await;
-            });
-            return;
-        }
-        if let Some(running) = self.0.host.take() {
-            running.host.close();
-            if let Err(e) = self.start_host() {
                 self.0.accept.set_active(false);
                 self.toast(&format!("Не удалось принимать подключения: {e}"));
             }
@@ -817,7 +824,6 @@ impl Window {
         .await;
         match result {
             Ok(()) => {
-                self.restart_host();
                 self.refresh_access();
                 let visible = self.0.navigation.visible_page().and_then(|p| p.tag());
                 if visible.as_deref() == Some("password") {
