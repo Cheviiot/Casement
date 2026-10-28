@@ -3,6 +3,22 @@
 
 use adw::prelude::*;
 
+/// Short Russian units even when the system locale has no GLib translations.
+pub fn file_size(bytes: u64) -> String {
+    let units = ["Б", "КиБ", "МиБ", "ГиБ", "ТиБ", "ПиБ", "ЭиБ"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < units.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} Б")
+    } else {
+        format!("{size:.1} {}", units[unit]).replace('.', ",")
+    }
+}
+
 /// A page with a header (optionally a button at its end) and scrolled preferences content.
 pub fn preferences(
     title: &str,

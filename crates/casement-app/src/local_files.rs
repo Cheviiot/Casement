@@ -112,8 +112,6 @@ pub fn open(window: &Window, on_selected: impl Fn(Vec<PathBuf>) + 'static) {
     let header = adw::HeaderBar::new();
     let home = pages::flat_icon("user-home-symbolic", "Домашняя папка");
     let downloads = pages::flat_icon("folder-download-symbolic", "Загрузки");
-    header.pack_start(&home);
-    header.pack_start(&downloads);
     let show_hidden = gtk::ToggleButton::builder()
         .icon_name("view-reveal-symbolic")
         .tooltip_text("Скрытые файлы")
@@ -133,6 +131,8 @@ pub fn open(window: &Window, on_selected: impl Fn(Vec<PathBuf>) + 'static) {
         .margin_start(18)
         .margin_end(18)
         .build();
+    location.append(&home);
+    location.append(&downloads);
     location.append(&up);
     location.append(&path);
     location.append(&refresh);
@@ -401,7 +401,7 @@ impl Browser {
                 }
             });
         } else {
-            row.set_subtitle(&glib::format_size(entry.size));
+            row.set_subtitle(&pages::file_size(entry.size));
             let selected = gtk::CheckButton::builder()
                 .active(self.selected.borrow().contains(&path))
                 .valign(gtk::Align::Center)

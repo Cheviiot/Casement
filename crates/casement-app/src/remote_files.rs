@@ -35,7 +35,7 @@ fn parent(folder: &str) -> String {
 }
 
 fn size_text(size: u64) -> String {
-    glib::format_size(size).to_string()
+    pages::file_size(size)
 }
 
 fn modified_text(seconds: u64) -> Option<String> {
