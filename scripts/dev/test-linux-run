@@ -10,6 +10,13 @@ scratch=${CASEMENT_SCRATCH:-$PWD/_scratch/linux-run-test}
 rm -rf "$scratch"
 mkdir -p "$scratch/home" "$scratch/data" "$scratch/config" "$scratch/cache"
 
+# Reproduce an upgrade from the former ~/.local/bin layout. The installer must
+# replace the stale desktop command rather than leaving a cached migration hazard.
+mkdir -p "$scratch/data/applications"
+printf '%s\n' '[Desktop Entry]' 'Type=Application' 'Name=Casement' \
+    "Exec=$scratch/home/.local/bin/casement" \
+    > "$scratch/data/applications/io.github.cheviiot.Casement.desktop"
+
 env HOME="$scratch/home" XDG_DATA_HOME="$scratch/data" \
     XDG_CONFIG_HOME="$scratch/config" XDG_CACHE_HOME="$scratch/cache" \
     CASEMENT_INSTALL_ROOT="$scratch/opt/casement" CASEMENT_SKIP_SERVICE=1 \
@@ -33,6 +40,8 @@ test ! -e "$scratch/home/.local/bin/casement"
 HOME="$scratch/home" XDG_CACHE_HOME="$scratch/cache" \
     "$root/current/bin/casement-cli" --help >/dev/null
 grep -F "$root/current/bin/casement" \
+    "$scratch/data/applications/io.github.cheviiot.Casement.desktop" >/dev/null
+! grep -F "$scratch/home/.local/bin/casement" \
     "$scratch/data/applications/io.github.cheviiot.Casement.desktop" >/dev/null
 grep -F "$root/current/bin/casement-host" \
     "$scratch/config/systemd/user/casement-host.service" >/dev/null

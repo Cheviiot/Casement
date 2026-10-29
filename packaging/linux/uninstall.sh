@@ -28,6 +28,9 @@ rm -f "$share/applications/io.github.cheviiot.Casement.desktop" \
     "$HOME/.local/bin/casement-cli" "$share/casement-uninstall.sh"
 rm -rf -- "$root"
 if [ "${1:-}" = "--settings" ]; then rm -rf -- "$config/casement"; fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$share/applications" >/dev/null 2>&1 || true
+fi
 if command -v systemctl >/dev/null 2>&1 && [ "${CASEMENT_SKIP_SERVICE:-0}" != 1 ]; then
     systemctl --user daemon-reload 2>/dev/null || true
 fi

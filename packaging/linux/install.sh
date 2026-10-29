@@ -57,6 +57,9 @@ esac
 share=${XDG_DATA_HOME:-$HOME/.local/share}
 config=${XDG_CONFIG_HOME:-$HOME/.config}
 units="$config/systemd/user"
+desktop="$share/applications/io.github.cheviiot.Casement.desktop"
+desktop_new="$desktop.new.$$"
+desktop_old="$desktop.old.$$"
 target="$root/versions/$version"
 stage="$root/versions/.${version}.new.$$"
 backup="$root/versions/.${version}.old.$$"
@@ -82,6 +85,11 @@ find "$stage/share/glycin-loaders" -type f -name '*.conf' -exec \
 restore() {
     rm -rf -- "$stage"
     if [ -d "$backup" ] && [ ! -e "$target" ]; then mv "$backup" "$target"; fi
+    rm -f -- "$desktop_new"
+    if [ -f "$desktop_old" ]; then
+        rm -f -- "$desktop"
+        mv "$desktop_old" "$desktop"
+    fi
 }
 trap restore EXIT HUP INT TERM
 if [ -e "$target" ]; then mv "$target" "$backup"; fi
@@ -90,9 +98,23 @@ ln -sfn "versions/$version" "$root/.current.new.$$"
 mv -Tf "$root/.current.new.$$" "$root/current"
 install -m 755 "$here/uninstall.sh" "$root/uninstall.sh"
 
-desktop="$share/applications/io.github.cheviiot.Casement.desktop"
 sed "s|^Exec=.*|Exec=\"$escaped_root/current/bin/casement\"|" \
-    "$here/share/applications/io.github.cheviiot.Casement.desktop" > "$desktop"
+    "$here/share/applications/io.github.cheviiot.Casement.desktop" > "$desktop_new"
+chmod 644 "$desktop_new"
+# GNOME Shell can keep an old Exec value when an existing desktop file is only
+# truncated and rewritten. A remove/add transition plus desktop database refresh
+# invalidates that cached GAppInfo while keeping the replacement recoverable.
+if [ -f "$desktop" ] && ! cmp -s "$desktop_new" "$desktop"; then
+    mv "$desktop" "$desktop_old"
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$share/applications" >/dev/null 2>&1 || true
+    fi
+fi
+mv -f "$desktop_new" "$desktop"
+rm -f -- "$desktop_old"
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$share/applications" >/dev/null 2>&1 || true
+fi
 install -m 644 "$here/share/icons/hicolor/scalable/apps/io.github.cheviiot.Casement.svg" \
     "$share/icons/hicolor/scalable/apps/"
 install -m 644 "$here/share/metainfo/io.github.cheviiot.Casement.metainfo.xml" "$share/metainfo/"
