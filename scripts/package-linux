@@ -12,6 +12,10 @@ app=$stage/app
 scratch=build/linux/.package
 plugins=$app/lib/gstreamer-1.0
 
+# Never publish whatever happens to be left in target/release from an earlier run.
+# CI normally has a warm release build, while local packaging must be correct on its own.
+"${CARGO:-cargo}" build --release -j "${JOBS:-4}"
+
 rm -rf build/linux
 mkdir -p "$app/bin" "$app/lib" "$app/libexec/casement" "$plugins" \
     "$app/share/applications" "$app/share/icons/hicolor/scalable/apps" \
