@@ -103,11 +103,12 @@ pub(super) async fn run(window: &Window, root: &Path) -> Result<Vec<String>, Str
         .store()
         .find("fixture")
         .ok_or("live fixture: запись исчезла")?;
-    if saved.fingerprint.is_empty() || saved.last_connected == 0 {
-        return Err("live fixture: успешный вход не сохранил ключ и время подключения".into());
+    if saved.fingerprint.is_empty() || saved.last_connected == 0 || saved.os_display_name.is_empty()
+    {
+        return Err("live fixture: успешный вход не сохранил ключ, ОС и время подключения".into());
     }
     checks.push(
-        "real loopback login and H.264 decode persist first-use key and connection time".into(),
+        "real loopback login persists first-use key, operating system and connection time".into(),
     );
 
     // The same signal as pointer entry, confined to our private GTK widget and fake host.

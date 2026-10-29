@@ -45,6 +45,8 @@ pub struct Session {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
     pub host_name: String,
+    pub host_os: String,
+    pub host_os_display_name: String,
     pub remembered: bool,
     input: InputSender,
     _endpoint: quinn::Endpoint,
@@ -214,6 +216,8 @@ impl Handshake {
             send: self.send,
             recv: self.recv,
             host_name: self.host_name,
+            host_os: self.host_os,
+            host_os_display_name: self.host_os_display_name,
             remembered: result.remembered,
             _endpoint: self._endpoint,
         })

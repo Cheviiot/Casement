@@ -17,17 +17,6 @@ enum Event {
     Failed(String),
 }
 
-fn os_icon(os: &str) -> &'static str {
-    let os = os.to_ascii_lowercase();
-    if os.contains("windows") {
-        "computer-symbolic"
-    } else if os.is_empty() {
-        "computer-symbolic"
-    } else {
-        "drive-harddisk-system-symbolic"
-    }
-}
-
 struct Scan {
     window: Window,
     list: gtk::ListBox,
@@ -181,10 +170,16 @@ impl Scan {
             let mut computer = Computer::new(&address.to_string(), peer.port);
             computer.name = peer.name;
             computer.os_display_name = peer.os_display_name;
-            let existing = self
-                .window
-                .store()
-                .find_by_fingerprint(&peer.fingerprint.to_hex());
+            let store = self.window.store();
+            let existing = store
+                .find_by_fingerprint(&peer.fingerprint.to_hex())
+                // A manual entry has no key yet, so match it by address once. Entries
+                // with learned, different keys may share an address in a dual-boot PC.
+                .or_else(|| {
+                    store
+                        .find_by_address(&computer.host, computer.port)
+                        .filter(|saved| saved.fingerprint.is_empty())
+                });
             let row = adw::ActionRow::builder()
                 .title(glib::markup_escape_text(&computer.title()).as_str())
                 .subtitle(computer.address())
@@ -193,7 +188,7 @@ impl Scan {
                 .activatable(existing.is_none())
                 .css_classes(["device-row"])
                 .build();
-            row.add_prefix(&pages::icon_tile(os_icon(&computer.os_display_name)));
+            row.add_prefix(&pages::icon_tile(pages::os_icon(&computer.os_display_name)));
             if existing.is_some() {
                 row.add_suffix(
                     &gtk::Label::builder()

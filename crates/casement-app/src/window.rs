@@ -284,19 +284,7 @@ impl Window {
                 .css_classes(["device-row"])
                 .build();
             row.set_widget_name(&computer.id);
-            row.add_prefix(&pages::icon_tile(
-                if computer
-                    .os_display_name
-                    .to_ascii_lowercase()
-                    .contains("windows")
-                {
-                    "computer-symbolic"
-                } else if computer.os_display_name.is_empty() {
-                    "computer-symbolic"
-                } else {
-                    "drive-harddisk-system-symbolic"
-                },
-            ));
+            row.add_prefix(&pages::icon_tile(pages::os_icon(&computer.os_display_name)));
             let edit = flat_icon("emblem-system-symbolic", "Параметры подключения");
             let (this, id) = (self.clone(), computer.id);
             edit.connect_clicked(move |_| computer::open(&this, &id));

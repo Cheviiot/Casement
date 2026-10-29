@@ -76,6 +76,18 @@ fn virtual_desktop_size(viewport_width: i32, scale_factor: i32) -> (u32, u32) {
         .unwrap_or(MODES[MODES.len() - 1])
 }
 
+fn remote_os_label(family: &str, display_name: &str) -> String {
+    let display_name = display_name.trim();
+    if !display_name.is_empty() {
+        return display_name.to_string();
+    }
+    match family.trim().to_ascii_lowercase().as_str() {
+        "windows" => "Windows".to_string(),
+        "linux" => "Linux".to_string(),
+        _ => family.trim().to_string(),
+    }
+}
+
 /// The picture of the remote screen and the input that goes back.
 struct Remote {
     picture: gtk::Picture,
@@ -1714,6 +1726,10 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
     if computer.name.is_empty() {
         computer.name = session.host_name.clone();
     }
+    let reported_os = remote_os_label(&session.host_os, &session.host_os_display_name);
+    if !reported_os.is_empty() {
+        computer.os_display_name = reported_os;
+    }
     window.remember(computer.clone());
     page.page.set_title(&computer.title());
     page.host_name.replace(computer.title());
@@ -1968,21 +1984,6 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::virtual_desktop_size;
-
-    #[test]
-    fn virtual_desktop_uses_stable_standard_modes() {
-        assert_eq!(virtual_desktop_size(0, 1), (1280, 720));
-        assert_eq!(virtual_desktop_size(400, 1), (1280, 720));
-        assert_eq!(virtual_desktop_size(1281, 1), (1600, 900));
-        assert_eq!(virtual_desktop_size(1700, 1), (1920, 1080));
-        assert_eq!(virtual_desktop_size(1700, 2), (3840, 2160));
-        assert_eq!(virtual_desktop_size(5000, 1), (3840, 2160));
-    }
-}
-
 const RECONNECT_DELAYS: [u64; 5] = [2, 4, 8, 15, 30];
 
 /// During automatic reconnects a failure schedules the next attempt; otherwise (or after
@@ -2049,4 +2050,29 @@ fn schedule_reconnect_after(
         reconnect(window, page, computer);
     });
     watch_owner.reconnect_watch.replace(Some(source));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{remote_os_label, virtual_desktop_size};
+
+    #[test]
+    fn virtual_desktop_uses_stable_standard_modes() {
+        assert_eq!(virtual_desktop_size(0, 1), (1280, 720));
+        assert_eq!(virtual_desktop_size(400, 1), (1280, 720));
+        assert_eq!(virtual_desktop_size(1281, 1), (1600, 900));
+        assert_eq!(virtual_desktop_size(1700, 1), (1920, 1080));
+        assert_eq!(virtual_desktop_size(1700, 2), (3840, 2160));
+        assert_eq!(virtual_desktop_size(5000, 1), (3840, 2160));
+    }
+
+    #[test]
+    fn old_and_new_hosts_get_short_operating_system_labels() {
+        assert_eq!(remote_os_label("linux", ""), "Linux");
+        assert_eq!(remote_os_label("windows", ""), "Windows");
+        assert_eq!(
+            remote_os_label("linux", "  ALT Workstation  "),
+            "ALT Workstation"
+        );
+    }
 }

@@ -96,7 +96,9 @@ pub fn os_display_name() -> String {
     #[cfg(target_os = "linux")]
     {
         if let Ok(contents) = std::fs::read_to_string("/etc/os-release") {
-            for key in ["PRETTY_NAME", "NAME"] {
+            // NAME stays concise enough for a device row ("ALT Workstation", "Fedora
+            // Linux"); PRETTY_NAME is only a fallback and often contains a long version.
+            for key in ["NAME", "PRETTY_NAME"] {
                 if let Some(value) = contents.lines().find_map(|line| {
                     line.strip_prefix(&format!("{key}="))
                         .map(|value| value.trim().trim_matches(['\"', '\'']).to_string())
@@ -107,7 +109,7 @@ pub fn os_display_name() -> String {
                 }
             }
         }
-        return "Linux".into();
+        "Linux".into()
     }
     #[cfg(windows)]
     {

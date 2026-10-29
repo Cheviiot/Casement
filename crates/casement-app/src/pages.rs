@@ -153,6 +153,17 @@ pub fn link_row(icon: &str, title: &str, subtitle: &str) -> adw::ActionRow {
     row
 }
 
+/// A stable symbolic icon family for a remote operating system. Old peers have no OS
+/// label and keep the neutral computer icon.
+pub fn os_icon(os: &str) -> &'static str {
+    let os = os.trim().to_ascii_lowercase();
+    if os.is_empty() || os.contains("windows") {
+        "computer-symbolic"
+    } else {
+        "drive-harddisk-system-symbolic"
+    }
+}
+
 /// A fingerprint as people read it aloud: its groups in two lines.
 fn fingerprint_lines(display: &str) -> String {
     let groups: Vec<&str> = display.split('-').collect();
@@ -172,12 +183,19 @@ pub fn fingerprint_label(display: &str) -> gtk::Label {
 
 #[cfg(test)]
 mod tests {
-    use super::fingerprint_lines;
+    use super::{fingerprint_lines, os_icon};
 
     #[test]
     fn fingerprint_in_two_lines() {
         assert_eq!(fingerprint_lines("A-B-C-D"), "A-B\nC-D");
         assert_eq!(fingerprint_lines("A-B-C"), "A-B\nC");
         assert_eq!(fingerprint_lines("A"), "A");
+    }
+
+    #[test]
+    fn operating_system_icons_are_distinct_and_have_a_fallback() {
+        assert_eq!(os_icon(""), "computer-symbolic");
+        assert_eq!(os_icon("Windows"), "computer-symbolic");
+        assert_eq!(os_icon("ALT Workstation"), "drive-harddisk-system-symbolic");
     }
 }
