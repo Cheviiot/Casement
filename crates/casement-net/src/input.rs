@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use casement_proto::{
     control, input, Control, Input, Key, Message, PointerButton, PointerMotion, ReliableInput,
@@ -11,17 +12,32 @@ use casement_proto::{
 use crate::{framing, screen::ScreenControl, NetError};
 
 const INPUT_QUEUE: usize = 128;
+const MOTION_REFRESH: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 struct PointerState {
     sequence: u64,
     position: Option<PointerMotion>,
+    changed: Option<Instant>,
+}
+
+impl PointerState {
+    fn packet(&self) -> Option<Vec<u8>> {
+        let mut bytes = vec![MOTION_DATAGRAM];
+        SequencedMotion {
+            position: Some(self.position.clone()?),
+            sequence: self.sequence,
+        }
+        .encode(&mut bytes)
+        .expect("Vec encoding");
+        Some(bytes)
+    }
 }
 
 struct Sender {
     connection: quinn::Connection,
     queue: Option<tokio::sync::mpsc::Sender<ReliableInput>>,
-    pointer: Mutex<PointerState>,
+    pointer: Arc<Mutex<PointerState>>,
     task: Option<tokio::task::AbortHandle>,
 }
 
@@ -39,19 +55,41 @@ pub struct InputSender(Arc<Sender>);
 
 impl InputSender {
     pub(crate) fn new(connection: quinn::Connection, reliable: bool) -> Self {
+        let pointer = Arc::new(Mutex::new(PointerState::default()));
         let (queue, task) = if reliable {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<ReliableInput>(INPUT_QUEUE);
             let peer = connection.clone();
+            let refresh_pointer = pointer.clone();
             let task = tokio::spawn(async move {
                 let result: Result<(), NetError> = async {
                     let mut stream = peer.open_uni().await?;
                     let _ = stream.set_priority(2);
-                    while let Some(command) = rx.recv().await {
+                    let mut refresh = tokio::time::interval(MOTION_REFRESH);
+                    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                        command = rx.recv() => {
+                            let Some(command) = command else { break };
                         framing::write(
                             &mut stream,
                             &Control::new(control::Kind::ReliableInput(command)),
                         )
                         .await?;
+                        }
+                        _ = refresh.tick() => {
+                            // A final motion datagram can be lost just as the mouse
+                            // stops. Refresh the same sequence while stationary;
+                            // delivered duplicates never reach the desktop backend.
+                            let bytes = {
+                                let pointer = refresh_pointer.lock().unwrap_or_else(|e| e.into_inner());
+                                pointer.changed.filter(|last| last.elapsed() >= MOTION_REFRESH).and_then(|_| pointer.packet())
+                            };
+                            if let Some(bytes) = bytes {
+                                peer.send_datagram(bytes.into()).map_err(|e| NetError::Stream(e.to_string()))?;
+                            }
+                        }
+                        _ = peer.closed() => return Ok(()),
+                        }
                     }
                     let _ = stream.finish();
                     Ok(())
@@ -68,7 +106,7 @@ impl InputSender {
         Self(Arc::new(Sender {
             connection,
             queue,
-            pointer: Mutex::new(PointerState::default()),
+            pointer,
             task,
         }))
     }
@@ -85,14 +123,8 @@ impl InputSender {
                 }
                 pointer.sequence = pointer.sequence.saturating_add(1);
                 pointer.position = Some(position.clone());
-                let mut bytes = vec![MOTION_DATAGRAM];
-                SequencedMotion {
-                    position: Some(position.clone()),
-                    sequence: pointer.sequence,
-                }
-                .encode(&mut bytes)
-                .expect("Vec encoding");
-                self.datagram(bytes)
+                pointer.changed = Some(Instant::now());
+                self.datagram(pointer.packet().expect("position was set"))
             }
             Some(kind) => {
                 let positioned = matches!(kind, input::Kind::Button(_) | input::Kind::Scroll(_));
@@ -293,6 +325,74 @@ mod tests {
         .encode(&mut data)
         .unwrap();
         receiver.datagram(&data);
+    }
+
+    #[tokio::test]
+    async fn lost_final_motion_is_refreshed_without_replaying_delivered_input() {
+        let (client, server, connection, peer) = crate::test_support::loopback_pair().await;
+        let sender = InputSender::new(connection, true);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), peer.read_datagram())
+                .await
+                .is_err()
+        );
+        sender
+            .send(&Input {
+                kind: Some(input::Kind::Motion(PointerMotion { x: 17.0, y: 8.0 })),
+            })
+            .unwrap();
+        let lost = peer.read_datagram().await.unwrap(); // Deliberately drop the first packet.
+        let refreshed = tokio::time::timeout(Duration::from_secs(2), peer.read_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lost, refreshed);
+        let capture = Arc::new(Capture::default());
+        let receiver = Receiver::new(capture.clone());
+        receiver.datagram(&refreshed);
+        receiver.datagram(&refreshed);
+        assert_eq!(
+            capture.0.lock().unwrap().len(),
+            1,
+            "duplicates must not reach the desktop"
+        );
+        sender
+            .send(&Input {
+                kind: Some(input::Kind::Motion(PointerMotion { x: 42.0, y: 9.0 })),
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let packet = peer.read_datagram().await.unwrap();
+                let motion = SequencedMotion::decode(&packet[1..]).unwrap();
+                if motion.sequence == 2 {
+                    receiver.datagram(&packet);
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        receiver.datagram(&refreshed); // A delayed refresh cannot restore an old position.
+        {
+            let inputs = capture.0.lock().unwrap();
+            assert_eq!(inputs.len(), 2);
+            assert_eq!(
+                inputs[1].kind,
+                Some(input::Kind::Motion(PointerMotion { x: 42.0, y: 9.0 }))
+            );
+        }
+        let task = sender.0.task.as_ref().unwrap().clone();
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        client.close(0u32.into(), b"test ended");
+        server.close(0u32.into(), b"test ended");
     }
 
     #[test]

@@ -90,3 +90,6 @@ pub(crate) fn transport_config() -> quinn::TransportConfig {
 pub fn os_name() -> &'static str {
     std::env::consts::OS
 }
+
+#[cfg(test)]
+mod test_support;
