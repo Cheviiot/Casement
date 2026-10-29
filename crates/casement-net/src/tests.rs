@@ -175,6 +175,97 @@ fn start_host(dir: &Path, password: Option<&str>) -> Running {
     }
 }
 
+fn start_host_with_providers(
+    dir: &Path,
+    screen: Option<std::sync::Arc<dyn crate::screen::ScreenProvider>>,
+    audio: Option<std::sync::Arc<dyn crate::audio::AudioProvider>>,
+) -> Running {
+    let identity = Identity::load_or_create(&dir.join("host")).unwrap();
+    let fingerprint = identity.fingerprint();
+    let trust = TrustStore::load(&dir.join("host")).unwrap();
+    let config = HostConfig {
+        name: "test-host".into(),
+        os: "linux".into(),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        allow_any_source: false,
+        screen,
+        files_dir: None,
+        shared_dir: None,
+        audio,
+        settings_dir: None,
+    };
+    let (host, events) = Host::bind(identity, config, None, trust).unwrap();
+    let host = std::sync::Arc::new(host);
+    let addr = host.local_addr().unwrap();
+    let runner = host.clone();
+    tokio::spawn(async move { runner.run().await });
+    Running {
+        addr,
+        fingerprint,
+        host,
+        events,
+    }
+}
+
+struct DropProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct PendingScreen {
+    started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::screen::ScreenProvider for PendingScreen {
+    fn start(&self, _request: crate::screen::ScreenRequest) -> crate::screen::StartFuture {
+        let started = self.started.lock().unwrap().take();
+        let dropped = self.dropped.clone();
+        Box::pin(async move {
+            let _probe = DropProbe(dropped);
+            if let Some(started) = started {
+                let _ = started.send(());
+            }
+            std::future::pending::<Result<crate::screen::ScreenStream, String>>().await
+        })
+    }
+}
+
+struct PendingAudio {
+    started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::audio::AudioProvider for PendingAudio {
+    fn start(&self) -> crate::audio::AudioStartFuture {
+        let started = self.started.lock().unwrap().take();
+        let dropped = self.dropped.clone();
+        Box::pin(async move {
+            let _probe = DropProbe(dropped);
+            if let Some(started) = started {
+                let _ = started.send(());
+            }
+            std::future::pending::<Result<crate::audio::AudioStream, String>>().await
+        })
+    }
+}
+
+async fn wait_for_closed(events: &mut tokio::sync::mpsc::UnboundedReceiver<HostEvent>) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(event) = events.recv().await {
+            if matches!(event, HostEvent::Closed { .. }) {
+                return;
+            }
+        }
+        panic!("host event stream ended before Closed");
+    })
+    .await
+    .expect("host should report the disconnected peer promptly");
+}
+
 fn client_identity(dir: &Path, name: &str) -> Identity {
     Identity::load_or_create(&dir.join(name)).unwrap()
 }
@@ -440,6 +531,70 @@ async fn screen_frames_and_input() {
         }
     }).await.unwrap();
     host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_during_screen_start_drops_provider_and_closes_host_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider = std::sync::Arc::new(PendingScreen {
+        started: std::sync::Mutex::new(Some(started_tx)),
+        dropped: dropped.clone(),
+    });
+    let mut host = start_host_with_providers(&dir.path().join("server"), Some(provider), None);
+    let me = client_identity(&dir.path().join("client"), "identity");
+    let handshake = client::connect(&me, host.addr, Some(host.fingerprint), &info(false))
+        .await
+        .unwrap();
+    let mut session = handshake.login(None).await.unwrap();
+
+    let mut start = Box::pin(session.start_screen(640, 480));
+    tokio::select! {
+        _ = started_rx => {},
+        _ = &mut start => panic!("screen startup unexpectedly completed"),
+    }
+    drop(start);
+    session.close();
+
+    wait_for_closed(&mut host.events).await;
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "closing the peer drops the pending screen provider future"
+    );
+    host.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_during_audio_start_drops_provider_and_closes_host_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider = std::sync::Arc::new(PendingAudio {
+        started: std::sync::Mutex::new(Some(started_tx)),
+        dropped: dropped.clone(),
+    });
+    let mut host = start_host_with_providers(&dir.path().join("server"), None, Some(provider));
+    let me = client_identity(&dir.path().join("client"), "identity");
+    let handshake = client::connect(&me, host.addr, Some(host.fingerprint), &info(false))
+        .await
+        .unwrap();
+    let mut session = handshake.login(None).await.unwrap();
+
+    let mut start = Box::pin(session.start_audio());
+    tokio::select! {
+        _ = started_rx => {},
+        _ = &mut start => panic!("audio startup unexpectedly completed"),
+    }
+    drop(start);
+    session.close();
+
+    wait_for_closed(&mut host.events).await;
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "closing the peer drops the pending audio provider future"
+    );
+    host.host.close();
 }
 
 #[tokio::test]

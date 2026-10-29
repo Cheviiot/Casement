@@ -36,6 +36,28 @@ struct Sharing {
 
 /// How long a client may take for each login step before it is dropped.
 const STEP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Starting a screen includes creating the capture pipeline on the host.
+const SCREEN_START_TIMEOUT: Duration = Duration::from_secs(15);
+/// Sound is optional and must not hold up the screen for long.
+const AUDIO_START_TIMEOUT: Duration = Duration::from_secs(3);
+
+enum StartupError {
+    Closed,
+    Timeout,
+    Provider(String),
+}
+
+async fn start_provider<T: Send>(
+    connection: &quinn::Connection,
+    timeout: Duration,
+    future: impl std::future::Future<Output = Result<T, String>> + Send,
+) -> Result<T, StartupError> {
+    tokio::select! {
+        result = future => result.map_err(StartupError::Provider),
+        _ = connection.closed() => Err(StartupError::Closed),
+        _ = tokio::time::sleep(timeout) => Err(StartupError::Timeout),
+    }
+}
 
 pub struct HostConfig {
     pub name: String,
@@ -445,15 +467,37 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
                     pump.abort();
                 }
                 let started = match shared.config.audio.clone() {
-                    Some(provider) => provider.start().await,
-                    None => Err("this computer does not share its sound".into()),
+                    Some(provider) => {
+                        match start_provider(connection, AUDIO_START_TIMEOUT, provider.start())
+                            .await
+                        {
+                            Ok(stream) => Ok(stream),
+                            Err(StartupError::Provider(message)) => Err((
+                                ErrorCode::NotAllowed,
+                                message,
+                            )),
+                            Err(StartupError::Timeout) => Err((
+                                ErrorCode::Internal,
+                                "audio startup timed out".into(),
+                            )),
+                            Err(StartupError::Closed) => {
+                                return Err(NetError::Stream(
+                                    "peer disconnected during audio startup".into(),
+                                ));
+                            }
+                        }
+                    }
+                    None => Err((
+                        ErrorCode::NotAllowed,
+                        "this computer does not share its sound".into(),
+                    )),
                 };
                 let stream = match started {
                     Ok(stream) => stream,
-                    Err(message) => {
+                    Err((code, message)) => {
                         framing::write(
                             &mut send,
-                            &Control::failure(ErrorCode::NotAllowed, message),
+                            &Control::failure(code, message),
                         )
                         .await?;
                         continue;
@@ -498,20 +542,39 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
                     .await?;
                     continue;
                 };
-                let started = provider
-                    .start(screen::ScreenRequest {
+                let started = start_provider(
+                    connection,
+                    SCREEN_START_TIMEOUT,
+                    provider.start(screen::ScreenRequest {
                         max_width: request.max_width,
                         max_height: request.max_height,
                         virtual_monitor: request.virtual_monitor,
                         monitor: request.monitor,
-                    })
-                    .await;
+                    }),
+                )
+                .await;
                 let stream = match started {
                     Ok(stream) => stream,
-                    Err(message) => {
-                        framing::write(&mut send, &Control::failure(ErrorCode::Internal, message))
-                            .await?;
+                    Err(StartupError::Provider(message)) => {
+                        framing::write(
+                            &mut send,
+                            &Control::failure(ErrorCode::Internal, message),
+                        )
+                        .await?;
                         continue;
+                    }
+                    Err(StartupError::Timeout) => {
+                        framing::write(
+                            &mut send,
+                            &Control::failure(ErrorCode::Internal, "screen startup timed out"),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Err(StartupError::Closed) => {
+                        return Err(NetError::Stream(
+                            "peer disconnected during screen startup".into(),
+                        ));
                     }
                 };
                 framing::write(
