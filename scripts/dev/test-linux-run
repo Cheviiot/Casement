@@ -25,6 +25,10 @@ root=$scratch/opt/casement
 test -x "$root/current/bin/casement"
 test -x "$root/current/bin/casement-host"
 test -x "$root/current/bin/casement-cli"
+test -f "$root/current/share/icons/hicolor/scalable/apps/io.github.cheviiot.Casement.svg"
+test -f "$root/current/share/icons/hicolor/scalable/apps/casement-os-windows.svg"
+test -f "$root/current/share/icons/hicolor/scalable/apps/casement-os-linux-symbolic.svg"
+test -f "$root/current/share/licenses/casement/LICENSE.devicon"
 test ! -e "$scratch/home/.local/bin/casement"
 HOME="$scratch/home" XDG_CACHE_HOME="$scratch/cache" \
     "$root/current/bin/casement-cli" --help >/dev/null

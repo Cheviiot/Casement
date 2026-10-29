@@ -36,8 +36,10 @@ modules:
       - install -Dm755 -t /app/bin target/release/casement target/release/casement-host target/release/casement-cli
       - install -Dm644 -t /app/share/applications data/io.github.cheviiot.Casement.desktop
       - install -Dm644 -t /app/share/icons/hicolor/scalable/apps data/io.github.cheviiot.Casement.svg
+      - install -Dm644 -t /app/share/icons/hicolor/scalable/apps data/icons/hicolor/scalable/apps/*.svg
       - install -Dm644 -t /app/share/metainfo data/io.github.cheviiot.Casement.metainfo.xml
       - install -Dm644 -t /app/share/licenses/io.github.cheviiot.Casement LICENSE
+      - install -Dm644 -t /app/share/licenses/io.github.cheviiot.Casement data/icons/LICENSE.devicon
     sources:
       - type: dir
         path: ../..

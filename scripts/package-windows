@@ -56,7 +56,8 @@ mkdir -p "$out/share/glib-2.0/schemas" "$out/share/icons"
 cp "$mingw"/share/glib-2.0/schemas/*.xml "$out/share/glib-2.0/schemas/"
 glib-compile-schemas "$out/share/glib-2.0/schemas"
 cp -r "$mingw/share/icons/Adwaita" "$mingw/share/icons/hicolor" "$out/share/icons/"
-cp LICENSE data/casement.ico "$out/"
+cp data/icons/hicolor/scalable/apps/*.svg "$out/share/icons/hicolor/scalable/apps/"
+cp LICENSE data/icons/LICENSE.devicon data/casement.ico "$out/"
 
 mkdir -p dist
 # The installer, and the same files as a portable archive.

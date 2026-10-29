@@ -30,7 +30,7 @@ struct Scan {
 pub fn open(window: &Window) {
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
-        .css_classes(["boxed-list"])
+        .css_classes(["device-list"])
         .build();
     let status = adw::StatusPage::builder()
         .icon_name("network-wireless-symbolic")
@@ -180,24 +180,29 @@ impl Scan {
                         .find_by_address(&computer.host, computer.port)
                         .filter(|saved| saved.fingerprint.is_empty())
                 });
+            let address = computer.address();
+            let (title, subtitle) =
+                pages::connection_labels(&computer.name, &address, &computer.os_display_name);
             let row = adw::ActionRow::builder()
-                .title(glib::markup_escape_text(&computer.title()).as_str())
-                .subtitle(computer.address())
+                .title(glib::markup_escape_text(&title).as_str())
+                .subtitle(glib::markup_escape_text(&subtitle).as_str())
                 .title_lines(1)
                 .subtitle_lines(1)
                 .activatable(existing.is_none())
-                .css_classes(["device-row"])
+                .css_classes(["device-card"])
                 .build();
-            row.add_prefix(&pages::icon_tile(pages::os_icon(&computer.os_display_name)));
+            row.add_prefix(&pages::os_icon_tile(&computer.os_display_name));
             if existing.is_some() {
                 row.add_suffix(
                     &gtk::Label::builder()
                         .label("Добавлен")
-                        .css_classes(["dim-label"])
+                        .css_classes(["connection-state"])
                         .build(),
                 );
             } else {
-                row.add_suffix(&gtk::Image::from_icon_name("list-add-symbolic"));
+                let add = gtk::Image::from_icon_name("list-add-symbolic");
+                add.add_css_class("connection-add");
+                row.add_suffix(&add);
                 let window = self.window.clone();
                 row.connect_activated(move |_| {
                     // A discovery announcement never establishes trust in a key.

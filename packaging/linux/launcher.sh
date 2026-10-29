@@ -16,7 +16,7 @@ if [ ! -x "$root/libexec/casement-runtime" ] || [ ! -x "$real" ]; then
     exit 1
 fi
 
-export XDG_DATA_DIRS="$root/share"
+export XDG_DATA_DIRS="$root/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 export GST_PLUGIN_PATH_1_0="$root/lib/gstreamer-1.0${GST_PLUGIN_PATH_1_0:+:$GST_PLUGIN_PATH_1_0}"
 export GST_PLUGIN_SCANNER_1_0="$root/libexec/gstreamer-1.0/gst-plugin-scanner"
 export GIO_EXTRA_MODULES="$root/lib/gio/modules${GIO_EXTRA_MODULES:+:$GIO_EXTRA_MODULES}"

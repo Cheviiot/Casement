@@ -8,7 +8,7 @@
 # connect-monitors (connect, then the monitor page when the host has several),
 # connect-switch-monitor (connect, then switch to another monitor once).
 # Settings come from $CASEMENT_CONFIG_DIR (default _scratch/cfg); CASEMENT_SNAPSHOT_DELAY in ms;
-# ADW_DEBUG_COLOR_SCHEME=prefer-dark for the dark style.
+# ADW_DEBUG_COLOR_SCHEME=prefer-dark for the dark style; CASEMENT_BINARY can check an installed build.
 set -e
 cd "$(dirname "$0")/../.."
 out="$1"
@@ -26,6 +26,7 @@ exec podman exec -i --user "$(id -un)" -w "$PWD" \
     -e CASEMENT_UI_LATENCY="${CASEMENT_UI_LATENCY:-}" \
     -e XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}" \
     -e CASEMENT_DECODER \
+    -e CASEMENT_BINARY="${CASEMENT_BINARY:-./target/debug/casement}" \
     oriel-dev ionice -c 3 nice -n 19 sh -s -- "$display" <<'BROADWAY'
 set -e
 display=$1
@@ -56,5 +57,5 @@ if [ "${CASEMENT_UI_LATENCY:-}" = 1 ]; then
         sleep 0.1
     done
 fi
-GDK_BACKEND=broadway BROADWAY_DISPLAY=":$display" ./target/debug/casement
+GDK_BACKEND=broadway BROADWAY_DISPLAY=":$display" "$CASEMENT_BINARY"
 BROADWAY

@@ -1,0 +1,12 @@
+[Icon Theme]
+Name=Casement development icons
+Comment=Local icon theme used by the source-tree UI checks
+Inherits=Adwaita,hicolor
+Directories=scalable/apps
+
+[scalable/apps]
+Size=48
+MinSize=16
+MaxSize=512
+Type=Scalable
+Context=Applications

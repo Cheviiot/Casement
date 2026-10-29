@@ -76,7 +76,7 @@ impl Window {
             .build();
         let saved = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["boxed-list", "device-list"])
+            .css_classes(["device-list"])
             .build();
         let add = gtk::Button::builder()
             .label("Добавить")
@@ -270,22 +270,22 @@ impl Window {
             .home_stack
             .set_visible_child_name(if empty { "empty" } else { "list" });
         for computer in items {
+            let address = computer.address();
+            let (title, subtitle) =
+                pages::connection_labels(&computer.name, &address, &computer.os_display_name);
             let row = adw::ActionRow::builder()
-                .title(glib::markup_escape_text(&computer.title()).as_str())
-                .subtitle(if computer.name.trim().is_empty() {
-                    String::new()
-                } else {
-                    computer.address()
-                })
+                .title(glib::markup_escape_text(&title).as_str())
+                .subtitle(glib::markup_escape_text(&subtitle).as_str())
                 .title_lines(1)
                 .subtitle_lines(1)
                 .activatable(true)
                 .tooltip_text("Подключиться")
-                .css_classes(["device-row"])
+                .css_classes(["device-card"])
                 .build();
             row.set_widget_name(&computer.id);
-            row.add_prefix(&pages::icon_tile(pages::os_icon(&computer.os_display_name)));
+            row.add_prefix(&pages::os_icon_tile(&computer.os_display_name));
             let edit = flat_icon("emblem-system-symbolic", "Параметры подключения");
+            edit.add_css_class("card-action");
             let (this, id) = (self.clone(), computer.id);
             edit.connect_clicked(move |_| computer::open(&this, &id));
             row.add_suffix(&edit);

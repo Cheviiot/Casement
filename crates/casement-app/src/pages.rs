@@ -96,6 +96,140 @@ pub fn icon_tile(icon: &str) -> gtk::Image {
         .build()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteOs {
+    Windows,
+    AltLinux,
+    Ubuntu,
+    Debian,
+    Fedora,
+    Arch,
+    OpenSuse,
+    Mint,
+    NixOs,
+    Linux,
+    Unknown,
+}
+
+fn remote_os(os: &str) -> RemoteOs {
+    let os = os.trim().to_ascii_lowercase();
+    if os.contains("windows") {
+        RemoteOs::Windows
+    } else if os.starts_with("alt ") || os.contains("alt linux") {
+        RemoteOs::AltLinux
+    } else if os.contains("ubuntu") {
+        RemoteOs::Ubuntu
+    } else if os.contains("debian") {
+        RemoteOs::Debian
+    } else if os.contains("fedora") {
+        RemoteOs::Fedora
+    } else if os.contains("arch linux") || os.starts_with("arch ") {
+        RemoteOs::Arch
+    } else if os.contains("opensuse") || os.contains("open suse") {
+        RemoteOs::OpenSuse
+    } else if os.contains("linux mint") {
+        RemoteOs::Mint
+    } else if os.contains("nixos") || os.contains("nix os") {
+        RemoteOs::NixOs
+    } else if os.contains("linux") {
+        RemoteOs::Linux
+    } else {
+        RemoteOs::Unknown
+    }
+}
+
+/// Make the vendored icon theme visible while running directly from the source tree.
+/// Installed packages place the same files in the normal hicolor theme.
+#[cfg(debug_assertions)]
+pub fn register_source_icons() {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/icons");
+    if path.is_dir() {
+        gtk::IconTheme::for_display(&display).add_search_path(path);
+    }
+}
+
+#[cfg(not(debug_assertions))]
+pub fn register_source_icons() {}
+
+fn remote_icon_name(os: RemoteOs, theme: &gtk::IconTheme) -> &'static str {
+    let preferred = match os {
+        RemoteOs::Windows => "casement-os-windows",
+        // ALT's local icon is an old text-heavy CC-BY-SA logo that becomes unreadable
+        // at card size. Devicon has no ALT mark, so use its clean generic Linux icon.
+        RemoteOs::AltLinux => "casement-os-linux-symbolic",
+        RemoteOs::Ubuntu => "casement-os-ubuntu",
+        RemoteOs::Debian => "casement-os-debian",
+        RemoteOs::Fedora => "casement-os-fedora",
+        RemoteOs::Arch => "casement-os-arch",
+        RemoteOs::OpenSuse => "casement-os-opensuse",
+        RemoteOs::Mint => "casement-os-mint",
+        RemoteOs::NixOs => "casement-os-nixos",
+        RemoteOs::Linux => "casement-os-linux-symbolic",
+        RemoteOs::Unknown => "computer-symbolic",
+    };
+    if theme.has_icon(preferred) {
+        preferred
+    } else if !matches!(os, RemoteOs::Windows | RemoteOs::Unknown)
+        && theme.has_icon("casement-os-linux-symbolic")
+    {
+        "casement-os-linux-symbolic"
+    } else {
+        "computer-symbolic"
+    }
+}
+
+/// A maintained OS or distribution mark from the bundled Devicon subset. Distros not
+/// represented there, including ALT Linux, use the generic Linux mark.
+pub fn os_icon_tile(os: &str) -> gtk::Box {
+    let os = remote_os(os);
+    let class = match os {
+        RemoteOs::Windows => "os-windows",
+        RemoteOs::AltLinux
+        | RemoteOs::Ubuntu
+        | RemoteOs::Debian
+        | RemoteOs::Fedora
+        | RemoteOs::Arch
+        | RemoteOs::OpenSuse
+        | RemoteOs::Mint
+        | RemoteOs::NixOs
+        | RemoteOs::Linux => "os-linux",
+        RemoteOs::Unknown => "os-unknown",
+    };
+    let theme = gtk::IconTheme::for_display(&gtk::gdk::Display::default().expect("display"));
+    let image = gtk::Image::builder()
+        .icon_name(remote_icon_name(os, &theme))
+        .pixel_size(30)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
+    let tile = gtk::Box::builder()
+        .width_request(56)
+        .height_request(56)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .css_classes(["os-tile", class])
+        .build();
+    tile.append(&image);
+    tile
+}
+
+/// Consistent title and metadata for home and LAN discovery cards.
+pub fn connection_labels(name: &str, address: &str, os: &str) -> (String, String) {
+    let name = name.trim();
+    let os = os.trim();
+    let title = if name.is_empty() { address } else { name }.to_string();
+    let subtitle = match (name.is_empty(), os.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => os.to_string(),
+        (false, true) => address.to_string(),
+        (false, false) => format!("{os}  ·  {address}"),
+    };
+    (title, subtitle)
+}
+
 pub fn scrolled(content: &impl IsA<gtk::Widget>, maximum: i32) -> gtk::ScrolledWindow {
     let clamp = adw::Clamp::builder()
         .maximum_size(maximum)
@@ -153,17 +287,6 @@ pub fn link_row(icon: &str, title: &str, subtitle: &str) -> adw::ActionRow {
     row
 }
 
-/// A stable symbolic icon family for a remote operating system. Old peers have no OS
-/// label and keep the neutral computer icon.
-pub fn os_icon(os: &str) -> &'static str {
-    let os = os.trim().to_ascii_lowercase();
-    if os.is_empty() || os.contains("windows") {
-        "computer-symbolic"
-    } else {
-        "drive-harddisk-system-symbolic"
-    }
-}
-
 /// A fingerprint as people read it aloud: its groups in two lines.
 fn fingerprint_lines(display: &str) -> String {
     let groups: Vec<&str> = display.split('-').collect();
@@ -183,7 +306,7 @@ pub fn fingerprint_label(display: &str) -> gtk::Label {
 
 #[cfg(test)]
 mod tests {
-    use super::{fingerprint_lines, os_icon};
+    use super::{connection_labels, fingerprint_lines, remote_os, RemoteOs};
 
     #[test]
     fn fingerprint_in_two_lines() {
@@ -194,8 +317,30 @@ mod tests {
 
     #[test]
     fn operating_system_icons_are_distinct_and_have_a_fallback() {
-        assert_eq!(os_icon(""), "computer-symbolic");
-        assert_eq!(os_icon("Windows"), "computer-symbolic");
-        assert_eq!(os_icon("ALT Workstation"), "drive-harddisk-system-symbolic");
+        assert_eq!(remote_os(""), RemoteOs::Unknown);
+        assert_eq!(remote_os("Windows 11"), RemoteOs::Windows);
+        assert_eq!(remote_os("ALT Atomic Onyx"), RemoteOs::AltLinux);
+        assert_eq!(remote_os("Fedora Linux"), RemoteOs::Fedora);
+        assert_eq!(remote_os("Ubuntu 26.04"), RemoteOs::Ubuntu);
+        assert_eq!(remote_os("Debian GNU/Linux"), RemoteOs::Debian);
+        assert_eq!(remote_os("Arch Linux"), RemoteOs::Arch);
+        assert_eq!(remote_os("openSUSE Tumbleweed"), RemoteOs::OpenSuse);
+        assert_eq!(remote_os("Linux Mint"), RemoteOs::Mint);
+        assert_eq!(remote_os("NixOS"), RemoteOs::NixOs);
+    }
+
+    #[test]
+    fn connection_card_keeps_os_and_address_out_of_the_title() {
+        assert_eq!(
+            connection_labels("GEM12", "gem12.local", "Windows 11"),
+            (
+                "GEM12".to_string(),
+                "Windows 11  ·  gem12.local".to_string()
+            )
+        );
+        assert_eq!(
+            connection_labels("", "192.168.1.20", "ALT Linux"),
+            ("192.168.1.20".to_string(), "ALT Linux".to_string())
+        );
     }
 }

@@ -11,6 +11,8 @@ mkdir -p "$top/SOURCES"
 cp "$bin/casement" "$bin/casement-host" "$bin/casement-cli" \
     data/io.github.cheviiot.Casement.desktop data/io.github.cheviiot.Casement.svg \
     data/casement-host.service data/io.github.cheviiot.Casement.metainfo.xml LICENSE "$top/SOURCES/"
+tar -C data/icons/hicolor/scalable/apps -czf "$top/SOURCES/casement-os-icons.tar.gz" .
+cp data/icons/LICENSE.devicon "$top/SOURCES/"
 rpmbuild -bb packaging/fedora/casement.spec \
     --define "_topdir $top" --define "_sourcedir $top/SOURCES" \
     --define "ver $version" --define "rel ${REL:-1}" \

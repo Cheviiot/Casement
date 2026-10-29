@@ -50,6 +50,7 @@ fn main() -> glib::ExitCode {
             move |_, _| app.quit()
         ));
         app.add_action(&quit);
+        pages::register_source_icons();
         let css = gtk::CssProvider::new();
         css.load_from_string(include_str!("style.css"));
         gtk::style_context_add_provider_for_display(

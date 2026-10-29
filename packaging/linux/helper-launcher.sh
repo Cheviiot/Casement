@@ -13,5 +13,5 @@ while [ ! -x "$root/libexec/casement-runtime" ]; do
     root=$parent
 done
 
-export XDG_DATA_DIRS="$root/share"
+export XDG_DATA_DIRS="$root/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 CASEMENT_RUNTIME_ROOT=$root exec "$root/libexec/casement-runtime" "$0.real" "$@"

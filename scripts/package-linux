@@ -136,6 +136,10 @@ done
 # Runtime data needed independently of what the host distribution ships.
 cp -a /usr/share/icons/Adwaita "$app/share/icons/"
 record_owner /usr/share/icons/Adwaita
+if [ -f /usr/share/icons/hicolor/index.theme ]; then
+    install -m 644 /usr/share/icons/hicolor/index.theme "$app/share/icons/hicolor/"
+    record_owner /usr/share/icons/hicolor/index.theme
+fi
 if [ -d /usr/share/gtk-4.0 ]; then
     cp -a /usr/share/gtk-4.0 "$app/share/"
     record_owner /usr/share/gtk-4.0
@@ -157,6 +161,8 @@ done
 
 install -m 644 data/io.github.cheviiot.Casement.desktop "$stage/share/applications/"
 install -m 644 data/io.github.cheviiot.Casement.svg "$stage/share/icons/hicolor/scalable/apps/"
+install -m 644 data/io.github.cheviiot.Casement.svg "$app/share/icons/hicolor/scalable/apps/"
+install -m 644 data/icons/hicolor/scalable/apps/*.svg "$app/share/icons/hicolor/scalable/apps/"
 install -m 644 data/casement-host.service "$stage/share/casement/"
 install -m 644 data/io.github.cheviiot.Casement.metainfo.xml "$stage/share/metainfo/"
 install -m 755 packaging/linux/install.sh packaging/linux/uninstall.sh "$stage/"
@@ -166,6 +172,7 @@ printf '%s\n' "$version" > "$stage/VERSION"
 # Include the licenses and exact package list for every copied runtime file.
 licenses=$app/share/licenses/casement
 mkdir -p "$licenses/runtime"
+install -m 644 data/icons/LICENSE.devicon "$licenses/"
 sort -u "$owners" -o "$owners"
 : > "$licenses/runtime-packages.txt"
 while IFS= read -r package; do
