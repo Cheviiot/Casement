@@ -1,7 +1,7 @@
 //! Adding and editing a connection are separate from starting a session.
 
 use crate::pages;
-use crate::store::{parse_address, Computer};
+use crate::store::{parse_address, Computer, VideoQuality};
 use crate::window::Window;
 use adw::prelude::*;
 use casement_net::Fingerprint;
@@ -57,9 +57,20 @@ fn editor(window: &Window, original: Option<Computer>) {
         .title("Виртуальный экран")
         .active(original.as_ref().is_some_and(|c| c.virtual_monitor))
         .build();
+    let quality = adw::ComboRow::builder()
+        .title("Качество")
+        .model(&gtk::StringList::new(&VideoQuality::LABELS))
+        .build();
+    quality.set_selected(
+        original
+            .as_ref()
+            .map(|computer| computer.video_quality.index())
+            .unwrap_or_else(|| VideoQuality::default().index()),
+    );
     if !is_new {
         let display = adw::PreferencesGroup::builder().title("Экран").build();
         display.add(&virtual_screen);
+        display.add(&quality);
         page.add(&display);
     }
     let save = gtk::Button::builder()
@@ -89,10 +100,11 @@ fn editor(window: &Window, original: Option<Computer>) {
         .build();
     page.add(&pages::bare(&validation));
     let update = {
-        let (address, name, virtual_screen, save, original, validation) = (
+        let (address, name, virtual_screen, quality, save, original, validation) = (
             address.clone(),
             name.clone(),
             virtual_screen.clone(),
+            quality.clone(),
             save.clone(),
             original.clone(),
             validation.clone(),
@@ -117,6 +129,7 @@ fn editor(window: &Window, original: Option<Computer>) {
                     .is_some_and(|(host, port)| host != &c.host || *port != c.port)
                     || name.text().trim() != c.name
                     || virtual_screen.is_active() != c.virtual_monitor
+                    || VideoQuality::from_index(quality.selected()) != c.video_quality
             });
             save.set_sensitive(parsed.is_some() && changed);
         }
@@ -125,7 +138,9 @@ fn editor(window: &Window, original: Option<Computer>) {
     address.connect_changed(move |_| f());
     let f = update.clone();
     name.connect_changed(move |_| f());
-    virtual_screen.connect_active_notify(move |_| update());
+    let f = update.clone();
+    virtual_screen.connect_active_notify(move |_| f());
+    quality.connect_selected_notify(move |_| update());
     let button = save.clone();
     address.connect_entry_activated(move |_| {
         if button.is_sensitive() {
@@ -207,6 +222,7 @@ fn editor(window: &Window, original: Option<Computer>) {
         computer.port = port;
         computer.name = name.text().trim().to_string();
         computer.virtual_monitor = virtual_screen.is_active();
+        computer.video_quality = VideoQuality::from_index(quality.selected());
         match window2.store().put(computer) {
             Ok(()) => {
                 window2.navigation().pop_to_tag("home");

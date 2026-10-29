@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 
-use crate::store::Store;
+use crate::store::{Store, VideoQuality};
 use crate::window::Window;
 
 mod latency;
@@ -93,6 +93,7 @@ pub async fn run(window: &Window) -> Result<Vec<String>, String> {
     let edit_widgets = descendants(edit_page.upcast_ref());
     let address = find_entry(&edit_widgets, "Адрес")?;
     let name = find_entry(&edit_widgets, "Название")?;
+    let quality = find_combo(&edit_widgets, "Качество")?;
     let save = find_button(&edit_widgets, "Сохранить")
         .ok_or_else(|| "computer: не найдена кнопка «Сохранить»".to_string())?;
 
@@ -104,6 +105,14 @@ pub async fn run(window: &Window) -> Result<Vec<String>, String> {
     if store.find(&computer.id).as_ref() != Some(&original) {
         return Err("computer: изменения применились до нажатия «Сохранить»".into());
     }
+    if quality.selected() != VideoQuality::Balanced.index() {
+        return Err(format!(
+            "computer: для старой записи выбран профиль качества {}, ожидался {}",
+            quality.selected(),
+            VideoQuality::Balanced.index()
+        ));
+    }
+    quality.set_selected(VideoQuality::Ultra.index());
     address.set_text("127.0.0.1:70000");
     if save.is_sensitive() {
         return Err("computer: «Сохранить» включена для недопустимого адреса".into());
@@ -117,7 +126,10 @@ pub async fn run(window: &Window) -> Result<Vec<String>, String> {
     computer = store
         .find(&computer.id)
         .ok_or_else(|| "computer: запись исчезла после сохранения".to_string())?;
-    if computer.host != "127.0.0.1" || computer.port != 47998 || computer.name != "Черновик"
+    if computer.host != "127.0.0.1"
+        || computer.port != 47998
+        || computer.name != "Черновик"
+        || computer.video_quality != VideoQuality::Ultra
     {
         return Err("computer: сохранены неверные поля".into());
     }
@@ -125,7 +137,7 @@ pub async fn run(window: &Window) -> Result<Vec<String>, String> {
     if reopened_store.find(&computer.id).as_ref() != Some(&computer) {
         return Err("computer: запись не сохранилась после повторного чтения Store".into());
     }
-    checks.push("edit atomically and reload saved connection".into());
+    checks.push("edit quality atomically and reload saved connection".into());
 
     let mut blocked_file = BlockSettingsFile::new(&window.core().dir, "connections.ini")?;
     crate::computer::open(window, &computer.id);
@@ -365,6 +377,15 @@ fn find_password_entry(
             (row.title().as_str() == title).then_some(row)
         })
         .ok_or_else(|| format!("не найдена строка пароля «{title}»"))
+}
+
+fn find_combo(widgets: &[gtk::Widget], title: &str) -> Result<adw::ComboRow, String> {
+    visible_widgets(widgets)
+        .find_map(|widget| {
+            let row = widget.clone().downcast::<adw::ComboRow>().ok()?;
+            (row.title().as_str() == title).then_some(row)
+        })
+        .ok_or_else(|| format!("не найдена строка выбора «{title}»"))
 }
 
 fn find_row(widgets: &[gtk::Widget], title: &str) -> Result<adw::ActionRow, String> {

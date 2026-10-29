@@ -10,7 +10,7 @@ use zbus::{Connection, Proxy};
 
 const RD_NAME: &str = "org.gnome.Mutter.RemoteDesktop";
 const SC_NAME: &str = "org.gnome.Mutter.ScreenCast";
-/// Cursor drawn into the picture (1); 2 would send it as metadata.
+/// Cursor drawn into the picture (1); virtual sessions hide it because Casement draws it locally.
 const CURSOR_HIDDEN: u32 = 0;
 const CURSOR_EMBEDDED: u32 = 1;
 
@@ -136,8 +136,14 @@ impl Session {
             SC_NAME,
         )
         .await?;
+        let sc_version = sc.get_property::<i32>("Version").await.unwrap_or(0);
         let mut props: HashMap<&str, Value> = HashMap::new();
         props.insert("remote-desktop-session-id", Value::from(session_id));
+        if virtual_size.is_some() && sc_version >= 3 {
+            // Remote desktops do not benefit from local shell transitions. Mutter owns
+            // this setting for the lifetime of the session and restores it on close.
+            props.insert("disable-animations", Value::Bool(true));
+        }
         let sc_path: OwnedObjectPath = sc.call("CreateSession", &(props,)).await?;
         let cast = Proxy::new(
             &connection,
@@ -148,15 +154,20 @@ impl Session {
         .await?;
 
         let mut record: HashMap<&str, Value> = HashMap::new();
-        // A virtual monitor can idle its frame clock after a short pause. Waiting for
-        // its embedded cursor then adds hundreds of milliseconds, so the client draws
-        // that cursor locally. Mirrored monitors keep Mutter's accurate cursor shape.
+        // A virtual monitor can idle its frame clock after a short pause. Waiting for its
+        // embedded cursor would add hundreds of milliseconds, so the client draws that cursor
+        // locally. Mirrored monitors keep Mutter's accurate embedded cursor shape.
         let cursor_mode = if virtual_size.is_some() {
             CURSOR_HIDDEN
         } else {
             CURSOR_EMBEDDED
         };
         record.insert("cursor-mode", Value::U32(cursor_mode));
+        if virtual_size.is_some() && sc_version >= 3 {
+            // Treat the virtual output as a real extended monitor. Besides avoiding
+            // screen-sharing chrome, this gives GNOME Shell normal panel/dock semantics.
+            record.insert("is-platform", Value::Bool(true));
+        }
         let monitors = monitors(&connection).await.unwrap_or_default();
         let (stream_path, connector): (OwnedObjectPath, String) = match virtual_size {
             Some(_) => (cast.call("RecordVirtual", &(record,)).await?, String::new()),

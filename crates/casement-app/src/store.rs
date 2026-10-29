@@ -7,6 +7,78 @@ use std::rc::Rc;
 
 use casement_net::DEFAULT_PORT;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoQuality {
+    Economy,
+    #[default]
+    Balanced,
+    High,
+    Ultra,
+}
+
+impl VideoQuality {
+    pub const LABELS: [&'static str; 4] = [
+        "720p · 8 Мбит/с",
+        "1080p · 20 Мбит/с",
+        "1440p · 40 Мбит/с",
+        "4K · 80 Мбит/с",
+    ];
+
+    pub fn from_index(index: u32) -> Self {
+        match index {
+            0 => Self::Economy,
+            2 => Self::High,
+            3 => Self::Ultra,
+            _ => Self::Balanced,
+        }
+    }
+
+    pub fn index(self) -> u32 {
+        match self {
+            Self::Economy => 0,
+            Self::Balanced => 1,
+            Self::High => 2,
+            Self::Ultra => 3,
+        }
+    }
+
+    pub fn from_key(value: &str) -> Self {
+        match value {
+            "economy" => Self::Economy,
+            "high" => Self::High,
+            "ultra" => Self::Ultra,
+            _ => Self::Balanced,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Economy => "economy",
+            Self::Balanced => "balanced",
+            Self::High => "high",
+            Self::Ultra => "ultra",
+        }
+    }
+
+    pub fn bitrate_kbps(self) -> u32 {
+        match self {
+            Self::Economy => 8_000,
+            Self::Balanced => 20_000,
+            Self::High => 40_000,
+            Self::Ultra => 80_000,
+        }
+    }
+
+    pub fn virtual_size(self) -> (u32, u32) {
+        match self {
+            Self::Economy => (1280, 720),
+            Self::Balanced => (1920, 1080),
+            Self::High => (2560, 1440),
+            Self::Ultra => (3840, 2160),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Computer {
     pub id: String,
@@ -19,6 +91,8 @@ pub struct Computer {
     pub os_display_name: String,
     /// Ask for a stable virtual desktop instead of mirroring the host's screen.
     pub virtual_monitor: bool,
+    /// Resolution and bitrate selected for this connection.
+    pub video_quality: VideoQuality,
     /// Most recent successful connection, as Unix seconds; zero means never.
     pub last_connected: i64,
 }
@@ -33,6 +107,7 @@ impl Computer {
             fingerprint: String::new(),
             os_display_name: String::new(),
             virtual_monitor: false,
+            video_quality: VideoQuality::default(),
             last_connected: 0,
         }
     }
@@ -216,6 +291,7 @@ impl Store {
                         },
                         os_display_name: get("os-name"),
                         virtual_monitor: file.boolean(group, "virtual-monitor").unwrap_or(false),
+                        video_quality: VideoQuality::from_key(&get("video-quality")),
                         last_connected: file
                             .int64(group, "last-connected")
                             .ok()
@@ -246,6 +322,9 @@ impl Store {
             }
             if item.virtual_monitor {
                 file.set_boolean(&item.id, "virtual-monitor", true);
+            }
+            if item.video_quality != VideoQuality::default() {
+                file.set_string(&item.id, "video-quality", item.video_quality.key());
             }
             file.set_int64(&item.id, "last-connected", item.last_connected.max(0));
         }
@@ -350,6 +429,7 @@ mod tests {
         item.os_display_name = "ALT Linux".into();
         item.fingerprint = "a".repeat(64);
         item.virtual_monitor = true;
+        item.video_quality = VideoQuality::Ultra;
         item.last_connected = 1_800_000_000;
         store.put(item.clone()).unwrap();
         store.put(Computer::new("gem12", DEFAULT_PORT)).unwrap();

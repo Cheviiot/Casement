@@ -54,17 +54,7 @@ pub(super) async fn run(window: &Window, root: &Path) -> Result<Vec<String>, Str
             .ok_or("live fixture: нет картинки виртуального сеанса")?;
         wait_frame(&virtual_picture).await?;
         let request = fs::read_to_string(root.join("screen-request")).map_err(|e| e.to_string())?;
-        if !request.ends_with(" virtual=true")
-            || ![
-                "1280x720",
-                "1600x900",
-                "1920x1080",
-                "2560x1440",
-                "3840x2160",
-            ]
-            .iter()
-            .any(|mode| request.starts_with(mode))
-        {
+        if request != "1920x1080 virtual=true" {
             return Err(format!(
                 "live fixture: виртуальный рабочий стол запрошен с неверной геометрией {request:?}"
             ));

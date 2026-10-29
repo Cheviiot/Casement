@@ -126,17 +126,24 @@ fn converter(encoder: &str) -> &'static str {
     }
 }
 
-/// Low latency everywhere: no B-frames, a keyframe at least every 2 s at 60 fps.
-fn encoder_description(name: &str) -> String {
+/// Low latency everywhere: no B-frames, a keyframe at least every second at 60 fps.
+fn encoder_description(name: &str, requested_bitrate_kbps: u32) -> String {
+    let bitrate = if requested_bitrate_kbps == 0 {
+        20_000
+    } else {
+        requested_bitrate_kbps.clamp(4_000, 100_000)
+    };
     match name {
-        "vah264enc" => {
-            "vah264enc rate-control=cbr bitrate=20000 key-int-max=120 b-frames=0 target-usage=6"
-                .into()
-        }
-        "openh264enc" => {
-            "openh264enc bitrate=12000000 rate-control=bitrate gop-size=120 complexity=low".into()
-        }
-        _ => "x264enc tune=zerolatency speed-preset=ultrafast bitrate=12000 key-int-max=120".into(),
+        "vah264enc" => format!(
+            "vah264enc rate-control=cbr bitrate={bitrate} key-int-max=60 b-frames=0 target-usage=6"
+        ),
+        "openh264enc" => format!(
+            "openh264enc bitrate={} rate-control=bitrate gop-size=60 complexity=low",
+            bitrate.saturating_mul(1000)
+        ),
+        _ => format!(
+            "x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate} key-int-max=60"
+        ),
     }
 }
 
@@ -268,11 +275,12 @@ pub fn virtual_size(width: u32, height: u32) -> (u32, u32) {
 pub async fn start(
     session: mutter::Session,
     virtual_size: Option<(u32, u32)>,
+    bitrate_kbps: u32,
 ) -> Result<ScreenStream, String> {
     let session = Arc::new(session);
     let encoder = encoder_name().ok_or("no H.264 encoder")?;
     let description = format!(
-        "pipewiresrc path={} do-timestamp=true keepalive-time=0 {}! {} ! {} \
+        "pipewiresrc path={} do-timestamp=true keepalive-time=0 min-buffers=1 max-buffers=2 {}! {} ! {} \
          ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au \
          ! appsink name=sink sync=false max-buffers={} drop=false",
         session.node_id,
@@ -283,7 +291,7 @@ pub async fn start(
             ))
             .unwrap_or_default(),
         converter(encoder),
-        encoder_description(encoder),
+        encoder_description(encoder, bitrate_kbps),
         QUEUE
     );
     tracing::info!("capture: {description}");

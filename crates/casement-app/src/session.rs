@@ -58,22 +58,11 @@ fn decoder() -> &'static str {
     }
 }
 
-/// A virtual desktop keeps one standard 16:9 mode for the whole connection. The client
-/// scales it locally when its window changes instead of renegotiating the live H.264
-/// stream: gtk4paintablesink cannot safely mix the last old-size buffer with new caps.
-fn virtual_desktop_size(viewport_width: i32, scale_factor: i32) -> (u32, u32) {
-    const MODES: [(u32, u32); 5] = [
-        (1280, 720),
-        (1600, 900),
-        (1920, 1080),
-        (2560, 1440),
-        (3840, 2160),
-    ];
-    let wanted = (viewport_width.max(0) as u32).saturating_mul(scale_factor.max(1) as u32);
-    MODES
-        .into_iter()
-        .find(|(width, _)| *width >= wanted)
-        .unwrap_or(MODES[MODES.len() - 1])
+/// A virtual desktop keeps one selected mode for the whole connection. Its resolution must
+/// not depend on the window's initial size: a small window would otherwise create a blurry
+/// 720p desktop, while a HiDPI scale could accidentally select an expensive 4K stream.
+fn virtual_desktop_size(quality: crate::store::VideoQuality) -> (u32, u32) {
+    quality.virtual_size()
 }
 
 fn remote_os_label(family: &str, display_name: &str) -> String {
@@ -1164,7 +1153,7 @@ impl SessionPage {
         // $CASEMENT_DECODER replaces the decoding part, for comparing pipelines.
         let decoding = std::env::var("CASEMENT_DECODER").unwrap_or_else(|_| decoder().into());
         let description = format!(
-            "appsrc name=src is-live=true format=time do-timestamp=true max-buffers=3 max-bytes=0 \
+            "appsrc name=src is-live=true format=time do-timestamp=true max-buffers=2 max-bytes=0 \
              caps=video/x-h264,stream-format=byte-stream,alignment=au \
              ! h264parse ! {decoding} ! gtk4paintablesink name=sink sync=false"
         );
@@ -1745,7 +1734,7 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
     // handled by GTK's local scaling, so shrinking the window cannot renegotiate a frame
     // while the decoder still owns buffers of the previous size.
     let (max_width, max_height) = if computer.virtual_monitor {
-        virtual_desktop_size(page.stack.width(), page.stack.scale_factor())
+        virtual_desktop_size(computer.video_quality)
     } else {
         (
             page.stack.width().max(640) as u32,
@@ -1757,6 +1746,7 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
         max_height,
         virtual_monitor: computer.virtual_monitor,
         monitor: page.monitor.borrow().clone(),
+        bitrate_kbps: computer.video_quality.bitrate_kbps(),
     };
     let (screen_tx, screen_rx) = async_channel::bounded::<Result<Started, String>>(1);
     let (src_tx, src_rx) = tokio::sync::oneshot::channel::<gst_app::AppSrc>();
@@ -1833,7 +1823,9 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
             })
         });
         // Each stream is read by its own task: reads are not cancellation-safe in select!.
-        let (frames_tx, mut frames) = tokio::sync::mpsc::channel(2);
+        // One completed AU may wait while the previous one is admitted to the decoder.
+        // Keeping the wire reader eager avoids turning this bridge into QUIC backpressure.
+        let (frames_tx, mut frames) = tokio::sync::mpsc::channel(1);
         let mut video = screen.video;
         let reader = tokio::spawn(async move {
             loop {
@@ -2055,15 +2047,14 @@ fn schedule_reconnect_after(
 #[cfg(test)]
 mod tests {
     use super::{remote_os_label, virtual_desktop_size};
+    use crate::store::VideoQuality;
 
     #[test]
     fn virtual_desktop_uses_stable_standard_modes() {
-        assert_eq!(virtual_desktop_size(0, 1), (1280, 720));
-        assert_eq!(virtual_desktop_size(400, 1), (1280, 720));
-        assert_eq!(virtual_desktop_size(1281, 1), (1600, 900));
-        assert_eq!(virtual_desktop_size(1700, 1), (1920, 1080));
-        assert_eq!(virtual_desktop_size(1700, 2), (3840, 2160));
-        assert_eq!(virtual_desktop_size(5000, 1), (3840, 2160));
+        assert_eq!(virtual_desktop_size(VideoQuality::Economy), (1280, 720));
+        assert_eq!(virtual_desktop_size(VideoQuality::Balanced), (1920, 1080));
+        assert_eq!(virtual_desktop_size(VideoQuality::High), (2560, 1440));
+        assert_eq!(virtual_desktop_size(VideoQuality::Ultra), (3840, 2160));
     }
 
     #[test]

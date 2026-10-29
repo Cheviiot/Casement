@@ -554,6 +554,7 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
                             max_height: request.max_height,
                             virtual_monitor: request.virtual_monitor,
                             monitor: request.monitor,
+                            bitrate_kbps: request.bitrate_kbps,
                         }),
                     )
                     .await;

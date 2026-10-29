@@ -27,7 +27,7 @@ const READ_FPS: u64 = 15;
 const PAYLOAD_BYTES: usize = 64 * 1024;
 const WARMUP: Duration = Duration::from_secs(5);
 const MEASURE: Duration = Duration::from_secs(5);
-const PROVIDER_QUEUE: usize = 3;
+const PROVIDER_QUEUE: usize = 2;
 
 struct Metrics {
     origin: Instant,
@@ -87,7 +87,7 @@ impl ScreenProvider for FakeScreen {
                 loop {
                     ticker.tick().await;
                     let forced = source_metrics.force_keyframe.swap(false, Ordering::AcqRel);
-                    let keyframe = forced || sequence % (FPS * 2) == 0;
+                    let keyframe = forced || sequence % FPS == 0;
                     if waiting_for_keyframe && !keyframe {
                         source_metrics
                             .dropped_before_keyframe

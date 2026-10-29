@@ -291,6 +291,7 @@ impl Session {
             max_height,
             virtual_monitor,
             monitor,
+            bitrate_kbps,
         } = request;
         framing::write(
             &mut self.send,
@@ -299,6 +300,7 @@ impl Session {
                 max_height,
                 virtual_monitor,
                 monitor,
+                bitrate_kbps,
             })),
         )
         .await?;

@@ -66,6 +66,8 @@ pub struct ScreenRequest {
     pub virtual_monitor: bool,
     /// `Monitor.id` to show; "" for the primary one.
     pub monitor: String,
+    /// Target H.264 bitrate in kbit/s (0 = the backend default).
+    pub bitrate_kbps: u32,
 }
 
 /// Starts sharing the screen; stops when the returned stream is dropped.

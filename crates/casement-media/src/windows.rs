@@ -39,28 +39,39 @@ const WHEEL_DELTA: f64 = 120.0;
 
 /// Encoders to try, best first; each with low-latency settings and, if those are not
 /// accepted by this GStreamer version, bare.
-const ENCODERS: &[(&str, &str)] = &[
-    (
-        "amfh264enc",
-        "amfh264enc usage=ultra-low-latency rate-control=cbr bitrate=20000 gop-size=120",
-    ),
-    (
-        "qsvh264enc",
-        "qsvh264enc low-latency=true rate-control=cbr bitrate=20000 gop-size=120",
-    ),
-    (
-        "nvd3d11h264enc",
-        "nvd3d11h264enc preset=low-latency-hq bitrate=20000 gop-size=120 bframes=0",
-    ),
-    (
-        "mfh264enc",
-        "mfh264enc low-latency=true rc-mode=cbr bitrate=20000 gop-size=120 bframes=0",
-    ),
-    (
-        "openh264enc",
-        "openh264enc bitrate=12000000 rate-control=bitrate gop-size=120 complexity=low",
-    ),
+const ENCODERS: &[&str] = &[
+    "amfh264enc",
+    "qsvh264enc",
+    "nvd3d11h264enc",
+    "mfh264enc",
+    "openh264enc",
 ];
+
+fn encoder_description(name: &str, requested_bitrate_kbps: u32) -> String {
+    let bitrate = if requested_bitrate_kbps == 0 {
+        20_000
+    } else {
+        requested_bitrate_kbps.clamp(4_000, 100_000)
+    };
+    match name {
+        "amfh264enc" => format!(
+            "amfh264enc usage=ultra-low-latency rate-control=cbr bitrate={bitrate} gop-size=60"
+        ),
+        "qsvh264enc" => {
+            format!("qsvh264enc low-latency=true rate-control=cbr bitrate={bitrate} gop-size=60")
+        }
+        "nvd3d11h264enc" => {
+            format!("nvd3d11h264enc preset=low-latency-hq bitrate={bitrate} gop-size=60 bframes=0")
+        }
+        "mfh264enc" => format!(
+            "mfh264enc low-latency=true rc-mode=cbr bitrate={bitrate} gop-size=60 bframes=0"
+        ),
+        _ => format!(
+            "openh264enc bitrate={} rate-control=bitrate gop-size=60 complexity=low",
+            bitrate.saturating_mul(1000)
+        ),
+    }
+}
 
 #[derive(Clone)]
 struct Display {
@@ -135,7 +146,7 @@ impl WindowsScreen {
 pub fn encoder_name() -> Option<&'static str> {
     ENCODERS
         .iter()
-        .map(|(name, _)| *name)
+        .copied()
         .find(|name| gst::ElementFactory::find(name).is_some())
 }
 
@@ -151,11 +162,12 @@ impl ScreenProvider for WindowsScreen {
                 .cloned()
                 .ok_or("no monitor is attached")?;
             let mut last_error = String::from("no H.264 encoder");
-            for (name, tuned) in ENCODERS {
+            for name in ENCODERS {
                 if gst::ElementFactory::find(name).is_none() {
                     continue;
                 }
-                for encoder in [*tuned, *name] {
+                let tuned = encoder_description(name, request.bitrate_kbps);
+                for encoder in [tuned.as_str(), *name] {
                     match start_with(&display, encoder).await {
                         Ok((frames, frame_overflow, control, width, height)) => {
                             let events = control.clipboard.watch();

@@ -517,6 +517,12 @@ async fn run() -> Result<()> {
                 })
             });
             if latency > 0 {
+                // A real virtual-monitor fixture may need time to map its target window.
+                // This diagnostic delay is intentionally environment-only: ordinary CLI
+                // use starts measuring immediately.
+                if let Ok(delay) = std::env::var("CASEMENT_LATENCY_START_DELAY_MS") {
+                    tokio::time::sleep(Duration::from_millis(delay.parse()?)).await;
+                }
                 // Frames arrive only when the screen changes: wait for quiet, move the pointer,
                 // time the first frame. Measures input -> capture -> encode -> network.
                 let (frames_tx, mut frames_rx) = tokio::sync::mpsc::unbounded_channel();

@@ -13,7 +13,8 @@ use gstreamer_video as gst_video;
 use casement_net::screen::EncodedFrame;
 
 /// Frames in flight between the encoder and the network before we start dropping.
-pub(crate) const QUEUE: usize = 3;
+/// Two access units absorb normal scheduler jitter without retaining a visible video tail.
+pub(crate) const QUEUE: usize = 2;
 
 pub(crate) fn pull_frames(
     sink: gst_app::AppSink,

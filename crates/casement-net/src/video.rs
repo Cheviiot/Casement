@@ -1,6 +1,8 @@
 //! Keep the decoder's compressed-input queue short without breaking a H.264 chain.
 
-pub const DECODE_QUEUE: u64 = 3;
+/// Compressed access units allowed to wait in appsrc. The decoder itself owns the frame
+/// currently being processed, so two queued units are enough for scheduling jitter.
+pub const DECODE_QUEUE: u64 = 2;
 
 #[derive(Default)]
 pub struct VideoBudget {

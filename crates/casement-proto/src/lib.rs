@@ -133,6 +133,9 @@ pub struct StartScreen {
     /// Which monitor to show (`Monitor.id` from an earlier ScreenStarted); "" = primary.
     #[prost(string, tag = "4")]
     pub monitor: String,
+    /// Target video bitrate in kbit/s (0 = host default). Hosts clamp this value.
+    #[prost(uint32, tag = "5")]
+    pub bitrate_kbps: u32,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
