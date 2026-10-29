@@ -195,42 +195,54 @@ async fn input_loop(
 ) {
     let (mut scroll_x, mut scroll_y) = (0.0f64, 0.0f64);
     while let Some(command) = rx.recv().await {
-        let event = match command {
-            Command::Input(event) => event,
-            Command::Clipboard(text) => {
-                *clipboard.lock().unwrap() = text;
-                if let Err(e) = session.set_selection(TEXT_TYPES).await {
-                    tracing::warn!("clipboard: {e}");
+        let result = rx
+            .until_closed(tokio::time::timeout(Duration::from_secs(1), async {
+                match command {
+                    Command::Clipboard(text) => {
+                        *clipboard.lock().unwrap() = text;
+                        session
+                            .set_selection(TEXT_TYPES)
+                            .await
+                            .map_err(|e| format!("clipboard: {e}"))
+                    }
+                    Command::Input(event) => {
+                        let result = match event.kind {
+                            Some(input::Kind::Motion(m)) => session.pointer_motion(m.x, m.y).await,
+                            Some(input::Kind::Button(b)) => {
+                                session.pointer_button(b.button as i32, b.pressed).await
+                            }
+                            Some(input::Kind::Key(k)) => session.key(k.code, k.pressed).await,
+                            Some(input::Kind::Scroll(s)) => {
+                                // Mutter takes whole wheel steps; keep the remainder for next time.
+                                scroll_x += s.dx;
+                                scroll_y += s.dy;
+                                let (sx, sy) = (scroll_x.trunc(), scroll_y.trunc());
+                                scroll_x -= sx;
+                                scroll_y -= sy;
+                                let mut result = Ok(());
+                                if sy != 0.0 {
+                                    result = session.scroll_discrete(0, sy as i32).await;
+                                }
+                                if sx != 0.0 && result.is_ok() {
+                                    result = session.scroll_discrete(1, sx as i32).await;
+                                }
+                                result
+                            }
+                            None => Ok(()),
+                        };
+                        result.map_err(|e| format!("input: {e}"))
+                    }
                 }
-                continue;
+            }))
+            .await;
+        match result {
+            None => break,
+            Some(Err(_)) => {
+                tracing::warn!("input: Mutter call timed out after 1 s");
+                break;
             }
-        };
-        let result = match event.kind {
-            Some(input::Kind::Motion(m)) => session.pointer_motion(m.x, m.y).await,
-            Some(input::Kind::Button(b)) => {
-                session.pointer_button(b.button as i32, b.pressed).await
-            }
-            Some(input::Kind::Key(k)) => session.key(k.code, k.pressed).await,
-            Some(input::Kind::Scroll(s)) => {
-                // Mutter takes whole wheel steps here; keep the remainder for the next event.
-                scroll_x += s.dx;
-                scroll_y += s.dy;
-                let (sx, sy) = (scroll_x.trunc(), scroll_y.trunc());
-                scroll_x -= sx;
-                scroll_y -= sy;
-                let mut result = Ok(());
-                if sy != 0.0 {
-                    result = session.scroll_discrete(0, sy as i32).await;
-                }
-                if sx != 0.0 && result.is_ok() {
-                    result = session.scroll_discrete(1, sx as i32).await;
-                }
-                result
-            }
-            None => Ok(()),
-        };
-        if let Err(e) = result {
-            tracing::warn!("input: {e}");
+            Some(Ok(Err(error))) => tracing::warn!("{error}"),
+            Some(Ok(Ok(()))) => {}
         }
     }
     session.stop().await;

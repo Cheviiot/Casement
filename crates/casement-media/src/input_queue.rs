@@ -1,6 +1,7 @@
 //! Bounded ordered input delivery for slow desktop backends.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use casement_proto::{input, Input};
@@ -22,6 +23,7 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     ready: Notify,
+    closed: Notify,
 }
 
 pub(crate) struct Sender(Arc<Shared>);
@@ -32,6 +34,7 @@ pub(crate) fn channel() -> (Sender, Receiver) {
     let shared = Arc::new(Shared {
         state: Mutex::new(State::default()),
         ready: Notify::new(),
+        closed: Notify::new(),
     });
     (Sender(shared.clone()), Receiver(shared))
 }
@@ -65,6 +68,7 @@ impl Sender {
             state.commands.clear();
             state.closed = true;
             self.0.ready.notify_one();
+            self.0.closed.notify_one();
             return;
         }
 
@@ -101,6 +105,30 @@ impl Receiver {
             notified.await;
         }
     }
+
+    pub(crate) async fn until_closed<F: Future>(&self, future: F) -> Option<F::Output> {
+        tokio::select! {
+            biased;
+            _ = self.closed() => None,
+            output = future => Some(output),
+        }
+    }
+
+    async fn closed(&self) {
+        loop {
+            let notified = self.0.closed.notified();
+            if self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .closed
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 fn close(shared: &Shared) {
@@ -108,12 +136,14 @@ fn close(shared: &Shared) {
     state.commands.clear();
     state.closed = true;
     shared.ready.notify_one();
+    shared.closed.notify_one();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use casement_proto::{input, Input, Key, PointerButton, PointerMotion};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     fn motion(x: f64) -> Command {
@@ -245,5 +275,39 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn close_cancels_an_in_flight_operation() {
+        let (sender, receiver) = channel();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe_dropped = dropped.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            receiver
+                .until_closed(async move {
+                    let _probe = DropProbe(probe_dropped);
+                    let _ = started_tx.send(());
+                    std::future::pending::<()>().await;
+                })
+                .await
+        });
+
+        started_rx.await.unwrap();
+        sender.close();
+        assert!(tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }
