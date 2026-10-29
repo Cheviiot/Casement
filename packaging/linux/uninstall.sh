@@ -1,20 +1,34 @@
 #!/bin/sh
-# Removes what install.sh put into ~/.local. Settings (~/.config/casement: the device key,
-# the access password, trusted devices, saved computers) stay unless --settings is given.
+# Removes the private application directory and desktop integration. Settings, device
+# identity and trusted computers stay unless --settings is explicitly given.
 set -eu
-bin="$HOME/.local/bin"
-share="${XDG_DATA_HOME:-$HOME/.local/share}"
-config="${XDG_CONFIG_HOME:-$HOME/.config}"
-if command -v systemctl >/dev/null 2>&1; then
+
+root=${CASEMENT_INSTALL_ROOT:-$HOME/.local/opt/casement}
+share=${XDG_DATA_HOME:-$HOME/.local/share}
+config=${XDG_CONFIG_HOME:-$HOME/.config}
+case "$root" in
+    /*) ;;
+    *) echo "Каталог удаления должен быть абсолютным: $root" >&2; exit 1 ;;
+esac
+case "$root" in
+    ""|/|"$HOME"|"$HOME/.local"|"$HOME/.local/opt")
+        echo "Небезопасный каталог удаления: $root" >&2
+        exit 1
+        ;;
+esac
+
+if command -v systemctl >/dev/null 2>&1 && [ "${CASEMENT_SKIP_SERVICE:-0}" != 1 ]; then
     systemctl --user disable --now casement-host.service 2>/dev/null || true
 fi
-rm -f "$bin/casement" "$bin/casement-host" "$bin/casement-cli" \
-    "$share/applications/io.github.cheviiot.Casement.desktop" \
+rm -f "$share/applications/io.github.cheviiot.Casement.desktop" \
     "$share/icons/hicolor/scalable/apps/io.github.cheviiot.Casement.svg" \
     "$share/metainfo/io.github.cheviiot.Casement.metainfo.xml" \
-    "$config/systemd/user/casement-host.service" "$share/casement-uninstall.sh"
-if [ "${1:-}" = "--settings" ]; then
-    rm -rf "$config/casement"
+    "$config/systemd/user/casement-host.service" \
+    "$HOME/.local/bin/casement" "$HOME/.local/bin/casement-host" \
+    "$HOME/.local/bin/casement-cli" "$share/casement-uninstall.sh"
+rm -rf -- "$root"
+if [ "${1:-}" = "--settings" ]; then rm -rf -- "$config/casement"; fi
+if command -v systemctl >/dev/null 2>&1 && [ "${CASEMENT_SKIP_SERVICE:-0}" != 1 ]; then
+    systemctl --user daemon-reload 2>/dev/null || true
 fi
-command -v systemctl >/dev/null 2>&1 && systemctl --user daemon-reload 2>/dev/null || true
 echo "Casement удалён."

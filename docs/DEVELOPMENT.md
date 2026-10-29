@@ -47,16 +47,22 @@ scripts/check-glibc target/release/casement   # не новее glibc 2.38 (ALT 
 
 | Команда | Результат в `dist/` |
 |---|---|
-| `scripts/package-linux` | `casement-ВЕРСИЯ-linux-x86_64.tar.gz` с `install.sh` |
+| `scripts/package-linux` | самодостаточные `casement-ВЕРСИЯ-linux-x86_64.run` и `.tar.gz` |
 | `scripts/package-alt` | `casement-ВЕРСИЯ-alt1.x86_64.rpm` (rpmbuild из Debian 13, зависимости ALT в spec) |
 | `scripts/package-fedora` | `casement-ВЕРСИЯ-1.fc44.x86_64.rpm` (в контейнере Fedora 44) |
 | `scripts/package-deb` | `casement_ВЕРСИЯ_amd64.deb` (в контейнере Debian 13) |
 | `scripts/package-windows` | `casement-ВЕРСИЯ-windows-x86_64-setup.exe` (NSIS) и `-portable.zip` |
 | `flatpak-builder --user --install build-flatpak packaging/flatpak/io.github.cheviiot.Casement.yml` | Flatpak |
-| `scripts/install-user` | ставит текущую сборку себе в `~/.local` |
+| `scripts/install-user` | ставит текущую сборку в `~/.local/opt/casement` |
 
-Пакеты Linux берут готовую `cargo build --release`: программы одни и те же, а
-зависимости каждый пакет вычисляет на своём дистрибутиве. `package-windows` сам
+Универсальный Linux-установщик хранит приложение, GTK, Libadwaita, GStreamer, плагины и
+динамический загрузчик в собственном каталоге `~/.local/opt/casement`. Версии лежат в
+`versions/`, а `current` переключается атомарно. В стандартные XDG-каталоги попадают
+только ярлык, значок, AppStream metadata и пользовательская служба systemd. Проверка
+установки в полностью отдельный профиль — `scripts/dev/test-linux-run`.
+
+Дистрибутивные пакеты Linux берут готовую `cargo build --release`: программы одни и те
+же, а зависимости каждый пакет вычисляет на своём дистрибутиве. `package-windows` сам
 собирает `x86_64-pc-windows-gnu`, кладёт рядом все DLL, плагины GStreamer, схемы и
 значки и делает из этого установщик (`packaging/windows/casement.nsi`) и архив.
 Значок встраивается в `.exe` при сборке (`packaging/windows/icon.rs`).
@@ -64,7 +70,7 @@ scripts/check-glibc target/release/casement   # не новее glibc 2.38 (ALT 
 ## CI и релизы
 
 `.github/workflows/build.yml` на каждый push и pull request проверяет форматирование,
-clippy и тесты, собирает архив Linux, пакеты ALT, Fedora и Debian, установщик Windows и
+clippy и тесты, собирает `.run` и архив Linux, пакеты ALT, Fedora и Debian, установщик Windows и
 Flatpak. Тег `vX.Y.Z` (совпадающий с версией в `Cargo.toml`) после тех же шагов
 публикует релиз со всеми пакетами, `install.sh` и `SHA256SUMS`:
 

@@ -27,6 +27,8 @@ jobs:
         run: >
           dnf -y install git gcc pkgconf-pkg-config binutils tar gzip
           gtk4-devel libadwaita-devel gstreamer1-devel gstreamer1-plugins-base-devel
+          gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugin-openh264
+          gstreamer1-plugin-gtk4 glycin-loaders adwaita-icon-theme dconf
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -41,11 +43,15 @@ jobs:
       - name: Release build
         run: cargo build --release --workspace
       - name: Archive
-        run: scripts/package-linux
+        run: |
+          scripts/package-linux
+          scripts/dev/test-linux-run
       - uses: actions/upload-artifact@v4
         with:
           name: linux
-          path: dist/*.tar.gz
+          path: |
+            dist/*.tar.gz
+            dist/*.run
       - uses: actions/upload-artifact@v4
         with:
           name: linux-binaries
@@ -191,13 +197,15 @@ jobs:
           mv dist/casement-x86_64.flatpak "dist/casement-$version-x86_64.flatpak"
           # Stable names for the "latest" download links of the README and installers.
           cp dist/casement-*-linux-x86_64.tar.gz dist/casement-linux-x86_64.tar.gz
+          cp dist/casement-*-linux-x86_64.run dist/casement-linux-x86_64.run
           cp dist/casement-*-windows-x86_64-setup.exe dist/casement-windows-x86_64-setup.exe
           cp dist/casement-*-alt1.x86_64.rpm dist/casement-alt-p11.x86_64.rpm
           cp dist/casement-*.fc*.x86_64.rpm dist/casement-fedora.x86_64.rpm
           cp dist/casement_*_amd64.deb dist/casement_amd64.deb
           cp "dist/casement-$version-x86_64.flatpak" dist/casement-x86_64.flatpak
           cp packaging/linux/install.sh dist/
-          (cd dist && sha256sum * > SHA256SUMS)
+          (cd dist && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
+            | sort -z | xargs -0 sha256sum > SHA256SUMS)
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "Casement $version" --notes-file - <<'NOTES'
           | Система | Файл |
@@ -206,7 +214,9 @@ jobs:
           | ALT p11 | `casement-alt-p11.x86_64.rpm` |
           | Fedora 44 | `casement-fedora.x86_64.rpm` |
           | Debian 13, Ubuntu 25.04+ | `casement_amd64.deb` |
-          | Любой Linux | `casement-x86_64.flatpak` или `install.sh` |
+          | Любой современный Linux x86-64 | `casement-linux-x86_64.run` |
+          | Переносимый Linux-архив | `casement-linux-x86_64.tar.gz` |
+          | Flatpak | `casement-x86_64.flatpak` |
 
           [README](https://github.com/Cheviiot/Casement/blob/main/README.ru.md) ·
           [English](https://github.com/Cheviiot/Casement#readme)

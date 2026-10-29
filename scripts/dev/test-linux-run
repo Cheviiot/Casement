@@ -1,0 +1,43 @@
+#!/bin/sh
+# Installs the generated .run into an isolated root, checks its private runtime and then
+# removes it. It never touches the user's service, settings or desktop files.
+set -eu
+cd "$(dirname "$0")/../.."
+
+run=${1:-dist/casement-$(scripts/version)-linux-x86_64.run}
+[ -f "$run" ] || { echo "Run scripts/package-linux first" >&2; exit 1; }
+scratch=${CASEMENT_SCRATCH:-$PWD/_scratch/linux-run-test}
+rm -rf "$scratch"
+mkdir -p "$scratch/home" "$scratch/data" "$scratch/config" "$scratch/cache"
+
+env HOME="$scratch/home" XDG_DATA_HOME="$scratch/data" \
+    XDG_CONFIG_HOME="$scratch/config" XDG_CACHE_HOME="$scratch/cache" \
+    CASEMENT_INSTALL_ROOT="$scratch/opt/casement" CASEMENT_SKIP_SERVICE=1 \
+    sh "$run"
+# A same-version reinstall must atomically replace the version rather than nesting or
+# leaving a half-updated directory.
+env HOME="$scratch/home" XDG_DATA_HOME="$scratch/data" \
+    XDG_CONFIG_HOME="$scratch/config" XDG_CACHE_HOME="$scratch/cache" \
+    CASEMENT_INSTALL_ROOT="$scratch/opt/casement" CASEMENT_SKIP_SERVICE=1 \
+    sh "$run" >/dev/null
+
+root=$scratch/opt/casement
+test -x "$root/current/bin/casement"
+test -x "$root/current/bin/casement-host"
+test -x "$root/current/bin/casement-cli"
+test ! -e "$scratch/home/.local/bin/casement"
+HOME="$scratch/home" XDG_CACHE_HOME="$scratch/cache" \
+    "$root/current/bin/casement-cli" --help >/dev/null
+grep -F "$root/current/bin/casement" \
+    "$scratch/data/applications/io.github.cheviiot.Casement.desktop" >/dev/null
+grep -F "$root/current/bin/casement-host" \
+    "$scratch/config/systemd/user/casement-host.service" >/dev/null
+
+mkdir -p "$scratch/config/casement"
+printf 'preserve settings\n' > "$scratch/config/casement/test"
+env HOME="$scratch/home" XDG_DATA_HOME="$scratch/data" \
+    XDG_CONFIG_HOME="$scratch/config" CASEMENT_INSTALL_ROOT="$root" \
+    CASEMENT_SKIP_SERVICE=1 sh "$run" --uninstall
+test ! -e "$root"
+test -f "$scratch/config/casement/test"
+echo "Self-contained Linux installer: PASS"

@@ -18,7 +18,7 @@
 [![ALT](https://img.shields.io/badge/ALT_p11-rpm-F5A623?style=for-the-badge)](https://github.com/Cheviiot/Casement/releases/latest/download/casement-alt-p11.x86_64.rpm)
 [![Fedora](https://img.shields.io/badge/Fedora-rpm-51A2DA?style=for-the-badge)](https://github.com/Cheviiot/Casement/releases/latest/download/casement-fedora.x86_64.rpm)
 [![Debian](https://img.shields.io/badge/Debian_|_Ubuntu-deb-A81D33?style=for-the-badge)](https://github.com/Cheviiot/Casement/releases/latest/download/casement_amd64.deb)
-[![Flatpak](https://img.shields.io/badge/Flatpak-any_Linux-4A90D9?style=for-the-badge)](https://github.com/Cheviiot/Casement/releases/latest/download/casement-x86_64.flatpak)
+[![Linux](https://img.shields.io/badge/Linux-installer-2EA44F?style=for-the-badge)](https://github.com/Cheviiot/Casement/releases/latest/download/casement-linux-x86_64.run)
 
 </div>
 
@@ -49,21 +49,21 @@
 ## Without a desktop
 
 ```sh
-casement-cli setup        # step-by-step: password, accepting connections, trusted devices
-casement-cli status       # how this computer is set up
-casement-cli accept off   # stop accepting connections
+~/.local/opt/casement/current/bin/casement-cli setup
+~/.local/opt/casement/current/bin/casement-cli status
+~/.local/opt/casement/current/bin/casement-cli accept off
 ```
 
 ## Requirements
 
 - **Windows** 10 or 11. Casement runs as a service, so it also shows the login screen,
   the lock screen and UAC prompts.
-- **Linux** with GTK 4.14+, Libadwaita 1.6+ and GStreamer 1.24+ (the packages pull them
-  in). Accepting connections needs GNOME on Wayland.
+- **Linux x86-64.** The universal `.run` carries GTK, Libadwaita and GStreamer and
+  installs without root into `~/.local/opt/casement`. Accepting connections needs GNOME
+  on Wayland.
 
 Every file is in the [latest release](https://github.com/Cheviiot/Casement/releases/latest),
-including a portable Windows archive and `install.sh` for a per-user install on any
-distribution.
+including portable archives and the single-file Linux `.run` installer.
 
 ## More
 

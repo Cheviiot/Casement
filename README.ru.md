@@ -18,7 +18,7 @@
 [![ALT](https://img.shields.io/badge/ALT_p11-rpm-F5A623?style=for-the-badge)](https://github.com/Cheviiot/Casement/releases/latest/download/casement-alt-p11.x86_64.rpm)
 [![Fedora](https://img.shields.io/badge/Fedora-rpm-51A2DA?style=for-the-badge)](https://github.com/Cheviiot/Casement/releases/latest/download/casement-fedora.x86_64.rpm)
 [![Debian](https://img.shields.io/badge/Debian_|_Ubuntu-deb-A81D33?style=for-the-badge)](https://github.com/Cheviiot/Casement/releases/latest/download/casement_amd64.deb)
-[![Flatpak](https://img.shields.io/badge/Flatpak-любой_Linux-4A90D9?style=for-the-badge)](https://github.com/Cheviiot/Casement/releases/latest/download/casement-x86_64.flatpak)
+[![Linux](https://img.shields.io/badge/Linux-установщик-2EA44F?style=for-the-badge)](https://github.com/Cheviiot/Casement/releases/latest/download/casement-linux-x86_64.run)
 
 </div>
 
@@ -47,21 +47,20 @@
 ## Без графики
 
 ```sh
-casement-cli setup        # по шагам: пароль, приём подключений, доверенные устройства
-casement-cli status       # как настроен этот компьютер
-casement-cli accept off   # перестать принимать подключения
+~/.local/opt/casement/current/bin/casement-cli setup
+~/.local/opt/casement/current/bin/casement-cli status
+~/.local/opt/casement/current/bin/casement-cli accept off
 ```
 
 ## Требования
 
 - **Windows** 10 или 11. Casement работает как служба, поэтому показывает и экран входа, и экран
   блокировки, и окна UAC.
-- **Linux** с GTK 4.14+, Libadwaita 1.6+ и GStreamer 1.24+ (пакеты подтягивают их сами).
-  Чтобы пускать к себе, нужен GNOME на Wayland.
+- **Linux x86-64.** Универсальный `.run` содержит GTK, Libadwaita и GStreamer и ставится
+  без `sudo` в `~/.local/opt/casement`. Чтобы пускать к себе, нужен GNOME на Wayland.
 
 Все файлы — в [последнем релизе](https://github.com/Cheviiot/Casement/releases/latest),
-в том числе переносная версия для Windows и `install.sh` для установки в домашнюю папку
-на любом дистрибутиве.
+в том числе переносные архивы и единый Linux-установщик `.run`.
 
 ## Подробнее
 
