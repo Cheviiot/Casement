@@ -253,6 +253,51 @@ impl crate::audio::AudioProvider for PendingAudio {
     }
 }
 
+struct DropTrackedControl(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl crate::screen::ScreenControl for DropTrackedControl {
+    fn request_keyframe(&self) {}
+
+    fn input(&self, _input: casement_proto::Input) {}
+}
+
+impl Drop for DropTrackedControl {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct EndedScreen {
+    events: std::sync::Arc<
+        std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::screen::ScreenEvent>>>,
+    >,
+    control_dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::screen::ScreenProvider for EndedScreen {
+    fn start(&self, _request: crate::screen::ScreenRequest) -> crate::screen::StartFuture {
+        let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        *self.events.lock().unwrap() = Some(events_tx);
+        let control = Box::new(DropTrackedControl(self.control_dropped.clone()));
+        Box::pin(async move {
+            let (_frames_tx, frames) = tokio::sync::mpsc::channel(1);
+            Ok(crate::screen::ScreenStream {
+                width: 640,
+                height: 480,
+                codec: "h264".into(),
+                frames,
+                frame_overflow: std::sync::Arc::new(
+                    std::sync::atomic::AtomicBool::new(false),
+                ),
+                control,
+                events: Some(events),
+                monitors: Vec::new(),
+                monitor: String::new(),
+            })
+        })
+    }
+}
+
 async fn wait_for_closed(events: &mut tokio::sync::mpsc::UnboundedReceiver<HostEvent>) {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while let Some(event) = events.recv().await {
@@ -594,6 +639,47 @@ async fn closing_during_audio_start_drops_provider_and_closes_host_session() {
         dropped.load(std::sync::atomic::Ordering::SeqCst),
         "closing the peer drops the pending audio provider future"
     );
+    host.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ended_screen_event_closes_connection_and_drops_backend_control() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let control_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider = std::sync::Arc::new(EndedScreen {
+        events: events.clone(),
+        control_dropped: control_dropped.clone(),
+    });
+    let mut host = start_host_with_providers(&dir.path().join("server"), Some(provider), None);
+    let me = client_identity(&dir.path().join("client"), "identity");
+    let handshake = client::connect(&me, host.addr, Some(host.fingerprint), &info(false))
+        .await
+        .unwrap();
+    let mut session = handshake.login(None).await.unwrap();
+    let _screen = session.start_screen(640, 480).await.unwrap();
+
+    events
+        .lock()
+        .unwrap()
+        .take()
+        .expect("screen provider installed its event sender")
+        .send(crate::screen::ScreenEvent::Ended(
+            "screen input backend failed".into(),
+        ))
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), session.closed())
+        .await
+        .expect("backend failure should close the client connection");
+    wait_for_closed(&mut host.events).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !control_dropped.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("backend control should be released promptly");
     host.host.close();
 }
 

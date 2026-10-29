@@ -33,6 +33,8 @@ pub trait ScreenControl: Send + Sync {
 pub enum ScreenEvent {
     /// Text copied on the host.
     Clipboard(String),
+    /// The screen backend can no longer serve this session.
+    Ended(String),
 }
 
 pub struct ScreenStream {

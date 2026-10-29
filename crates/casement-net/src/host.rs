@@ -431,12 +431,20 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
                     None => std::future::pending().await,
                 }
             } => {
-                let screen::ScreenEvent::Clipboard(text) = event;
-                let message = Control::new(Kind::ClipboardText(casement_proto::ClipboardText { text }));
-                if let Err(e) = framing::write(&mut send, &message).await {
-                    break Err(e);
+                match event {
+                    screen::ScreenEvent::Clipboard(text) => {
+                        let message = Control::new(Kind::ClipboardText(
+                            casement_proto::ClipboardText { text },
+                        ));
+                        if let Err(e) = framing::write(&mut send, &message).await {
+                            break Err(e);
+                        }
+                        continue;
+                    }
+                    screen::ScreenEvent::Ended(reason) => {
+                        break Err(NetError::Stream(reason));
+                    }
                 }
-                continue;
             }
         };
         match message.kind {
