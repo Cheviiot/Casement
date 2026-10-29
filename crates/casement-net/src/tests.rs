@@ -194,7 +194,8 @@ fn start_host_with_providers(
         audio,
         settings_dir: None,
     };
-    let (host, events) = Host::bind(identity, config, None, trust).unwrap();
+    let password = StoredPassword::create(PASSWORD).unwrap();
+    let (host, events) = Host::bind(identity, config, Some(password), trust).unwrap();
     let host = std::sync::Arc::new(host);
     let addr = host.local_addr().unwrap();
     let runner = host.clone();
@@ -286,9 +287,7 @@ impl crate::screen::ScreenProvider for EndedScreen {
                 height: 480,
                 codec: "h264".into(),
                 frames,
-                frame_overflow: std::sync::Arc::new(
-                    std::sync::atomic::AtomicBool::new(false),
-                ),
+                frame_overflow: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 control,
                 events: Some(events),
                 monitors: Vec::new(),
@@ -592,7 +591,7 @@ async fn closing_during_screen_start_drops_provider_and_closes_host_session() {
     let handshake = client::connect(&me, host.addr, Some(host.fingerprint), &info(false))
         .await
         .unwrap();
-    let mut session = handshake.login(None).await.unwrap();
+    let mut session = handshake.login(Some(PASSWORD)).await.unwrap();
 
     let mut start = Box::pin(session.start_screen(640, 480));
     tokio::select! {
@@ -624,7 +623,7 @@ async fn closing_during_audio_start_drops_provider_and_closes_host_session() {
     let handshake = client::connect(&me, host.addr, Some(host.fingerprint), &info(false))
         .await
         .unwrap();
-    let mut session = handshake.login(None).await.unwrap();
+    let mut session = handshake.login(Some(PASSWORD)).await.unwrap();
 
     let mut start = Box::pin(session.start_audio());
     tokio::select! {
@@ -656,7 +655,7 @@ async fn ended_screen_event_closes_connection_and_drops_backend_control() {
     let handshake = client::connect(&me, host.addr, Some(host.fingerprint), &info(false))
         .await
         .unwrap();
-    let mut session = handshake.login(None).await.unwrap();
+    let mut session = handshake.login(Some(PASSWORD)).await.unwrap();
     let _screen = session.start_screen(640, 480).await.unwrap();
 
     events

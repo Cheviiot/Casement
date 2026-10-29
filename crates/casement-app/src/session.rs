@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use adw::prelude::*;
@@ -1162,7 +1162,7 @@ impl SessionPage {
     }
 
     /// Decoder pipeline whose sink paints into the picture; returns its appsrc.
-    fn start_decoder(&self) -> Result<gst_app::AppSrc, String> {
+    fn start_decoder(&self, reset: Arc<AtomicBool>) -> Result<gst_app::AppSrc, String> {
         // $CASEMENT_DECODER replaces the decoding part, for comparing pipelines.
         let decoding = std::env::var("CASEMENT_DECODER").unwrap_or_else(|_| decoder().into());
         let description = format!(
@@ -1191,6 +1191,7 @@ impl SessionPage {
             .add_watch_local(move |_, message| {
                 if let gst::MessageView::Error(err) = message.view() {
                     glib::g_warning!("Casement", "decoder: {}", err.error());
+                    reset.store(true, Ordering::Release);
                     if let Some(pipeline) = restart.upgrade() {
                         let _ = pipeline.set_state(gst::State::Null);
                         let _ = pipeline.set_state(gst::State::Playing);
@@ -1405,6 +1406,45 @@ pub async fn check_cursor(window: &Window) -> Result<Vec<String>, String> {
     ])
 }
 
+pub async fn check_decoder_recovery(window: &Window) -> Result<Vec<String>, String> {
+    let computer = Computer::new("127.0.0.1", 47999);
+    let page = session_page(window, &computer);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    page.keyframe.replace(Some(tx));
+    let reset = Arc::new(AtomicBool::new(false));
+    let _src = page.start_decoder(reset.clone())?;
+    let pipeline = page
+        .pipeline
+        .borrow()
+        .clone()
+        .ok_or("decoder check: no pipeline")?;
+    pipeline
+        .post_message(gst::message::Error::new(
+            gst::CoreError::Failed,
+            "synthetic decoder recovery check",
+        ))
+        .map_err(|e| e.to_string())?;
+    let started = std::time::Instant::now();
+    while !reset.load(Ordering::Acquire) {
+        if started.elapsed().as_secs() > 1 {
+            return Err("decoder check: error did not invalidate the reference chain".into());
+        }
+        glib::timeout_future(std::time::Duration::from_millis(10)).await;
+    }
+    rx.try_recv()
+        .map_err(|_| "decoder check: error did not request a keyframe")?;
+    let mut budget = casement_net::video::VideoBudget {
+        recovering: reset.swap(false, Ordering::AcqRel),
+    };
+    if budget.accept(false, 0) || !budget.accept(true, 0) || !budget.accept(false, 0) {
+        return Err("decoder check: reset did not wait for an independent frame".into());
+    }
+    window.navigation().pop();
+    Ok(vec![
+        "decoder error resets the reference chain and requests an independent frame".into(),
+    ])
+}
+
 pub fn preview(window: &Window, which: &str) {
     const FP: &str = "3F2A-91C4-0B7E-55D1-AE20-6C93-1F48-B70D";
     let mut computer = Computer::new("127.0.0.1", 47999);
@@ -1512,6 +1552,7 @@ struct Started {
     input: InputSender,
     files: FileSender,
     sound: Option<casement_net::audio::AudioFormat>,
+    decoder_reset: Arc<AtomicBool>,
     monitors: Vec<casement_net::screen::Monitor>,
     monitor: String,
 }
@@ -1532,6 +1573,21 @@ async fn resolve(host: String, port: u16) -> Result<SocketAddr, NetError> {
 pub fn open(window: &Window, computer: Computer) {
     let page = session_page(window, &computer);
     glib::spawn_future_local(flow(window.clone(), page, computer));
+}
+
+/// A weak probe for the isolated GTK fixture; keeps the production connection's
+/// file stream available without covering its video with the Files page.
+pub(crate) fn open_for_check(
+    window: &Window,
+    computer: Computer,
+) -> impl Fn() -> Option<FileSender> {
+    let page = session_page(window, &computer);
+    let weak = Rc::downgrade(&page);
+    glib::spawn_future_local(flow(window.clone(), page, computer));
+    move || {
+        weak.upgrade()
+            .and_then(|page| page.remote_files.borrow().clone())
+    }
 }
 
 fn session_page(window: &Window, computer: &Computer) -> Rc<SessionPage> {
@@ -1693,7 +1749,14 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
     let (clip_in_tx, clip_in_rx) = async_channel::unbounded::<String>();
     runtime().spawn(async move {
         let mut session = session;
-        let screen = match session.start_screen_with(request).await {
+        let mut stop_rx = stop_rx;
+        // Closing the page must also cancel startup, before a screen/audio reply
+        // exists. Cancelling a framing read is safe here because the connection ends.
+        let started = tokio::select! {
+            _ = &mut stop_rx => { session.close(); return; }
+            started = session.start_screen_with(request) => started,
+        };
+        let screen = match started {
             Ok(screen) => screen,
             Err(e) => {
                 let _ = screen_tx.send(Err(describe(&e))).await;
@@ -1702,11 +1765,16 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
             }
         };
         // Sound is a bonus: without it the session goes on silently.
-        let sound = match session.start_audio().await {
+        let audio = tokio::select! {
+            _ = &mut stop_rx => { session.close(); return; }
+            audio = session.start_audio() => audio,
+        };
+        let sound = match audio {
             Ok(format) if format.codec == "opus" => Some(format),
             _ => None,
         };
         let (mut control, mut messages, handle) = session.split();
+        let decoder_reset = Arc::new(AtomicBool::new(false));
         let _ = screen_tx
             .send(Ok(Started {
                 width: screen.width,
@@ -1714,6 +1782,7 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
                 input: handle.input_sender(),
                 files: handle.file_sender(),
                 sound: sound.clone(),
+                decoder_reset: decoder_reset.clone(),
                 monitors: screen.monitors,
                 monitor: screen.monitor,
             }))
@@ -1764,7 +1833,6 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
                 }
             }
         });
-        let mut stop_rx = stop_rx;
         let mut budget = casement_net::video::VideoBudget::default();
         let mut recovery = tokio::time::interval(std::time::Duration::from_millis(100));
         recovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1772,6 +1840,9 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
             tokio::select! {
                 frame = frames.recv() => match frame {
                     Some(Ok(Some(frame))) => {
+                        if decoder_reset.swap(false, Ordering::AcqRel) {
+                            budget.recovering = true;
+                        }
                         if !budget.accept(frame.keyframe, src.property::<u64>("current-level-buffers")) {
                             continue;
                         }
@@ -1779,8 +1850,12 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
                         if !frame.keyframe {
                             buffer.get_mut().unwrap().set_flags(gst::BufferFlags::DELTA_UNIT);
                         }
-                        if src.push_buffer(buffer).is_err() {
-                            break None;
+                        if let Err(error) = src.push_buffer(buffer) {
+                            if error == gst::FlowError::Flushing {
+                                budget.recovering = true;
+                            } else {
+                                break Some("Не удалось продолжить показ экрана".to_string());
+                            }
                         }
                     }
                     Some(Ok(None)) | None => break Some("Тот компьютер прекратил показ экрана".to_string()),
@@ -1825,12 +1900,13 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
             input,
             files,
             sound,
+            decoder_reset,
             monitors,
             monitor,
         })) => {
             page.remote.width.set(width);
             page.remote.height.set(height);
-            match page.start_decoder() {
+            match page.start_decoder(decoder_reset) {
                 Ok(src) => {
                     let player = sound.and_then(|format| {
                         page.start_sound(&format)

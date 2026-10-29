@@ -192,6 +192,7 @@ async fn input_loop(
     session: Arc<mutter::Session>,
     mut rx: input_queue::Receiver,
     clipboard: Arc<std::sync::Mutex<String>>,
+    events: tokio::sync::mpsc::UnboundedSender<ScreenEvent>,
 ) {
     let (mut scroll_x, mut scroll_y) = (0.0f64, 0.0f64);
     while let Some(command) = rx.recv().await {
@@ -245,7 +246,10 @@ async fn input_loop(
             Some(Ok(Ok(()))) => {}
         }
     }
-    session.stop().await;
+    // Timeout/overflow ends the whole shared screen, so the network drops Control
+    // and its clipboard task as well. A live video with dead input is not a session.
+    let _ = events.send(ScreenEvent::Ended("desktop input stopped".into()));
+    let _ = tokio::time::timeout(Duration::from_secs(2), session.stop()).await;
 }
 
 /// A sensible virtual monitor for a client asking `width` x `height`: even sides within
@@ -294,8 +298,13 @@ pub async fn start(
 
     let (input_tx, input_rx) = input_queue::channel();
     let clipboard = Arc::new(std::sync::Mutex::new(String::new()));
-    tokio::spawn(input_loop(session.clone(), input_rx, clipboard.clone()));
     let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(input_loop(
+        session.clone(),
+        input_rx,
+        clipboard.clone(),
+        events_tx.clone(),
+    ));
     let clipboard_task = tokio::spawn(clipboard_loop(session.clone(), clipboard, events_tx));
     let control = Control {
         pipeline: pipeline.clone(),

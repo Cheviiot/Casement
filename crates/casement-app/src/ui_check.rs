@@ -12,7 +12,9 @@ use adw::prelude::*;
 use crate::store::Store;
 use crate::window::Window;
 
+mod latency;
 mod live;
+mod marker;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const STATE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -274,6 +276,7 @@ pub async fn run(window: &Window) -> Result<Vec<String>, String> {
 
     checks.extend(crate::session::check_session_lifetime(window).await?);
     checks.extend(crate::session::check_cursor(window).await?);
+    checks.extend(crate::session::check_decoder_recovery(window).await?);
     Ok(checks)
 }
 

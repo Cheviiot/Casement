@@ -18,6 +18,7 @@ use tokio::{
 
 const MAX_QUEUE: usize = 128;
 const MAX_BYTES_PER_SECOND: f64 = 1_000_000.0;
+type PacketQueue = BinaryHeap<Reverse<(Instant, u64, Vec<u8>, bool)>>;
 
 #[derive(Default)]
 struct Counters {
@@ -56,7 +57,11 @@ impl Relay {
         let task = tokio::spawn(async move {
             run(front, back, impaired, paused, task_counters).await;
         });
-        Ok(Self { addr, task, counters })
+        Ok(Self {
+            addr,
+            task,
+            counters,
+        })
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -86,7 +91,7 @@ async fn run(
     counters: Arc<Counters>,
 ) {
     let mut client = None;
-    let mut queue: BinaryHeap<Reverse<(Instant, u64, Vec<u8>, bool)>> = BinaryHeap::new();
+    let mut queue = PacketQueue::new();
     let mut sequence = 0u64;
     let mut loss_sequence = 0u64;
     let mut next_host_send = Instant::now();
@@ -157,7 +162,7 @@ async fn admit(
     to_host: bool,
     impaired: bool,
     paused: bool,
-    queue: &mut BinaryHeap<Reverse<(Instant, u64, Vec<u8>, bool)>>,
+    queue: &mut PacketQueue,
     sequence: &mut u64,
     loss_sequence: &mut u64,
     next_host_send: &mut Instant,
@@ -172,7 +177,11 @@ async fn admit(
         return;
     }
     if !impaired {
-        let sent = if to_host { back.send(bytes).await } else { front.send_to(bytes, client).await };
+        let sent = if to_host {
+            back.send(bytes).await
+        } else {
+            front.send_to(bytes, client).await
+        };
         if sent.is_ok() {
             counters.forwarded.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -189,14 +198,20 @@ async fn admit(
         counters.dropped.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let rate_slot = if to_host { next_host_send } else { next_client_send };
+    let rate_slot = if to_host {
+        next_host_send
+    } else {
+        next_client_send
+    };
     let now = Instant::now();
-    let jitter_ms = (*sequence % 11) as u64;
+    let jitter_ms = *sequence % 11;
     let due = now + Duration::from_millis(20 + jitter_ms);
     let due = due.max(*rate_slot);
     *rate_slot = due + Duration::from_secs_f64(bytes.len() as f64 / MAX_BYTES_PER_SECOND);
     let id = *sequence;
     *sequence += 1;
     queue.push(Reverse((due, id, bytes.to_vec(), to_host)));
-    counters.peak_queue.fetch_max(queue.len() as u64, Ordering::Relaxed);
+    counters
+        .peak_queue
+        .fetch_max(queue.len() as u64, Ordering::Relaxed);
 }

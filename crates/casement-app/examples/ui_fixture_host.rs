@@ -14,8 +14,43 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
+#[path = "../src/ui_check/marker.rs"]
+mod marker;
+#[path = "support/network.rs"]
+mod network;
+
 struct FixtureScreen {
     root: PathBuf,
+}
+
+struct StartupGuard(PathBuf);
+
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, "cancelled");
+    }
+}
+
+async fn pause_startup(root: &Path, kind: &str) -> Result<(), String> {
+    if root.join(format!("pause-{kind}")).is_file() {
+        std::fs::write(root.join(format!("{kind}-starting")), "started")
+            .map_err(|e| e.to_string())?;
+        let _guard = StartupGuard(root.join(format!("{kind}-cancelled")));
+        std::future::pending::<()>().await;
+    }
+    Ok(())
+}
+
+struct FixtureAudio(PathBuf);
+
+impl casement_net::audio::AudioProvider for FixtureAudio {
+    fn start(&self) -> casement_net::audio::AudioStartFuture {
+        let root = self.0.clone();
+        Box::pin(async move {
+            pause_startup(&root, "audio").await?;
+            Err("fixture has no sound".into())
+        })
+    }
 }
 
 struct Control(gst::Pipeline);
@@ -33,8 +68,20 @@ impl ScreenControl for Control {
         }
     }
 
-    fn input(&self, _: casement_proto::Input) {
+    fn input(&self, input: casement_proto::Input) {
         // Deliberately never forward synthetic UI input to the operating system.
+        if std::env::var("CASEMENT_UI_LATENCY").as_deref() == Ok("1") {
+            if let Some(casement_proto::input::Kind::Motion(motion)) = input.kind {
+                let code = (motion.x / 10.0).round().clamp(0.0, 63.0) as u32;
+                let [r, g, b] = marker::color(code);
+                if let Some(source) = self.0.by_name("source") {
+                    source.set_property(
+                        "foreground-color",
+                        0xff000000u32 | u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -48,13 +95,16 @@ impl ScreenProvider for FixtureScreen {
     fn start(&self, request: ScreenRequest) -> StartFuture {
         let root = self.root.clone();
         Box::pin(async move {
+            pause_startup(&root, "screen").await?;
             let monitor = if request.monitor == "fixture-2" {
                 "fixture-2"
             } else {
                 "fixture-1"
             };
             std::fs::write(root.join("shown-monitor"), monitor).map_err(|e| e.to_string())?;
-            let pattern = if monitor == "fixture-2" {
+            let pattern = if std::env::var("CASEMENT_UI_LATENCY").as_deref() == Ok("1") {
+                "solid-color"
+            } else if monitor == "fixture-2" {
                 "smpte"
             } else {
                 "ball"
@@ -65,7 +115,7 @@ impl ScreenProvider for FixtureScreen {
                 "x264enc tune=zerolatency speed-preset=ultrafast bitrate=1000 key-int-max=30 threads=2"
             };
             let pipeline = gst::parse::launch(&format!(
-                "videotestsrc is-live=true pattern={pattern} \
+                "videotestsrc name=source is-live=true pattern={pattern} \
                  ! video/x-raw,width=640,height=360,framerate=30/1 \
                  ! videoconvert ! {encoder} ! h264parse config-interval=-1 \
                  ! video/x-h264,stream-format=byte-stream,alignment=au \
@@ -154,6 +204,10 @@ fn seed(root: &Path) -> std::io::Result<()> {
     std::fs::write(root.join("shared/folder/nested.txt"), "nested fixture\n")?;
     // Sparse data makes it possible to observe and cancel a real in-flight fetch.
     std::fs::File::create(root.join("shared/cancel.bin"))?.set_len(128 * 1024 * 1024)?;
+    if std::env::var("CASEMENT_UI_LATENCY").as_deref() == Ok("1") {
+        std::fs::File::create(root.join("shared/latency-load.bin"))?
+            .set_len(4 * 1024 * 1024 * 1024)?;
+    }
     std::fs::write(root.join("downloads/upload-a.txt"), "first upload\n")?;
     std::fs::write(root.join("downloads/upload-b.txt"), "second upload\n")?;
     std::fs::write(
@@ -191,14 +245,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         screen: Some(Arc::new(FixtureScreen { root: root.clone() })),
         files_dir: Some(root.join("uploads")),
         shared_dir: Some(root.join("shared")),
-        audio: None,
+        audio: Some(Arc::new(FixtureAudio(root.clone()))),
         settings_dir: None,
     };
     let (host, mut events) = Host::bind(identity, config, None, trust)?;
+    let impaired = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
+    let relay = if std::env::var("CASEMENT_UI_LATENCY").as_deref() == Ok("1") {
+        Some(network::Relay::start(host.local_addr()?, impaired.clone(), paused.clone()).await?)
+    } else {
+        None
+    };
+    let address = relay
+        .as_ref()
+        .map(|r| r.addr())
+        .unwrap_or(host.local_addr()?);
     let file = glib::KeyFile::new();
     file.set_string("fixture", "name", "Тестовый компьютер");
     file.set_string("fixture", "host", "127.0.0.1");
-    file.set_uint64("fixture", "port", u64::from(host.local_addr()?.port()));
+    file.set_uint64("fixture", "port", u64::from(address.port()));
     std::fs::write(root.join("client/connections.ini"), file.to_data())?;
     std::fs::write(root.join("ready"), host.local_addr()?.to_string())?;
     let host = Arc::new(host);
@@ -206,8 +271,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let serving = tokio::spawn(async move { server.run().await });
     let logging = tokio::spawn(async move { while events.recv().await.is_some() {} });
     let started = Instant::now();
+    let mut profile = None;
     while !root.join("stop").exists() && started.elapsed() < Duration::from_secs(120) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some(relay) = &relay {
+            let state = (
+                root.join("impaired").is_file(),
+                root.join("paused").is_file(),
+            );
+            if profile != Some(state) {
+                impaired.store(state.0, std::sync::atomic::Ordering::Release);
+                paused.store(state.1, std::sync::atomic::Ordering::Release);
+                std::fs::write(
+                    root.join("network-state"),
+                    format!("{} {}", state.0, state.1),
+                )?;
+                std::fs::write(root.join("network-stats"), format!("{:?}", relay.stats()))?;
+                profile = Some(state);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     host.close();
     let _ = serving.await;

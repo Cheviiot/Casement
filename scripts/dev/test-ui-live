@@ -5,8 +5,11 @@ cd "$(dirname "$0")/../.."
 mkdir -p _scratch/ui-live
 work=$(mktemp -d "$PWD/_scratch/ui-live/run.XXXXXX")
 : > "$work/.casement-ui-fixture"
+if [ "${CASEMENT_UI_LATENCY:-}" = 1 ]; then
+    echo "Latency fixture: $work (attach Broadway viewer, then create viewer-ready here)"
+fi
 scripts/dev/in-box scripts/cargo build --locked -p casement --example ui_fixture_host -j 2
-scripts/dev/in-box ./target/debug/examples/ui_fixture_host "$work" >"$work/host.log" 2>&1 &
+scripts/dev/in-box env CASEMENT_UI_LATENCY="${CASEMENT_UI_LATENCY:-}" ./target/debug/examples/ui_fixture_host "$work" >"$work/host.log" 2>&1 &
 host_job=$!
 cleanup() {
     : > "$work/stop"

@@ -418,239 +418,236 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
     let mut screen_events: Option<tokio::sync::mpsc::UnboundedReceiver<screen::ScreenEvent>> = None;
     let mut audio: Option<tokio::task::JoinHandle<()>> = None;
     // Keep fallible writes inside this scope so every exit reaches task cleanup.
-    let result = async { loop {
-        let message = tokio::select! {
-            message = control_rx.recv() => match message {
-                Some(Ok(Some(message))) => message,
-                Some(Ok(None)) | None => break Ok(()),
-                Some(Err(e)) => break Err(e),
-            },
-            Some(event) = async {
-                match screen_events.as_mut() {
-                    Some(events) => events.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                match event {
-                    screen::ScreenEvent::Clipboard(text) => {
-                        let message = Control::new(Kind::ClipboardText(
-                            casement_proto::ClipboardText { text },
-                        ));
-                        if let Err(e) = framing::write(&mut send, &message).await {
-                            break Err(e);
-                        }
-                        continue;
+    let result = async {
+        loop {
+            let message = tokio::select! {
+                message = control_rx.recv() => match message {
+                    Some(Ok(Some(message))) => message,
+                    Some(Ok(None)) | None => break Ok(()),
+                    Some(Err(e)) => break Err(e),
+                },
+                Some(event) = async {
+                    match screen_events.as_mut() {
+                        Some(events) => events.recv().await,
+                        None => std::future::pending().await,
                     }
-                    screen::ScreenEvent::Ended(reason) => {
-                        break Err(NetError::Stream(reason));
-                    }
-                }
-            }
-        };
-        match message.kind {
-            Some(Kind::ResizeScreen(size)) => {
-                if let Some(Sharing { control, .. }) = &sharing {
-                    control.resize(size.width, size.height);
-                }
-            }
-            Some(Kind::ClipboardText(clipboard)) => {
-                if let Some(Sharing { control, .. }) = &sharing {
-                    control.clipboard(clipboard.text);
-                }
-            }
-            Some(Kind::Ping(ping)) => {
-                framing::write(
-                    &mut send,
-                    &Control::new(Kind::Pong(Pong { nonce: ping.nonce })),
-                )
-                .await?;
-            }
-            Some(Kind::RequestKeyframe(_)) => {
-                if let Some(Sharing { control, .. }) = &sharing {
-                    control.request_keyframe();
-                }
-            }
-            Some(Kind::StartAudio(_)) => {
-                if let Some(pump) = audio.take() {
-                    pump.abort();
-                }
-                let started = match shared.config.audio.clone() {
-                    Some(provider) => {
-                        match start_provider(connection, AUDIO_START_TIMEOUT, provider.start())
-                            .await
-                        {
-                            Ok(stream) => Ok(stream),
-                            Err(StartupError::Provider(message)) => Err((
-                                ErrorCode::NotAllowed,
-                                message,
-                            )),
-                            Err(StartupError::Timeout) => Err((
-                                ErrorCode::Internal,
-                                "audio startup timed out".into(),
-                            )),
-                            Err(StartupError::Closed) => {
-                                return Err(NetError::Stream(
-                                    "peer disconnected during audio startup".into(),
-                                ));
+                } => {
+                    match event {
+                        screen::ScreenEvent::Clipboard(text) => {
+                            let message = Control::new(Kind::ClipboardText(
+                                casement_proto::ClipboardText { text },
+                            ));
+                            if let Err(e) = framing::write(&mut send, &message).await {
+                                break Err(e);
                             }
-                        }
-                    }
-                    None => Err((
-                        ErrorCode::NotAllowed,
-                        "this computer does not share its sound".into(),
-                    )),
-                };
-                let stream = match started {
-                    Ok(stream) => stream,
-                    Err((code, message)) => {
-                        framing::write(
-                            &mut send,
-                            &Control::failure(code, message),
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-                let format = stream.format.clone();
-                framing::write(
-                    &mut send,
-                    &Control::new(Kind::AudioStarted(casement_proto::AudioStarted {
-                        codec: format.codec,
-                        rate: format.rate,
-                        channels: format.channels,
-                    })),
-                )
-                .await?;
-                let connection = connection.clone();
-                let mut packets = stream.packets;
-                audio = Some(tokio::spawn(async move {
-                    while let Some(packet) = packets.recv().await {
-                        // More than 100 ms waiting means old sound: skip ahead to now.
-                        if packets.len() > 5 {
                             continue;
                         }
-                        // Too large or the peer cannot take datagrams: skip that packet.
-                        if let Err(quinn::SendDatagramError::ConnectionLost(_)) =
-                            connection.send_datagram(crate::audio::encode(&packet).into())
-                        {
-                            return;
+                        screen::ScreenEvent::Ended(reason) => {
+                            break Err(NetError::Stream(reason));
                         }
                     }
-                }));
-            }
-            Some(Kind::StartScreen(request)) if sharing.is_none() => {
-                let Some(provider) = shared.config.screen.clone() else {
+                }
+            };
+            match message.kind {
+                Some(Kind::ResizeScreen(size)) => {
+                    if let Some(Sharing { control, .. }) = &sharing {
+                        control.resize(size.width, size.height);
+                    }
+                }
+                Some(Kind::ClipboardText(clipboard)) => {
+                    if let Some(Sharing { control, .. }) = &sharing {
+                        control.clipboard(clipboard.text);
+                    }
+                }
+                Some(Kind::Ping(ping)) => {
                     framing::write(
                         &mut send,
-                        &Control::failure(
-                            ErrorCode::NotAllowed,
-                            "this computer does not share its screen",
-                        ),
+                        &Control::new(Kind::Pong(Pong { nonce: ping.nonce })),
                     )
                     .await?;
-                    continue;
-                };
-                let started = start_provider(
-                    connection,
-                    SCREEN_START_TIMEOUT,
-                    provider.start(screen::ScreenRequest {
-                        max_width: request.max_width,
-                        max_height: request.max_height,
-                        virtual_monitor: request.virtual_monitor,
-                        monitor: request.monitor,
-                    }),
-                )
-                .await;
-                let stream = match started {
-                    Ok(stream) => stream,
-                    Err(StartupError::Provider(message)) => {
-                        framing::write(
-                            &mut send,
-                            &Control::failure(ErrorCode::Internal, message),
-                        )
-                        .await?;
-                        continue;
+                }
+                Some(Kind::RequestKeyframe(_)) => {
+                    if let Some(Sharing { control, .. }) = &sharing {
+                        control.request_keyframe();
                     }
-                    Err(StartupError::Timeout) => {
-                        framing::write(
-                            &mut send,
-                            &Control::failure(ErrorCode::Internal, "screen startup timed out"),
-                        )
-                        .await?;
-                        continue;
+                }
+                Some(Kind::StartAudio(_)) => {
+                    if let Some(pump) = audio.take() {
+                        pump.abort();
                     }
-                    Err(StartupError::Closed) => {
-                        return Err(NetError::Stream(
-                            "peer disconnected during screen startup".into(),
-                        ));
-                    }
-                };
-                framing::write(
-                    &mut send,
-                    &Control::new(Kind::ScreenStarted(ScreenStarted {
-                        width: stream.width,
-                        height: stream.height,
-                        codec: stream.codec.clone(),
-                        monitors: stream.monitors.clone(),
-                        monitor: stream.monitor.clone(),
-                    })),
-                )
-                .await?;
-                screen_events = stream.events;
-                let control: Arc<dyn ScreenControl> = Arc::from(stream.control);
-                let mut frames = stream.frames;
-                let frame_overflow = stream.frame_overflow;
-                let video_control = control.clone();
-                let mut video = connection.open_uni().await?;
-                let _ = video.set_priority(1);
-                let pump = tokio::spawn(async move {
-                    let mut waiting_for_keyframe = false;
-                    while let Some(frame) = next_video_frame(
-                        &mut frames,
-                        &frame_overflow,
-                        video_control.as_ref(),
-                        &mut waiting_for_keyframe,
-                    )
-                    .await
-                    {
-                        if screen::write_frame(&mut video, &frame).await.is_err() {
-                            break;
+                    let started = match shared.config.audio.clone() {
+                        Some(provider) => {
+                            match start_provider(connection, AUDIO_START_TIMEOUT, provider.start())
+                                .await
+                            {
+                                Ok(stream) => Ok(stream),
+                                Err(StartupError::Provider(message)) => {
+                                    Err((ErrorCode::NotAllowed, message))
+                                }
+                                Err(StartupError::Timeout) => {
+                                    Err((ErrorCode::Internal, "audio startup timed out".into()))
+                                }
+                                Err(StartupError::Closed) => {
+                                    return Err(NetError::Stream(
+                                        "peer disconnected during audio startup".into(),
+                                    ));
+                                }
+                            }
                         }
-                    }
-                    let _ = video.finish();
-                });
-                let input_state = Arc::new(crate::input::Receiver::new(control.clone()));
-                let input_control = input_state.clone();
-                let datagrams = connection.clone();
-                let input = tokio::spawn(async move {
-                    while let Ok(bytes) = datagrams.read_datagram().await {
-                        input_control.datagram(&bytes);
-                    }
-                });
-                let input_peer = connection.clone();
-                let reliable_input = tokio::spawn(async move {
-                    // Reads are not cancelled in a select: a frame may be partially read.
-                    if let Ok(mut stream) = input_peer.accept_uni().await {
-                        while let Ok(Some(message)) = framing::read(&mut stream).await {
-                            if let Some(Kind::ReliableInput(input)) = message.kind {
-                                input_state.reliable(input);
-                            } else {
+                        None => Err((
+                            ErrorCode::NotAllowed,
+                            "this computer does not share its sound".into(),
+                        )),
+                    };
+                    let stream = match started {
+                        Ok(stream) => stream,
+                        Err((code, message)) => {
+                            framing::write(&mut send, &Control::failure(code, message)).await?;
+                            continue;
+                        }
+                    };
+                    let format = stream.format.clone();
+                    framing::write(
+                        &mut send,
+                        &Control::new(Kind::AudioStarted(casement_proto::AudioStarted {
+                            codec: format.codec,
+                            rate: format.rate,
+                            channels: format.channels,
+                        })),
+                    )
+                    .await?;
+                    let connection = connection.clone();
+                    let mut packets = stream.packets;
+                    audio = Some(tokio::spawn(async move {
+                        while let Some(packet) = packets.recv().await {
+                            // More than 100 ms waiting means old sound: skip ahead to now.
+                            if packets.len() > 5 {
+                                continue;
+                            }
+                            // Too large or the peer cannot take datagrams: skip that packet.
+                            if let Err(quinn::SendDatagramError::ConnectionLost(_)) =
+                                connection.send_datagram(crate::audio::encode(&packet).into())
+                            {
+                                return;
+                            }
+                        }
+                    }));
+                }
+                Some(Kind::StartScreen(request)) if sharing.is_none() => {
+                    let Some(provider) = shared.config.screen.clone() else {
+                        framing::write(
+                            &mut send,
+                            &Control::failure(
+                                ErrorCode::NotAllowed,
+                                "this computer does not share its screen",
+                            ),
+                        )
+                        .await?;
+                        continue;
+                    };
+                    let started = start_provider(
+                        connection,
+                        SCREEN_START_TIMEOUT,
+                        provider.start(screen::ScreenRequest {
+                            max_width: request.max_width,
+                            max_height: request.max_height,
+                            virtual_monitor: request.virtual_monitor,
+                            monitor: request.monitor,
+                        }),
+                    )
+                    .await;
+                    let stream = match started {
+                        Ok(stream) => stream,
+                        Err(StartupError::Provider(message)) => {
+                            framing::write(
+                                &mut send,
+                                &Control::failure(ErrorCode::Internal, message),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        Err(StartupError::Timeout) => {
+                            framing::write(
+                                &mut send,
+                                &Control::failure(ErrorCode::Internal, "screen startup timed out"),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        Err(StartupError::Closed) => {
+                            return Err(NetError::Stream(
+                                "peer disconnected during screen startup".into(),
+                            ));
+                        }
+                    };
+                    framing::write(
+                        &mut send,
+                        &Control::new(Kind::ScreenStarted(ScreenStarted {
+                            width: stream.width,
+                            height: stream.height,
+                            codec: stream.codec.clone(),
+                            monitors: stream.monitors.clone(),
+                            monitor: stream.monitor.clone(),
+                        })),
+                    )
+                    .await?;
+                    screen_events = stream.events;
+                    let control: Arc<dyn ScreenControl> = Arc::from(stream.control);
+                    let mut frames = stream.frames;
+                    let frame_overflow = stream.frame_overflow;
+                    let video_control = control.clone();
+                    let mut video = connection.open_uni().await?;
+                    let _ = video.set_priority(1);
+                    let pump = tokio::spawn(async move {
+                        let mut waiting_for_keyframe = false;
+                        while let Some(frame) = next_video_frame(
+                            &mut frames,
+                            &frame_overflow,
+                            video_control.as_ref(),
+                            &mut waiting_for_keyframe,
+                        )
+                        .await
+                        {
+                            if screen::write_frame(&mut video, &frame).await.is_err() {
                                 break;
                             }
                         }
-                    }
-                    input_peer.close(0u32.into(), b"input stream ended");
-                });
-                sharing = Some(Sharing {
-                    control,
-                    pump,
-                    input,
-                    reliable_input,
-                });
+                        let _ = video.finish();
+                    });
+                    let input_state = Arc::new(crate::input::Receiver::new(control.clone()));
+                    let input_control = input_state.clone();
+                    let datagrams = connection.clone();
+                    let input = tokio::spawn(async move {
+                        while let Ok(bytes) = datagrams.read_datagram().await {
+                            input_control.datagram(&bytes);
+                        }
+                    });
+                    let input_peer = connection.clone();
+                    let reliable_input = tokio::spawn(async move {
+                        // Reads are not cancelled in a select: a frame may be partially read.
+                        if let Ok(mut stream) = input_peer.accept_uni().await {
+                            while let Ok(Some(message)) = framing::read(&mut stream).await {
+                                if let Some(Kind::ReliableInput(input)) = message.kind {
+                                    input_state.reliable(input);
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        input_peer.close(0u32.into(), b"input stream ended");
+                    });
+                    sharing = Some(Sharing {
+                        control,
+                        pump,
+                        input,
+                        reliable_input,
+                    });
+                }
+                _ => {}
             }
-            _ => {}
         }
-    } }.await;
+    }
+    .await;
     reader.abort();
     files.abort();
     if let Some(pump) = audio {

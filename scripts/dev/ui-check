@@ -23,6 +23,7 @@ exec podman exec -i --user "$(id -un)" -w "$PWD" \
     -e CASEMENT_WINDOW_HEIGHT="${CASEMENT_WINDOW_HEIGHT:-660}" \
     -e CASEMENT_UI_CHECK="${CASEMENT_UI_CHECK:-}" \
     -e CASEMENT_UI_FIXTURE_ROOT="${CASEMENT_UI_FIXTURE_ROOT:-}" \
+    -e CASEMENT_UI_LATENCY="${CASEMENT_UI_LATENCY:-}" \
     -e XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}" \
     -e CASEMENT_DECODER \
     oriel-dev ionice -c 3 nice -n 19 sh -s -- "$display" <<'BROADWAY'
@@ -45,5 +46,15 @@ trap cleanup EXIT
 sleep 1.5
 # Do not accidentally attach to another project's server if this one failed to bind.
 kill -0 "$bp"
+if [ "${CASEMENT_UI_LATENCY:-}" = 1 ]; then
+    # Broadway without a browser acknowledging frames paces at about 1 Hz. A
+    # latency measurement must attach its viewer before launching the application.
+    attempt=0
+    while [ ! -f "$CASEMENT_UI_FIXTURE_ROOT/viewer-ready" ]; do
+        test "$attempt" -lt 200 || { echo "Latency viewer was not attached" >&2; exit 1; }
+        attempt=$((attempt + 1))
+        sleep 0.1
+    done
+fi
 GDK_BACKEND=broadway BROADWAY_DISPLAY=":$display" ./target/debug/casement
 BROADWAY

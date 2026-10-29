@@ -20,7 +20,28 @@ pub(super) async fn run(window: &Window, root: &Path) -> Result<Vec<String>, Str
     if computer.host != "127.0.0.1" {
         return Err("live fixture: разрешён только loopback".into());
     }
-    crate::session::open(window, computer);
+    if std::env::var("CASEMENT_UI_LATENCY").as_deref() != Ok("1") {
+        for kind in ["screen", "audio"] {
+            fs::write(root.join(format!("pause-{kind}")), "pause").map_err(|e| e.to_string())?;
+            crate::session::open(window, computer.clone());
+            wait_until("host provider startup begins", STATE_TIMEOUT, || {
+                root.join(format!("{kind}-starting")).is_file()
+            })
+            .await?;
+            navigation.pop();
+            wait_until(
+                "leaving session cancels host provider startup",
+                Duration::from_secs(2),
+                || root.join(format!("{kind}-cancelled")).is_file(),
+            )
+            .await?;
+            fs::remove_file(root.join(format!("pause-{kind}"))).map_err(|e| e.to_string())?;
+            checks.push(format!(
+                "leaving during {kind} startup cancels the real connection and host provider"
+            ));
+        }
+    }
+    let connection_files = crate::session::open_for_check(window, computer);
     wait_tag(&navigation, "session", STATE_TIMEOUT).await?;
     let session = visible_page(&navigation)?;
     let picture = descendants(session.upcast_ref())
@@ -63,6 +84,21 @@ pub(super) async fn run(window: &Window, root: &Path) -> Result<Vec<String>, Str
         return Err("live fixture: курсор над видео не прозрачен".into());
     }
     checks.push("local cursor is transparent over a real decoded frame".into());
+
+    if std::env::var("CASEMENT_UI_LATENCY").as_deref() == Ok("1") {
+        checks.extend(
+            super::latency::run(
+                window,
+                &picture,
+                &connection_files().ok_or("latency: missing file sender")?,
+                &root,
+            )
+            .await?,
+        );
+        navigation.pop();
+        wait_tag(&navigation, "home", STATE_TIMEOUT).await?;
+        return Ok(checks);
+    }
 
     tooltip_button(session.upcast_ref(), "Файлы")?.emit_clicked();
     wait_tag(&navigation, "remote-files", STATE_TIMEOUT).await?;
