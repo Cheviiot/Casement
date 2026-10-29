@@ -12,6 +12,7 @@ use casement_net::screen::{EncodedFrame, ScreenControl, ScreenEvent, ScreenStrea
 use casement_proto::{input, Input};
 
 use crate::frames::{pull_frames, QUEUE};
+use crate::input_queue::{self, Command};
 use crate::mutter;
 
 /// Text types offered and accepted on the host's clipboard, best first.
@@ -139,15 +140,10 @@ fn encoder_description(name: &str) -> String {
     }
 }
 
-enum Command {
-    Input(Input),
-    Clipboard(String),
-}
-
 struct Control {
     pipeline: gst::Pipeline,
     sink: gst_app::AppSink,
-    input: tokio::sync::mpsc::UnboundedSender<Command>,
+    input: input_queue::Sender,
     clipboard_task: tokio::task::AbortHandle,
 }
 
@@ -160,11 +156,11 @@ impl ScreenControl for Control {
     }
 
     fn input(&self, input: Input) {
-        let _ = self.input.send(Command::Input(input));
+        self.input.send(Command::Input(input));
     }
 
     fn clipboard(&self, text: String) {
-        let _ = self.input.send(Command::Clipboard(text));
+        self.input.send(Command::Clipboard(text));
     }
 
     fn resize(&self, width: u32, height: u32) {
@@ -185,6 +181,7 @@ impl ScreenControl for Control {
 
 impl Drop for Control {
     fn drop(&mut self) {
+        self.input.close();
         let _ = self.pipeline.set_state(gst::State::Null);
         self.clipboard_task.abort();
     }
@@ -193,7 +190,7 @@ impl Drop for Control {
 /// Applies input in order; ends the Mutter session when the sender goes away.
 async fn input_loop(
     session: Arc<mutter::Session>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Command>,
+    mut rx: input_queue::Receiver,
     clipboard: Arc<std::sync::Mutex<String>>,
 ) {
     let (mut scroll_x, mut scroll_y) = (0.0f64, 0.0f64);
@@ -283,7 +280,7 @@ pub async fn start(
         .and_then(|e| e.downcast::<gst_app::AppSink>().ok())
         .ok_or("no appsink")?;
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (input_tx, input_rx) = input_queue::channel();
     let clipboard = Arc::new(std::sync::Mutex::new(String::new()));
     tokio::spawn(input_loop(session.clone(), input_rx, clipboard.clone()));
     let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();

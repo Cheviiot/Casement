@@ -8,6 +8,8 @@ pub mod autostart;
 #[cfg(target_os = "linux")]
 mod capture;
 mod frames;
+#[cfg(target_os = "linux")]
+mod input_queue;
 pub mod keyboard;
 #[cfg(target_os = "linux")]
 mod mutter;
