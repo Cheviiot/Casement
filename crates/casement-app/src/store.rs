@@ -17,12 +17,8 @@ pub enum VideoQuality {
 }
 
 impl VideoQuality {
-    pub const LABELS: [&'static str; 4] = [
-        "720p · 8 Мбит/с",
-        "1080p · 20 Мбит/с",
-        "1440p · 40 Мбит/с",
-        "4K · 80 Мбит/с",
-    ];
+    pub const LABELS: [&'static str; 4] =
+        ["720p · Авто", "1080p · Авто", "1440p · Авто", "4K · Авто"];
 
     pub fn from_index(index: u32) -> Self {
         match index {
@@ -67,6 +63,11 @@ impl VideoQuality {
             Self::High => 40_000,
             Self::Ultra => 80_000,
         }
+    }
+
+    /// New peers grow from the profile's safe starting point to what the path can sustain.
+    pub fn max_bitrate_kbps(self) -> u32 {
+        casement_net::screen::MAX_VIDEO_BITRATE_KBPS
     }
 
     pub fn virtual_size(self) -> (u32, u32) {

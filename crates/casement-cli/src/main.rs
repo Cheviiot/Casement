@@ -128,6 +128,15 @@ enum Command {
         /// Measure input-to-frame latency over this many pointer moves
         #[arg(long, default_value_t = 0)]
         latency: u32,
+        /// Initial video bitrate in Mbit/s
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(4..=2000))]
+        bitrate: u32,
+        /// Do not grow bitrate from live QUIC feedback
+        #[arg(long)]
+        fixed_bitrate: bool,
+        /// Adaptive video ceiling in Mbit/s
+        #[arg(long, default_value_t = 2000, value_parser = clap::value_parser!(u32).range(4..=2000))]
+        max_bitrate: u32,
     },
     /// Проверка: прочитать буфер обмена этого компьютера через GNOME (или положить --set)
     ClipboardProbe {
@@ -342,6 +351,9 @@ async fn run() -> Result<()> {
             audio,
             audio_record,
             monitor,
+            bitrate,
+            fixed_bitrate,
+            max_bitrate,
         } => {
             let addr = resolve(&target)?;
             let expected = match fingerprint {
@@ -438,7 +450,10 @@ async fn run() -> Result<()> {
                 session.close();
                 return Ok(());
             }
-            let request = match &virtual_screen {
+            if max_bitrate < bitrate {
+                bail!("--max-bitrate must be at least --bitrate");
+            }
+            let mut request = match &virtual_screen {
                 Some(size) => {
                     let (w, h) = size.split_once('x').context("--virtual WIDTHxHEIGHT")?;
                     casement_net::screen::ScreenRequest {
@@ -453,6 +468,9 @@ async fn run() -> Result<()> {
                     ..Default::default()
                 },
             };
+            request.bitrate_kbps = bitrate.saturating_mul(1000);
+            request.adaptive_bitrate = !fixed_bitrate;
+            request.max_bitrate_kbps = max_bitrate.saturating_mul(1000);
             let mut screen = session.start_screen_with(request).await?;
             for m in &screen.monitors {
                 println!(

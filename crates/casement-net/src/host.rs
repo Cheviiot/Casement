@@ -40,6 +40,128 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 const SCREEN_START_TIMEOUT: Duration = Duration::from_secs(15);
 /// Sound is optional and must not hold up the screen for long.
 const AUDIO_START_TIMEOUT: Duration = Duration::from_secs(3);
+const BITRATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(750);
+const BITRATE_URGENT_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Additive observation, multiplicative backoff around the target accepted by the encoder.
+/// QUIC remains the authority for congestion; this controller prevents its backpressure from
+/// turning into stale video while still probing upward on a clean, busy LAN path.
+struct AdaptiveBitrate {
+    target_kbps: u32,
+    max_kbps: u32,
+    video_bytes: u64,
+    blocked_pending: bool,
+    overflow_pending: bool,
+    sampled_at: Instant,
+    stats: quinn::ConnectionStats,
+}
+
+impl AdaptiveBitrate {
+    fn new(initial_kbps: u32, max_kbps: u32, connection: &quinn::Connection) -> Self {
+        Self::with_stats(initial_kbps, max_kbps, connection.stats(), Instant::now())
+    }
+
+    fn with_stats(
+        initial_kbps: u32,
+        max_kbps: u32,
+        stats: quinn::ConnectionStats,
+        sampled_at: Instant,
+    ) -> Self {
+        let max_kbps = if max_kbps == 0 {
+            screen::MAX_VIDEO_BITRATE_KBPS
+        } else {
+            max_kbps.clamp(
+                screen::MIN_VIDEO_BITRATE_KBPS,
+                screen::MAX_VIDEO_BITRATE_KBPS,
+            )
+        };
+        Self {
+            target_kbps: initial_kbps.clamp(screen::MIN_VIDEO_BITRATE_KBPS, max_kbps),
+            max_kbps,
+            video_bytes: 0,
+            blocked_pending: false,
+            overflow_pending: false,
+            sampled_at,
+            stats,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        frame_bytes: usize,
+        write_time: Duration,
+        overflowed: bool,
+        connection: &quinn::Connection,
+        now: Instant,
+    ) -> Option<u32> {
+        self.observe_stats(frame_bytes, write_time, overflowed, connection.stats(), now)
+    }
+
+    fn observe_stats(
+        &mut self,
+        frame_bytes: usize,
+        write_time: Duration,
+        overflowed: bool,
+        stats: quinn::ConnectionStats,
+        now: Instant,
+    ) -> Option<u32> {
+        self.video_bytes = self.video_bytes.saturating_add(frame_bytes as u64);
+        let elapsed = now.saturating_duration_since(self.sampled_at);
+        let block_limit = stats
+            .path
+            .rtt
+            .saturating_mul(2)
+            .max(Duration::from_millis(20));
+        let blocked = write_time > block_limit;
+        self.blocked_pending |= blocked;
+        self.overflow_pending |= overflowed;
+        let urgent = self.overflow_pending || self.blocked_pending;
+        if elapsed < BITRATE_SAMPLE_INTERVAL && (!urgent || elapsed < BITRATE_URGENT_INTERVAL) {
+            return None;
+        }
+
+        let lost = stats.path.lost_packets > self.stats.path.lost_packets
+            || stats.path.congestion_events > self.stats.path.congestion_events;
+        let rtt_inflated = stats.path.min_rtt > Duration::ZERO
+            && stats.path.rtt
+                > stats
+                    .path
+                    .min_rtt
+                    .saturating_mul(2)
+                    .saturating_add(Duration::from_millis(8));
+        let congested = self.overflow_pending || self.blocked_pending || lost || rtt_inflated;
+        let actual_kbps = if elapsed.is_zero() {
+            0
+        } else {
+            ((self.video_bytes as u128 * 8) / elapsed.as_millis().max(1)).min(u128::from(u32::MAX))
+                as u32
+        };
+        let previous = self.target_kbps;
+
+        if congested {
+            let percent = if self.overflow_pending { 60 } else { 75 };
+            self.target_kbps = self
+                .target_kbps
+                .saturating_mul(percent)
+                .saturating_div(100)
+                .max(screen::MIN_VIDEO_BITRATE_KBPS);
+        } else if actual_kbps >= self.target_kbps / 10 {
+            self.target_kbps = self
+                .target_kbps
+                .saturating_mul(5)
+                .saturating_div(4)
+                .max(self.target_kbps.saturating_add(4_000))
+                .min(self.max_kbps);
+        }
+
+        self.video_bytes = 0;
+        self.blocked_pending = false;
+        self.overflow_pending = false;
+        self.sampled_at = now;
+        self.stats = stats;
+        (self.target_kbps != previous).then_some(self.target_kbps)
+    }
+}
 
 enum StartupError {
     Closed,
@@ -535,6 +657,9 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
                     }));
                 }
                 Some(Kind::StartScreen(request)) if sharing.is_none() => {
+                    let adaptive_request = request
+                        .adaptive_bitrate
+                        .then_some((request.bitrate_kbps, request.max_bitrate_kbps));
                     let Some(provider) = shared.config.screen.clone() else {
                         framing::write(
                             &mut send,
@@ -555,6 +680,8 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
                             virtual_monitor: request.virtual_monitor,
                             monitor: request.monitor,
                             bitrate_kbps: request.bitrate_kbps,
+                            adaptive_bitrate: request.adaptive_bitrate,
+                            max_bitrate_kbps: request.max_bitrate_kbps,
                         }),
                     )
                     .await;
@@ -601,9 +728,13 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
                     let video_control = control.clone();
                     let mut video = connection.open_uni().await?;
                     let _ = video.set_priority(1);
+                    let video_connection = connection.clone();
                     let pump = tokio::spawn(async move {
                         let mut waiting_for_keyframe = false;
-                        while let Some(frame) = next_video_frame(
+                        let mut adaptive = adaptive_request.map(|(initial, max)| {
+                            AdaptiveBitrate::new(initial, max, &video_connection)
+                        });
+                        while let Some((frame, overflowed)) = next_video_frame(
                             &mut frames,
                             &frame_overflow,
                             video_control.as_ref(),
@@ -611,8 +742,28 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
                         )
                         .await
                         {
+                            let frame_bytes = frame.data.len() + casement_proto::FRAME_HEADER_LEN;
+                            let write_started = Instant::now();
                             if screen::write_frame(&mut video, &frame).await.is_err() {
                                 break;
+                            }
+                            let now = Instant::now();
+                            let update = adaptive.as_mut().and_then(|controller| {
+                                controller.observe(
+                                    frame_bytes,
+                                    now.saturating_duration_since(write_started),
+                                    overflowed,
+                                    &video_connection,
+                                    now,
+                                )
+                            });
+                            if let Some(bitrate_kbps) = update {
+                                if video_control.set_bitrate(bitrate_kbps) {
+                                    tracing::debug!(bitrate_kbps, "adapted video bitrate");
+                                } else {
+                                    tracing::warn!("video backend cannot adapt bitrate");
+                                    adaptive = None;
+                                }
                             }
                         }
                         let _ = video.finish();
@@ -676,12 +827,14 @@ async fn next_video_frame(
     overflow: &std::sync::atomic::AtomicBool,
     control: &dyn ScreenControl,
     waiting_for_keyframe: &mut bool,
-) -> Option<screen::EncodedFrame> {
+) -> Option<(screen::EncodedFrame, bool)> {
+    let mut recovered_overflow = false;
     loop {
         let frame = frames.recv().await?;
         if overflow.swap(false, std::sync::atomic::Ordering::AcqRel) {
             while frames.try_recv().is_ok() {}
             *waiting_for_keyframe = true;
+            recovered_overflow = true;
             control.request_keyframe();
             continue;
         }
@@ -691,7 +844,7 @@ async fn next_video_frame(
             }
             *waiting_for_keyframe = false;
         }
-        return Some(frame);
+        return Some((frame, recovered_overflow));
     }
 }
 
@@ -701,6 +854,7 @@ mod socket_tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     };
+    use std::time::{Duration, Instant};
 
     use crate::screen::{EncodedFrame, ScreenControl};
     use casement_proto::Input;
@@ -723,6 +877,90 @@ mod socket_tests {
         }
     }
 
+    fn path_stats(rtt_ms: u64) -> quinn::ConnectionStats {
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.min_rtt = Duration::from_millis(2);
+        stats.path.rtt = Duration::from_millis(rtt_ms);
+        stats
+    }
+
+    #[test]
+    fn adaptive_bitrate_probes_busy_clean_path_and_backs_off() {
+        let started = Instant::now();
+        let baseline = path_stats(2);
+        let mut bitrate = super::AdaptiveBitrate::with_stats(
+            20_000,
+            crate::screen::MAX_VIDEO_BITRATE_KBPS,
+            baseline,
+            started,
+        );
+        // 2 Mbit/s during a 750 ms observation window. VFR encoders often stay far below
+        // their nominal target, so one 10%-full clean window justifies probing upward.
+        assert_eq!(
+            bitrate.observe_stats(
+                187_500,
+                Duration::ZERO,
+                false,
+                baseline,
+                started + Duration::from_millis(750),
+            ),
+            Some(25_000)
+        );
+
+        let mut loss = baseline;
+        loss.path.lost_packets = 1;
+        assert_eq!(
+            bitrate.observe_stats(
+                2_343_750,
+                Duration::ZERO,
+                false,
+                loss,
+                started + Duration::from_millis(1_500),
+            ),
+            Some(18_750)
+        );
+        assert_eq!(bitrate.target_kbps, 18_750);
+    }
+
+    #[test]
+    fn adaptive_bitrate_reacts_early_to_stale_frames_and_rtt_queue() {
+        let started = Instant::now();
+        let baseline = path_stats(2);
+        let mut overflow = super::AdaptiveBitrate::with_stats(100_000, 800_000, baseline, started);
+        assert_eq!(
+            overflow.observe_stats(
+                1_250_000,
+                Duration::ZERO,
+                true,
+                baseline,
+                started + Duration::from_millis(100),
+            ),
+            None
+        );
+        assert_eq!(
+            overflow.observe_stats(
+                1_875_000,
+                Duration::ZERO,
+                false,
+                baseline,
+                started + Duration::from_millis(250),
+            ),
+            Some(60_000)
+        );
+
+        let mut queued = super::AdaptiveBitrate::with_stats(100_000, 800_000, baseline, started);
+        assert_eq!(
+            queued.observe_stats(
+                9_375_000,
+                Duration::ZERO,
+                false,
+                path_stats(20),
+                started + Duration::from_millis(750),
+            ),
+            Some(75_000)
+        );
+    }
+
     #[tokio::test]
     async fn overflow_discards_stale_queue_and_waits_for_keyframe() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(3);
@@ -742,21 +980,29 @@ mod socket_tests {
             let mut waiting = false;
             let next = super::next_video_frame(&mut rx, &overflow_for_task, &control, &mut waiting);
             let _ = ready_tx.send(());
-            let keyframe = next.await.unwrap();
-            let following =
+            let (keyframe, recovered) = next.await.unwrap();
+            let (following, recovered_again) =
                 super::next_video_frame(&mut rx, &overflow_for_task, &control, &mut waiting)
                     .await
                     .unwrap();
-            (keyframe, following, control.0.load(Ordering::Relaxed))
+            (
+                keyframe,
+                following,
+                recovered,
+                recovered_again,
+                control.0.load(Ordering::Relaxed),
+            )
         });
         ready_rx.await.unwrap();
         tx.send(frame(5, false)).await.unwrap();
         tx.send(frame(6, true)).await.unwrap();
         tx.send(frame(7, false)).await.unwrap();
-        let (keyframe, following, requests) = task.await.unwrap();
+        let (keyframe, following, recovered, recovered_again, requests) = task.await.unwrap();
         assert_eq!(keyframe.data, [6]);
         assert!(keyframe.keyframe);
         assert_eq!(following.data, [7]);
+        assert!(recovered);
+        assert!(!recovered_again);
         assert_eq!(requests, 1);
     }
 

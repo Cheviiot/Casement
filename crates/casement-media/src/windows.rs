@@ -48,26 +48,22 @@ const ENCODERS: &[&str] = &[
 ];
 
 fn encoder_description(name: &str, requested_bitrate_kbps: u32) -> String {
-    let bitrate = if requested_bitrate_kbps == 0 {
-        20_000
-    } else {
-        requested_bitrate_kbps.clamp(4_000, 100_000)
-    };
+    let bitrate = crate::bitrate::initial(requested_bitrate_kbps);
     match name {
         "amfh264enc" => format!(
-            "amfh264enc usage=ultra-low-latency rate-control=cbr bitrate={bitrate} gop-size=60"
+            "amfh264enc name=encoder usage=ultra-low-latency rate-control=cbr bitrate={bitrate} gop-size=60"
         ),
         "qsvh264enc" => {
-            format!("qsvh264enc low-latency=true rate-control=cbr bitrate={bitrate} gop-size=60")
+            format!("qsvh264enc name=encoder low-latency=true rate-control=cbr bitrate={bitrate} gop-size=60")
         }
         "nvd3d11h264enc" => {
-            format!("nvd3d11h264enc preset=low-latency-hq bitrate={bitrate} gop-size=60 bframes=0")
+            format!("nvd3d11h264enc name=encoder preset=low-latency-hq bitrate={bitrate} gop-size=60 bframes=0")
         }
         "mfh264enc" => format!(
-            "mfh264enc low-latency=true rc-mode=cbr bitrate={bitrate} gop-size=60 bframes=0"
+            "mfh264enc name=encoder low-latency=true rc-mode=cbr bitrate={bitrate} gop-size=60 bframes=0"
         ),
         _ => format!(
-            "openh264enc bitrate={} rate-control=bitrate gop-size=60 complexity=low",
+            "openh264enc name=encoder bitrate={} rate-control=bitrate gop-size=60 complexity=low",
             bitrate.saturating_mul(1000)
         ),
     }
@@ -167,8 +163,9 @@ impl ScreenProvider for WindowsScreen {
                     continue;
                 }
                 let tuned = encoder_description(name, request.bitrate_kbps);
-                for encoder in [tuned.as_str(), *name] {
-                    match start_with(&display, encoder).await {
+                let fallback = format!("{name} name=encoder");
+                for encoder in [tuned.as_str(), fallback.as_str()] {
+                    match start_with(&display, name, encoder).await {
                         Ok((frames, frame_overflow, control, width, height)) => {
                             let events = control.clipboard.watch();
                             tracing::info!("sharing {width}x{height} with {encoder}");
@@ -199,6 +196,7 @@ impl ScreenProvider for WindowsScreen {
 
 async fn start_with(
     display: &Display,
+    encoder_name: &'static str,
     encoder: &str,
 ) -> Result<
     (
@@ -224,6 +222,7 @@ async fn start_with(
         .by_name("sink")
         .and_then(|e| e.downcast::<gst_app::AppSink>().ok())
         .ok_or("no appsink")?;
+    let encoder_element = pipeline.by_name("encoder").ok_or("no encoder element")?;
     if let Err(e) = pipeline.set_state(gst::State::Playing) {
         let _ = pipeline.set_state(gst::State::Null);
         return Err(format!("cannot start capture: {e}"));
@@ -247,6 +246,8 @@ async fn start_with(
     let control = Control {
         pipeline,
         sink,
+        encoder: encoder_element,
+        encoder_name,
         rect: display.rect,
         scroll: std::sync::Mutex::new((0.0, 0.0)),
         clipboard: Arc::new(Clipboard::default()),
@@ -257,6 +258,8 @@ async fn start_with(
 struct Control {
     pipeline: gst::Pipeline,
     sink: gst_app::AppSink,
+    encoder: gst::Element,
+    encoder_name: &'static str,
     /// The shared monitor on the virtual desktop, for absolute pointer positions.
     rect: RECT,
     /// Wheel remainders smaller than what is worth sending.
@@ -445,6 +448,10 @@ impl ScreenControl for Control {
             .all_headers(true)
             .build();
         self.sink.send_event(event);
+    }
+
+    fn set_bitrate(&self, bitrate_kbps: u32) -> bool {
+        crate::bitrate::set(&self.encoder, self.encoder_name, bitrate_kbps)
     }
 
     fn input(&self, event: Input) {

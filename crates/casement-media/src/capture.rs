@@ -128,21 +128,17 @@ fn converter(encoder: &str) -> &'static str {
 
 /// Low latency everywhere: no B-frames, a keyframe at least every second at 60 fps.
 fn encoder_description(name: &str, requested_bitrate_kbps: u32) -> String {
-    let bitrate = if requested_bitrate_kbps == 0 {
-        20_000
-    } else {
-        requested_bitrate_kbps.clamp(4_000, 100_000)
-    };
+    let bitrate = crate::bitrate::initial(requested_bitrate_kbps);
     match name {
         "vah264enc" => format!(
-            "vah264enc rate-control=cbr bitrate={bitrate} key-int-max=60 b-frames=0 target-usage=6"
+            "vah264enc name=encoder rate-control=cbr bitrate={bitrate} key-int-max=60 b-frames=0 target-usage=6"
         ),
         "openh264enc" => format!(
-            "openh264enc bitrate={} rate-control=bitrate gop-size=60 complexity=low",
+            "openh264enc name=encoder bitrate={} rate-control=bitrate gop-size=60 complexity=low",
             bitrate.saturating_mul(1000)
         ),
         _ => format!(
-            "x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate} key-int-max=60"
+            "x264enc name=encoder tune=zerolatency speed-preset=ultrafast bitrate={bitrate} key-int-max=60"
         ),
     }
 }
@@ -150,6 +146,8 @@ fn encoder_description(name: &str, requested_bitrate_kbps: u32) -> String {
 struct Control {
     pipeline: gst::Pipeline,
     sink: gst_app::AppSink,
+    encoder: gst::Element,
+    encoder_name: &'static str,
     input: input_queue::Sender,
     clipboard_task: tokio::task::AbortHandle,
 }
@@ -164,6 +162,10 @@ impl ScreenControl for Control {
 
     fn input(&self, input: Input) {
         self.input.send(Command::Input(input));
+    }
+
+    fn set_bitrate(&self, bitrate_kbps: u32) -> bool {
+        crate::bitrate::set(&self.encoder, self.encoder_name, bitrate_kbps)
     }
 
     fn clipboard(&self, text: String) {
@@ -303,6 +305,7 @@ pub async fn start(
         .by_name("sink")
         .and_then(|e| e.downcast::<gst_app::AppSink>().ok())
         .ok_or("no appsink")?;
+    let encoder_element = pipeline.by_name("encoder").ok_or("no encoder element")?;
 
     let (input_tx, input_rx) = input_queue::channel();
     let clipboard = Arc::new(std::sync::Mutex::new(String::new()));
@@ -317,6 +320,8 @@ pub async fn start(
     let control = Control {
         pipeline: pipeline.clone(),
         sink: sink.clone(),
+        encoder: encoder_element,
+        encoder_name: encoder,
         input: input_tx,
         clipboard_task: clipboard_task.abort_handle(),
     };

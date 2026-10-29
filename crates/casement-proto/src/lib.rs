@@ -136,6 +136,12 @@ pub struct StartScreen {
     /// Target video bitrate in kbit/s (0 = host default). Hosts clamp this value.
     #[prost(uint32, tag = "5")]
     pub bitrate_kbps: u32,
+    /// Let the host adjust the encoder from live QUIC feedback instead of keeping tag 5 fixed.
+    #[prost(bool, tag = "6")]
+    pub adaptive_bitrate: bool,
+    /// Highest bitrate the adaptive controller may request, in kbit/s (0 = host limit).
+    #[prost(uint32, tag = "7")]
+    pub max_bitrate_kbps: u32,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

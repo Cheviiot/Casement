@@ -5,6 +5,7 @@
 
 mod audio;
 pub mod autostart;
+mod bitrate;
 #[cfg(target_os = "linux")]
 mod capture;
 mod frames;

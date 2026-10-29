@@ -11,6 +11,12 @@ use casement_proto::{Input, FRAME_FLAG_KEYFRAME, FRAME_HEADER_LEN, MAX_FRAME};
 
 use crate::NetError;
 
+/// Encoder limits shared by the protocol adapter and the real media backends. Two Gbit/s
+/// leaves room for QUIC overhead on 2.5GbE and remains representable by encoders whose
+/// bitrate property is a signed number of bits per second.
+pub const MIN_VIDEO_BITRATE_KBPS: u32 = 4_000;
+pub const MAX_VIDEO_BITRATE_KBPS: u32 = 2_000_000;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct EncodedFrame {
     pub pts_us: u64,
@@ -22,6 +28,10 @@ pub struct EncodedFrame {
 pub trait ScreenControl: Send + Sync {
     fn request_keyframe(&self);
     fn input(&self, input: Input);
+    /// Changes the running encoder target. Returns false when this backend cannot do it.
+    fn set_bitrate(&self, _bitrate_kbps: u32) -> bool {
+        false
+    }
     /// The client copied this text: offer it as the host's clipboard.
     fn clipboard(&self, _text: String) {}
     /// The client's window changed size; only a virtual monitor follows it.
@@ -68,6 +78,10 @@ pub struct ScreenRequest {
     pub monitor: String,
     /// Target H.264 bitrate in kbit/s (0 = the backend default).
     pub bitrate_kbps: u32,
+    /// Adjust bitrate from congestion, RTT and stale-frame feedback while the session runs.
+    pub adaptive_bitrate: bool,
+    /// Upper adaptive limit in kbit/s (0 = the host limit).
+    pub max_bitrate_kbps: u32,
 }
 
 /// Starts sharing the screen; stops when the returned stream is dropped.

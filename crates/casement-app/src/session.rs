@@ -1747,6 +1747,8 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
         virtual_monitor: computer.virtual_monitor,
         monitor: page.monitor.borrow().clone(),
         bitrate_kbps: computer.video_quality.bitrate_kbps(),
+        adaptive_bitrate: true,
+        max_bitrate_kbps: computer.video_quality.max_bitrate_kbps(),
     };
     let (screen_tx, screen_rx) = async_channel::bounded::<Result<Started, String>>(1);
     let (src_tx, src_rx) = tokio::sync::oneshot::channel::<gst_app::AppSrc>();
