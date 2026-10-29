@@ -53,7 +53,10 @@ impl casement_net::audio::AudioProvider for FixtureAudio {
     }
 }
 
-struct Control(gst::Pipeline);
+struct Control {
+    pipeline: gst::Pipeline,
+    unexpected_resize: PathBuf,
+}
 
 impl ScreenControl for Control {
     fn request_keyframe(&self) {
@@ -63,7 +66,7 @@ impl ScreenControl for Control {
                 .field("count", 0u32)
                 .build(),
         );
-        if let Some(sink) = self.0.by_name("sink") {
+        if let Some(sink) = self.pipeline.by_name("sink") {
             sink.send_event(event);
         }
     }
@@ -74,7 +77,7 @@ impl ScreenControl for Control {
             if let Some(casement_proto::input::Kind::Motion(motion)) = input.kind {
                 let code = (motion.x / 10.0).round().clamp(0.0, 63.0) as u32;
                 let [r, g, b] = marker::color(code);
-                if let Some(source) = self.0.by_name("source") {
+                if let Some(source) = self.pipeline.by_name("source") {
                     source.set_property(
                         "foreground-color",
                         0xff000000u32 | u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b),
@@ -83,11 +86,15 @@ impl ScreenControl for Control {
             }
         }
     }
+
+    fn resize(&self, width: u32, height: u32) {
+        let _ = std::fs::write(&self.unexpected_resize, format!("{width}x{height}"));
+    }
 }
 
 impl Drop for Control {
     fn drop(&mut self) {
-        let _ = self.0.set_state(gst::State::Null);
+        let _ = self.pipeline.set_state(gst::State::Null);
     }
 }
 
@@ -96,6 +103,14 @@ impl ScreenProvider for FixtureScreen {
         let root = self.root.clone();
         Box::pin(async move {
             pause_startup(&root, "screen").await?;
+            std::fs::write(
+                root.join("screen-request"),
+                format!(
+                    "{}x{} virtual={}",
+                    request.max_width, request.max_height, request.virtual_monitor
+                ),
+            )
+            .map_err(|e| e.to_string())?;
             let monitor = if request.monitor == "fixture-2" {
                 "fixture-2"
             } else {
@@ -128,7 +143,10 @@ impl ScreenProvider for FixtureScreen {
                 .by_name("sink")
                 .and_then(|element| element.downcast::<gst_app::AppSink>().ok())
                 .ok_or("no appsink")?;
-            let control = Control(pipeline.clone());
+            let control = Control {
+                pipeline: pipeline.clone(),
+                unexpected_resize: root.join("unexpected-resize"),
+            };
             pipeline
                 .set_state(gst::State::Playing)
                 .map_err(|e| e.to_string())?;
@@ -265,6 +283,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     file.set_string("fixture", "name", "Тестовый компьютер");
     file.set_string("fixture", "host", "127.0.0.1");
     file.set_uint64("fixture", "port", u64::from(address.port()));
+    file.set_string("fixture-virtual", "name", "Виртуальный рабочий стол");
+    file.set_string("fixture-virtual", "host", "127.0.0.1");
+    file.set_uint64("fixture-virtual", "port", u64::from(address.port()));
+    file.set_boolean("fixture-virtual", "virtual-monitor", true);
     std::fs::write(root.join("client/connections.ini"), file.to_data())?;
     std::fs::write(root.join("ready"), host.local_addr()?.to_string())?;
     let host = Arc::new(host);

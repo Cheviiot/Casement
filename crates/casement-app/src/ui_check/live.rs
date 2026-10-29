@@ -40,6 +40,50 @@ pub(super) async fn run(window: &Window, root: &Path) -> Result<Vec<String>, Str
                 "leaving during {kind} startup cancels the real connection and host provider"
             ));
         }
+
+        let virtual_computer = window
+            .store()
+            .find("fixture-virtual")
+            .ok_or("live fixture: нет виртуального подключения")?;
+        crate::session::open(window, virtual_computer);
+        wait_tag(&navigation, "session", STATE_TIMEOUT).await?;
+        let virtual_session = visible_page(&navigation)?;
+        let virtual_picture = descendants(virtual_session.upcast_ref())
+            .into_iter()
+            .find_map(|widget| widget.downcast::<gtk::Picture>().ok())
+            .ok_or("live fixture: нет картинки виртуального сеанса")?;
+        wait_frame(&virtual_picture).await?;
+        let request = fs::read_to_string(root.join("screen-request")).map_err(|e| e.to_string())?;
+        if !request.ends_with(" virtual=true")
+            || ![
+                "1280x720",
+                "1600x900",
+                "1920x1080",
+                "2560x1440",
+                "3840x2160",
+            ]
+            .iter()
+            .any(|mode| request.starts_with(mode))
+        {
+            return Err(format!(
+                "live fixture: виртуальный рабочий стол запрошен с неверной геометрией {request:?}"
+            ));
+        }
+        window.widget().set_default_size(700, 540);
+        glib::timeout_future(Duration::from_millis(700)).await;
+        if root.join("unexpected-resize").exists() {
+            return Err("live fixture: размер окна перенастроил живой виртуальный экран".into());
+        }
+        if active_tag(&navigation).as_deref() != Some("session")
+            || virtual_picture.paintable().is_none()
+        {
+            return Err("live fixture: уменьшение окна разрушило виртуальный сеанс".into());
+        }
+        window.widget().set_default_size(900, 660);
+        tooltip_button(virtual_session.upcast_ref(), "Завершить сеанс")?.emit_clicked();
+        wait_tag(&navigation, "home", STATE_TIMEOUT).await?;
+        checks
+            .push("virtual desktop keeps one standard mode while the client window resizes".into());
     }
     let connection_files = crate::session::open_for_check(window, computer);
     wait_tag(&navigation, "session", STATE_TIMEOUT).await?;

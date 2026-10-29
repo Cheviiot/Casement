@@ -15,7 +15,7 @@ pub struct Computer {
     pub port: u16,
     /// 64 hex digits once the first connection was confirmed, else empty.
     pub fingerprint: String,
-    /// Ask for a virtual monitor the size of the window instead of the host's screen.
+    /// Ask for a stable virtual desktop instead of mirroring the host's screen.
     pub virtual_monitor: bool,
     /// Most recent successful connection, as Unix seconds; zero means never.
     pub last_connected: i64,

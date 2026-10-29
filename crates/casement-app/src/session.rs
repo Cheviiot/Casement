@@ -58,6 +58,24 @@ fn decoder() -> &'static str {
     }
 }
 
+/// A virtual desktop keeps one standard 16:9 mode for the whole connection. The client
+/// scales it locally when its window changes instead of renegotiating the live H.264
+/// stream: gtk4paintablesink cannot safely mix the last old-size buffer with new caps.
+fn virtual_desktop_size(viewport_width: i32, scale_factor: i32) -> (u32, u32) {
+    const MODES: [(u32, u32); 5] = [
+        (1280, 720),
+        (1600, 900),
+        (1920, 1080),
+        (2560, 1440),
+        (3840, 2160),
+    ];
+    let wanted = (viewport_width.max(0) as u32).saturating_mul(scale_factor.max(1) as u32);
+    MODES
+        .into_iter()
+        .find(|(width, _)| *width >= wanted)
+        .unwrap_or(MODES[MODES.len() - 1])
+}
+
 /// The picture of the remote screen and the input that goes back.
 struct Remote {
     picture: gtk::Picture,
@@ -416,9 +434,6 @@ pub struct SessionPage {
     reconnects: Cell<u32>,
     /// Pending automatic reconnect; cancelled when this page leaves or a flow restarts.
     reconnect_watch: RefCell<Option<glib::SourceId>>,
-    /// New window sizes for a virtual monitor.
-    resize_out: RefCell<Option<tokio::sync::mpsc::UnboundedSender<(u32, u32)>>>,
-    resize_watch: RefCell<Option<glib::SourceId>>,
     /// Local clipboard text for the host.
     clipboard_out: RefCell<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
     clipboard_watch: RefCell<Option<glib::SignalHandlerId>>,
@@ -560,7 +575,6 @@ impl SessionPage {
             generation: Cell::new(0),
             keyframe: RefCell::new(None),
             clipboard_out: RefCell::new(None),
-            resize_out: RefCell::new(None),
             files_wired: Cell::new(false),
             browse_files,
             remote_files: RefCell::new(None),
@@ -568,7 +582,6 @@ impl SessionPage {
             gone: Cell::new(false),
             reconnects: Cell::new(0),
             reconnect_watch: RefCell::new(None),
-            resize_watch: RefCell::new(None),
             clipboard_watch: RefCell::new(None),
             pipeline: RefCell::new(None),
             bus_watch: RefCell::new(None),
@@ -816,31 +829,6 @@ impl SessionPage {
         }
     }
 
-    /// A virtual monitor follows the window: when the picture area keeps a new size for a
-    /// moment, ask the host for it.
-    fn follow_window_size(&self, width: u32, height: u32) {
-        let Some(out) = self.resize_out.borrow().clone() else {
-            return;
-        };
-        let picture = self.remote.picture.clone();
-        let sent = std::cell::Cell::new((width, height));
-        let seen = std::cell::Cell::new((width, height));
-        let id = glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
-            let now = (
-                picture.width().max(0) as u32,
-                picture.height().max(0) as u32,
-            );
-            if now.0 >= 640 && now.1 >= 480 && now == seen.get() && now != sent.get() {
-                sent.set(now);
-                // Never Break here: shutdown() removes this source and must find it.
-                let _ = out.send(now);
-            }
-            seen.set(now);
-            glib::ControlFlow::Continue
-        });
-        self.resize_watch.replace(Some(id));
-    }
-
     /// Text clipboard both ways while the screen is shown. Our own writes come back as
     /// "changed" with a local owner and are not echoed.
     fn share_clipboard(&self, incoming: async_channel::Receiver<String>) {
@@ -929,12 +917,8 @@ impl SessionPage {
         self.bus_watch.replace(None);
         self.keyframe.replace(None);
         self.clipboard_out.replace(None);
-        self.resize_out.replace(None);
         self.remote_files.replace(None);
         self.browse_files.set_visible(false);
-        if let Some(id) = self.resize_watch.take() {
-            id.remove();
-        }
         if let Some(id) = self.clipboard_watch.take() {
             self.remote.picture.clipboard().disconnect(id);
         }
@@ -1741,10 +1725,20 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
     page.stop.replace(Some(stop_tx));
     let (keyframe_tx, mut keyframe_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     page.keyframe.replace(Some(keyframe_tx));
-    // A virtual monitor gets the size of the area the picture will fill.
+    // A virtual desktop starts in a standard mode and stays there. Window resizes are
+    // handled by GTK's local scaling, so shrinking the window cannot renegotiate a frame
+    // while the decoder still owns buffers of the previous size.
+    let (max_width, max_height) = if computer.virtual_monitor {
+        virtual_desktop_size(page.stack.width(), page.stack.scale_factor())
+    } else {
+        (
+            page.stack.width().max(640) as u32,
+            page.stack.height().max(480) as u32,
+        )
+    };
     let request = casement_net::screen::ScreenRequest {
-        max_width: page.stack.width().max(640) as u32,
-        max_height: page.stack.height().max(480) as u32,
+        max_width,
+        max_height,
         virtual_monitor: computer.virtual_monitor,
         monitor: page.monitor.borrow().clone(),
     };
@@ -1752,10 +1746,6 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
     let (src_tx, src_rx) = tokio::sync::oneshot::channel::<gst_app::AppSrc>();
     let (sound_src_tx, sound_src_rx) = tokio::sync::oneshot::channel::<gst_app::AppSrc>();
     let (ended_tx, ended_rx) = async_channel::bounded::<Option<String>>(1);
-    let (resize_tx, mut resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, u32)>();
-    if computer.virtual_monitor {
-        page.resize_out.replace(Some(resize_tx));
-    }
     let (clip_out_tx, mut clip_out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     page.clipboard_out.replace(Some(clip_out_tx));
     let (clip_in_tx, clip_in_rx) = async_channel::unbounded::<String>();
@@ -1884,11 +1874,6 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
                         break Some("Соединение прервалось".to_string());
                     }
                 }
-                Some((width, height)) = resize_rx.recv() => {
-                    if control.resize(width, height).await.is_err() {
-                        break Some("Соединение прервалось".to_string());
-                    }
-                }
                 Some(text) = clip_out_rx.recv() => {
                     if control.clipboard(&text).await.is_err() {
                         break Some("Соединение прервалось".to_string());
@@ -1940,7 +1925,6 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
                     let _ = src_tx.send(src);
                     page.remote.input.replace(Some(input));
                     page.share_clipboard(clip_in_rx.clone());
-                    page.follow_window_size(width, height);
                     page.enable_files(&window);
                     page.controls.set_visible(true);
                     page.disconnect.set_visible(true);
@@ -1981,6 +1965,21 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
         // The picture was there: try to get it back on our own first.
         page.reconnects.set(1);
         schedule_reconnect(&window, &page, &computer, &reason);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::virtual_desktop_size;
+
+    #[test]
+    fn virtual_desktop_uses_stable_standard_modes() {
+        assert_eq!(virtual_desktop_size(0, 1), (1280, 720));
+        assert_eq!(virtual_desktop_size(400, 1), (1280, 720));
+        assert_eq!(virtual_desktop_size(1281, 1), (1600, 900));
+        assert_eq!(virtual_desktop_size(1700, 1), (1920, 1080));
+        assert_eq!(virtual_desktop_size(1700, 2), (3840, 2160));
+        assert_eq!(virtual_desktop_size(5000, 1), (3840, 2160));
     }
 }
 
