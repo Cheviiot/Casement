@@ -15,6 +15,8 @@ pub struct Computer {
     pub port: u16,
     /// 64 hex digits once the first connection was confirmed, else empty.
     pub fingerprint: String,
+    /// Human-readable OS reported by the remote computer; absent in old records.
+    pub os_display_name: String,
     /// Ask for a stable virtual desktop instead of mirroring the host's screen.
     pub virtual_monitor: bool,
     /// Most recent successful connection, as Unix seconds; zero means never.
@@ -29,6 +31,7 @@ impl Computer {
             host: host.to_string(),
             port,
             fingerprint: String::new(),
+            os_display_name: String::new(),
             virtual_monitor: false,
             last_connected: 0,
         }
@@ -36,10 +39,15 @@ impl Computer {
 
     pub fn title(&self) -> String {
         let name = self.name.trim();
-        if name.is_empty() {
+        let name = if name.is_empty() {
             self.address()
         } else {
             name.to_string()
+        };
+        if self.os_display_name.trim().is_empty() {
+            name
+        } else {
+            format!("{name} · {}", self.os_display_name.trim())
         }
     }
 
@@ -206,6 +214,7 @@ impl Store {
                         } else {
                             String::new()
                         },
+                        os_display_name: get("os-name"),
                         virtual_monitor: file.boolean(group, "virtual-monitor").unwrap_or(false),
                         last_connected: file
                             .int64(group, "last-connected")
@@ -231,6 +240,9 @@ impl Store {
             file.set_uint64(&item.id, "port", item.port as u64);
             if !item.fingerprint.is_empty() {
                 file.set_string(&item.id, "fingerprint", &item.fingerprint);
+            }
+            if !item.os_display_name.is_empty() {
+                file.set_string(&item.id, "os-name", &item.os_display_name);
             }
             if item.virtual_monitor {
                 file.set_boolean(&item.id, "virtual-monitor", true);
@@ -335,6 +347,7 @@ mod tests {
         assert!(store.items().is_empty());
         let mut item = Computer::new("10.0.0.5", 47900);
         item.name = "Офис".into();
+        item.os_display_name = "ALT Linux".into();
         item.fingerprint = "a".repeat(64);
         item.virtual_monitor = true;
         item.last_connected = 1_800_000_000;
@@ -404,6 +417,34 @@ mod tests {
         let reloaded = Store::open(dir.path());
         assert_eq!(reloaded.find("legacy").unwrap().last_connected, 0);
         assert_eq!(reloaded.find("modern").unwrap().last_connected, 1234);
+        assert_eq!(reloaded.find("legacy").unwrap().os_display_name, "");
+    }
+
+    #[test]
+    fn same_address_can_hold_two_distinct_os_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path());
+        let mut linux = Computer::new("gem12", DEFAULT_PORT);
+        linux.name = "GEM12".into();
+        linux.os_display_name = "ALT Linux".into();
+        linux.fingerprint = "a".repeat(64);
+        let mut windows = linux.clone();
+        windows.id = "windows".into();
+        windows.os_display_name = "Windows".into();
+        windows.fingerprint = "b".repeat(64);
+        store.put(linux.clone()).unwrap();
+        store.put(windows.clone()).unwrap();
+
+        let reloaded = Store::open(dir.path());
+        assert_eq!(reloaded.items().len(), 2);
+        assert_eq!(
+            reloaded.find(&linux.id).unwrap().title(),
+            "GEM12 · ALT Linux"
+        );
+        assert_eq!(
+            reloaded.find(&windows.id).unwrap().title(),
+            "GEM12 · Windows"
+        );
     }
 
     #[test]

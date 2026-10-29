@@ -91,5 +91,43 @@ pub fn os_name() -> &'static str {
     std::env::consts::OS
 }
 
+/// Best-effort human-readable operating system name for discovery and peer labels.
+pub fn os_display_name() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(contents) = std::fs::read_to_string("/etc/os-release") {
+            for key in ["PRETTY_NAME", "NAME"] {
+                if let Some(value) = contents.lines().find_map(|line| {
+                    line.strip_prefix(&format!("{key}="))
+                        .map(|value| value.trim().trim_matches(['\"', '\'']).to_string())
+                }) {
+                    if !value.is_empty() && !value.chars().any(char::is_control) {
+                        return value;
+                    }
+                }
+            }
+        }
+        return "Linux".into();
+    }
+    #[cfg(windows)]
+    {
+        "Windows".into()
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        std::env::consts::OS.to_string()
+    }
+}
+
+#[cfg(test)]
+mod os_display_tests {
+    #[test]
+    fn display_name_uses_a_nonempty_system_fallback() {
+        let name = super::os_display_name();
+        assert!(!name.trim().is_empty());
+        assert!(!name.chars().any(char::is_control));
+    }
+}
+
 #[cfg(test)]
 mod test_support;

@@ -17,6 +17,17 @@ enum Event {
     Failed(String),
 }
 
+fn os_icon(os: &str) -> &'static str {
+    let os = os.to_ascii_lowercase();
+    if os.contains("windows") {
+        "computer-symbolic"
+    } else if os.is_empty() {
+        "computer-symbolic"
+    } else {
+        "drive-harddisk-system-symbolic"
+    }
+}
+
 struct Scan {
     window: Window,
     list: gtk::ListBox,
@@ -169,15 +180,11 @@ impl Scan {
             };
             let mut computer = Computer::new(&address.to_string(), peer.port);
             computer.name = peer.name;
+            computer.os_display_name = peer.os_display_name;
             let existing = self
                 .window
                 .store()
-                .find_by_fingerprint(&peer.fingerprint.to_hex())
-                .or_else(|| {
-                    self.window
-                        .store()
-                        .find_by_address(&computer.host, computer.port)
-                });
+                .find_by_fingerprint(&peer.fingerprint.to_hex());
             let row = adw::ActionRow::builder()
                 .title(glib::markup_escape_text(&computer.title()).as_str())
                 .subtitle(computer.address())
@@ -186,7 +193,7 @@ impl Scan {
                 .activatable(existing.is_none())
                 .css_classes(["device-row"])
                 .build();
-            row.add_prefix(&pages::icon_tile("computer-symbolic"));
+            row.add_prefix(&pages::icon_tile(os_icon(&computer.os_display_name)));
             if existing.is_some() {
                 row.add_suffix(
                     &gtk::Label::builder()

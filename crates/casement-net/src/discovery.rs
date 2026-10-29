@@ -1,7 +1,7 @@
 //! Finding Casement hosts on the LAN with mDNS / DNS-SD.
 //!
 //! A host announces `_casement._udp.local.` with TXT records `v` (protocol version),
-//! `name`, `os` and `fp` (full key fingerprint). Only public facts go into the record;
+//! `name`, `os`, `os-name` and `fp` (full key fingerprint). Only public facts go into the record;
 //! a fingerprint learned here is still confirmed by the TLS handshake.
 
 use std::net::IpAddr;
@@ -35,10 +35,12 @@ impl Announcement {
         );
         let version = PROTOCOL_VERSION.to_string();
         let fp = fingerprint.to_hex();
+        let os_display_name = sanitize_name(&crate::os_display_name());
         let properties = [
             ("v", version.as_str()),
             ("name", name.as_str()),
             ("os", crate::os_name()),
+            ("os-name", os_display_name.as_str()),
             ("fp", fp.as_str()),
         ];
         let info = ServiceInfo::new(
@@ -70,6 +72,7 @@ pub struct Peer {
     pub id: String,
     pub name: String,
     pub os: String,
+    pub os_display_name: String,
     pub fingerprint: Fingerprint,
     /// IPv4 first: they work across more networks than link-local IPv6.
     pub addresses: Vec<IpAddr>,
@@ -120,6 +123,9 @@ impl Browser {
                         id: info.fullname.clone(),
                         name,
                         os: sanitize_name(props.get_property_val_str("os").unwrap_or("")),
+                        os_display_name: sanitize_name(
+                            props.get_property_val_str("os-name").unwrap_or(""),
+                        ),
                         fingerprint,
                         addresses,
                         port: info.port,

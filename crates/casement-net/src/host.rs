@@ -269,6 +269,7 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
         os: shared.config.os.clone(),
         password: None,
         reliable_input: true,
+        os_display_name: crate::os_display_name(),
     };
 
     if let Some(dir) = &shared.config.settings_dir {
