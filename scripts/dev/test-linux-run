@@ -36,7 +36,9 @@ test -f "$root/current/share/icons/hicolor/scalable/apps/io.github.cheviiot.Case
 test -f "$root/current/share/icons/hicolor/scalable/apps/casement-os-windows.svg"
 test -f "$root/current/share/icons/hicolor/scalable/apps/casement-os-linux-symbolic.svg"
 test -f "$root/current/share/licenses/casement/LICENSE.devicon"
-test ! -e "$scratch/home/.local/bin/casement"
+test -L "$scratch/home/.local/bin/casement"
+test "$(readlink -f "$scratch/home/.local/bin/casement")" = \
+    "$(readlink -f "$root/current/bin/casement")"
 HOME="$scratch/home" XDG_CACHE_HOME="$scratch/cache" \
     "$root/current/bin/casement-cli" --help >/dev/null
 grep -F "$root/current/bin/casement" \
@@ -52,5 +54,6 @@ env HOME="$scratch/home" XDG_DATA_HOME="$scratch/data" \
     XDG_CONFIG_HOME="$scratch/config" CASEMENT_INSTALL_ROOT="$root" \
     CASEMENT_SKIP_SERVICE=1 sh "$run" --uninstall
 test ! -e "$root"
+test ! -e "$scratch/home/.local/bin/casement"
 test -f "$scratch/config/casement/test"
 echo "Self-contained Linux installer: PASS"

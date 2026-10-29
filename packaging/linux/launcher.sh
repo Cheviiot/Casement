@@ -2,7 +2,12 @@
 # Starts one of Casement's programs with the private runtime installed beside it.
 set -eu
 
-self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+self=$0
+if command -v readlink >/dev/null 2>&1; then
+    resolved=$(readlink -f -- "$self" 2>/dev/null || true)
+    [ -z "$resolved" ] || self=$resolved
+fi
+self_dir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd -P)
 root=$(CDPATH= cd -- "$self_dir/.." && pwd -P)
 program=$(basename -- "$0")
 case "$program" in

@@ -60,6 +60,12 @@ units="$config/systemd/user"
 desktop="$share/applications/io.github.cheviiot.Casement.desktop"
 desktop_new="$desktop.new.$$"
 desktop_old="$desktop.old.$$"
+legacy_launcher="$HOME/.local/bin/casement"
+legacy_migration=0
+if [ -L "$legacy_launcher" ] || \
+    { [ -f "$desktop" ] && grep -Fq "$HOME/.local/bin/casement" "$desktop"; }; then
+    legacy_migration=1
+fi
 target="$root/versions/$version"
 stage="$root/versions/.${version}.new.$$"
 backup="$root/versions/.${version}.old.$$"
@@ -121,10 +127,17 @@ install -m 644 "$here/share/metainfo/io.github.cheviiot.Casement.metainfo.xml" "
 sed "s|^ExecStart=.*|ExecStart=\"$escaped_root/current/bin/casement-host\"|" \
     "$here/share/casement/casement-host.service" > "$units/casement-host.service"
 
-# Remove files left by the former per-user layout. Distribution packages use /usr and
-# are deliberately untouched.
-rm -f "$HOME/.local/bin/casement" "$HOME/.local/bin/casement-host" \
-    "$HOME/.local/bin/casement-cli" "$share/casement-uninstall.sh"
+# Remove files left by the former per-user layout. A live GNOME Shell can keep the old
+# GUI command until the next login, so an upgrade keeps one symlink into the private
+# application directory. Fresh installs do not add anything to ~/.local/bin.
+rm -f "$HOME/.local/bin/casement-host" "$HOME/.local/bin/casement-cli" \
+    "$share/casement-uninstall.sh"
+if [ "$legacy_migration" = 1 ]; then
+    mkdir -p "$HOME/.local/bin"
+    ln -sfn "$root/current/bin/casement" "$legacy_launcher"
+else
+    rm -f "$legacy_launcher"
+fi
 rm -rf -- "$backup"
 trap - EXIT HUP INT TERM
 
