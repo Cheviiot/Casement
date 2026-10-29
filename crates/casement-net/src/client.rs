@@ -232,6 +232,8 @@ pub struct Screen {
     /// The host's monitors and the id of the one shown ("" for a virtual monitor).
     pub monitors: Vec<crate::screen::Monitor>,
     pub monitor: String,
+    /// False means the client should draw its own low-latency cursor.
+    pub cursor_embedded: bool,
 }
 
 impl Session {
@@ -305,6 +307,8 @@ impl Session {
                         video,
                         monitors: started.monitors,
                         monitor: started.monitor,
+                        // Before protocol field 6 every backend embedded the cursor.
+                        cursor_embedded: started.cursor_embedded.unwrap_or(true),
                     });
                 }
                 Some(Kind::Failure(failure)) => return Err(refused(failure)),

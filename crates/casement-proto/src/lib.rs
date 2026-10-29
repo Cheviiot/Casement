@@ -164,6 +164,10 @@ pub struct ScreenStarted {
     /// The one shown (`Monitor.id`); "" for a virtual monitor or when unknown.
     #[prost(string, tag = "5")]
     pub monitor: String,
+    /// True when the cursor is already painted into the video. Optional so new
+    /// clients remain compatible with hosts from before this field existed.
+    #[prost(bool, optional, tag = "6")]
+    pub cursor_embedded: Option<bool>,
 }
 
 /// Client → host: the decoder lost track; send a keyframe soon.

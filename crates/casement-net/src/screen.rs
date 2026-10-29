@@ -52,6 +52,8 @@ pub struct ScreenStream {
     /// The host's monitors and the id of the one shown ("" for a virtual monitor).
     pub monitors: Vec<Monitor>,
     pub monitor: String,
+    /// Whether the video already contains the remote cursor.
+    pub cursor_embedded: bool,
 }
 
 pub type StartFuture = Pin<Box<dyn Future<Output = Result<ScreenStream, String>> + Send>>;

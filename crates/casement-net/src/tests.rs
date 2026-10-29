@@ -134,6 +134,7 @@ impl crate::screen::ScreenProvider for FakeScreen {
                 events: Some(events),
                 monitors,
                 monitor,
+                cursor_embedded: true,
             })
         })
     }
@@ -292,6 +293,7 @@ impl crate::screen::ScreenProvider for EndedScreen {
                 events: Some(events),
                 monitors: Vec::new(),
                 monitor: String::new(),
+                cursor_embedded: true,
             })
         })
     }
@@ -414,6 +416,7 @@ async fn screen_frames_and_input() {
         ("Первый", true)
     );
     assert_eq!(screen.monitor, "FAKE-2");
+    assert!(screen.cursor_embedded);
     assert_eq!(
         client::clip_text(&"ж".repeat(600_000)).len(),
         casement_proto::MAX_CLIPBOARD_TEXT

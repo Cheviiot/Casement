@@ -182,6 +182,7 @@ impl ScreenProvider for FixtureScreen {
                     },
                 ],
                 monitor: monitor.into(),
+                cursor_embedded: true,
             })
         })
     }

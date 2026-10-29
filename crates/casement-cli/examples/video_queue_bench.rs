@@ -136,6 +136,7 @@ impl ScreenProvider for FakeScreen {
                 events: Some(events),
                 monitors: Vec::new(),
                 monitor: String::new(),
+                cursor_embedded: true,
             })
         })
     }

@@ -170,6 +170,7 @@ impl ScreenProvider for WindowsScreen {
                                 events: Some(events),
                                 monitors: all.iter().map(|d| d.monitor.clone()).collect(),
                                 monitor: display.monitor.id.clone(),
+                                cursor_embedded: true,
                             });
                         }
                         Err(e) => {

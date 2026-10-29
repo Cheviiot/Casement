@@ -76,6 +76,7 @@ struct Remote {
     pointer: Cell<Option<(f64, f64)>>,
     hidden_cursor: gtk::gdk::Cursor,
     cursor_hidden: Cell<bool>,
+    cursor_embedded: Cell<bool>,
 }
 
 impl Remote {
@@ -111,6 +112,7 @@ impl Remote {
             pointer: Cell::new(None),
             hidden_cursor: gtk::gdk::Cursor::from_texture(&transparent, 0, 0, None),
             cursor_hidden: Cell::new(false),
+            cursor_embedded: Cell::new(true),
         });
         remote.attach_controllers();
         let weak = Rc::downgrade(&remote);
@@ -196,7 +198,7 @@ impl Remote {
             .pointer
             .get()
             .is_none_or(|point| self.viewport().is_some_and(|v| v.contains(point)));
-        let hide = inside && self.picture.paintable().is_some();
+        let hide = self.cursor_embedded.get() && inside && self.picture.paintable().is_some();
         if self.cursor_hidden.replace(hide) != hide {
             self.picture.set_cursor(if hide {
                 Some(&self.hidden_cursor)
@@ -1396,12 +1398,21 @@ pub async fn check_cursor(window: &Window) -> Result<Vec<String>, String> {
     if remote.picture.cursor().is_some() {
         return Err("cursor: not restored after the picture ended".into());
     }
+    remote.cursor_embedded.set(false);
+    remote.pointer.set(Some(center));
+    remote.picture.set_paintable(Some(&frame));
+    remote.sync_cursor();
+    if remote.cursor_hidden.get() || remote.picture.cursor().is_some() {
+        return Err("cursor: virtual screen did not keep the local pointer visible".into());
+    }
+    remote.picture.set_paintable(None::<&gtk::gdk::Paintable>);
     window.navigation().pop();
     Ok(vec![
         "cursor hides on first frame without motion".into(),
         "cursor is an explicit transparent texture".into(),
         "cursor follows image geometry while stationary".into(),
         "cursor restores when the picture ends".into(),
+        "virtual screen keeps the low-latency local cursor visible".into(),
         "image margins ignore clicks and an outside drag release clears the button".into(),
     ])
 }
@@ -1555,6 +1566,7 @@ struct Started {
     decoder_reset: Arc<AtomicBool>,
     monitors: Vec<casement_net::screen::Monitor>,
     monitor: String,
+    cursor_embedded: bool,
 }
 
 async fn resolve(host: String, port: u16) -> Result<SocketAddr, NetError> {
@@ -1785,6 +1797,7 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
                 decoder_reset: decoder_reset.clone(),
                 monitors: screen.monitors,
                 monitor: screen.monitor,
+                cursor_embedded: screen.cursor_embedded,
             }))
             .await;
         let Ok(src) = src_rx.await else { return };
@@ -1903,9 +1916,12 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
             decoder_reset,
             monitors,
             monitor,
+            cursor_embedded,
         })) => {
             page.remote.width.set(width);
             page.remote.height.set(height);
+            page.remote.cursor_embedded.set(cursor_embedded);
+            page.remote.sync_cursor();
             match page.start_decoder(decoder_reset) {
                 Ok(src) => {
                     let player = sound.and_then(|format| {

@@ -588,6 +588,7 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
                             codec: stream.codec.clone(),
                             monitors: stream.monitors.clone(),
                             monitor: stream.monitor.clone(),
+                            cursor_embedded: Some(stream.cursor_embedded),
                         })),
                     )
                     .await?;

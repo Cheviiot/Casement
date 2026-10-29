@@ -272,7 +272,7 @@ pub async fn start(
     let session = Arc::new(session);
     let encoder = encoder_name().ok_or("no H.264 encoder")?;
     let description = format!(
-        "pipewiresrc path={} do-timestamp=true keepalive-time=500 {}! {} ! {} \
+        "pipewiresrc path={} do-timestamp=true keepalive-time=0 {}! {} ! {} \
          ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au \
          ! appsink name=sink sync=false max-buffers={} drop=false",
         session.node_id,
@@ -347,5 +347,6 @@ pub async fn start(
         events: Some(events),
         monitors,
         monitor,
+        cursor_embedded: virtual_size.is_none(),
     })
 }

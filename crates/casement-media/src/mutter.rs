@@ -11,6 +11,7 @@ use zbus::{Connection, Proxy};
 const RD_NAME: &str = "org.gnome.Mutter.RemoteDesktop";
 const SC_NAME: &str = "org.gnome.Mutter.ScreenCast";
 /// Cursor drawn into the picture (1); 2 would send it as metadata.
+const CURSOR_HIDDEN: u32 = 0;
 const CURSOR_EMBEDDED: u32 = 1;
 
 pub struct Session {
@@ -147,7 +148,15 @@ impl Session {
         .await?;
 
         let mut record: HashMap<&str, Value> = HashMap::new();
-        record.insert("cursor-mode", Value::U32(CURSOR_EMBEDDED));
+        // A virtual monitor can idle its frame clock after a short pause. Waiting for
+        // its embedded cursor then adds hundreds of milliseconds, so the client draws
+        // that cursor locally. Mirrored monitors keep Mutter's accurate cursor shape.
+        let cursor_mode = if virtual_size.is_some() {
+            CURSOR_HIDDEN
+        } else {
+            CURSOR_EMBEDDED
+        };
+        record.insert("cursor-mode", Value::U32(cursor_mode));
         let monitors = monitors(&connection).await.unwrap_or_default();
         let (stream_path, connector): (OwnedObjectPath, String) = match virtual_size {
             Some(_) => (cast.call("RecordVirtual", &(record,)).await?, String::new()),
