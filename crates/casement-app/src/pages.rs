@@ -183,36 +183,23 @@ fn remote_icon_name(os: RemoteOs, theme: &gtk::IconTheme) -> &'static str {
 
 /// A maintained OS or distribution mark from the bundled Devicon subset. Distros not
 /// represented there, including ALT Linux, use the generic Linux mark.
-pub fn os_icon_tile(os: &str) -> gtk::Box {
+pub fn os_icon_tile(os: &str) -> gtk::CenterBox {
     let os = remote_os(os);
-    let class = match os {
-        RemoteOs::Windows => "os-windows",
-        RemoteOs::AltLinux
-        | RemoteOs::Ubuntu
-        | RemoteOs::Debian
-        | RemoteOs::Fedora
-        | RemoteOs::Arch
-        | RemoteOs::OpenSuse
-        | RemoteOs::Mint
-        | RemoteOs::NixOs
-        | RemoteOs::Linux => "os-linux",
-        RemoteOs::Unknown => "os-unknown",
-    };
     let theme = gtk::IconTheme::for_display(&gtk::gdk::Display::default().expect("display"));
     let image = gtk::Image::builder()
         .icon_name(remote_icon_name(os, &theme))
-        .pixel_size(30)
+        .pixel_size(28)
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Center)
         .build();
-    let tile = gtk::Box::builder()
-        .width_request(56)
-        .height_request(56)
+    let tile = gtk::CenterBox::builder()
+        .width_request(48)
+        .height_request(48)
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Center)
-        .css_classes(["os-tile", class])
+        .css_classes(["os-tile"])
         .build();
-    tile.append(&image);
+    tile.set_center_widget(Some(&image));
     tile
 }
 
