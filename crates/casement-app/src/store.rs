@@ -86,6 +86,8 @@ pub struct Computer {
     pub name: String,
     pub host: String,
     pub port: u16,
+    /// Alternative routes to this device, not separate saved computers.
+    pub routes: Vec<String>,
     /// 64 hex digits once the first connection was confirmed, else empty.
     pub fingerprint: String,
     /// Human-readable OS reported by the remote computer; absent in old records.
@@ -105,6 +107,7 @@ impl Computer {
             name: String::new(),
             host: host.to_string(),
             port,
+            routes: Vec::new(),
             fingerprint: String::new(),
             os_display_name: String::new(),
             virtual_monitor: false,
@@ -135,6 +138,40 @@ impl Computer {
         } else {
             format!("{}:{}", self.host, self.port)
         }
+    }
+
+    pub fn targets(&self) -> Vec<(String, u16)> {
+        let mut targets = vec![(self.host.clone(), self.port)];
+        for route in &self.routes {
+            if let Some(target) = parse_address(route) {
+                if !targets
+                    .iter()
+                    .any(|(host, port)| host.eq_ignore_ascii_case(&target.0) && *port == target.1)
+                {
+                    targets.push(target);
+                }
+            }
+        }
+        targets
+    }
+
+    pub fn remember_route(&mut self, route: &str) {
+        let Some((host, port)) = parse_address(route) else {
+            return;
+        };
+        if self
+            .targets()
+            .iter()
+            .any(|(saved, saved_port)| saved.eq_ignore_ascii_case(&host) && *saved_port == port)
+            || self.routes.len() >= 16
+        {
+            return;
+        }
+        self.routes.push(if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        });
     }
 
     /// Record a successful connection using whole Unix seconds.
@@ -285,6 +322,12 @@ impl Store {
                         name: get("name"),
                         host,
                         port,
+                        routes: get("routes")
+                            .split(';')
+                            .filter(|route| parse_address(route).is_some())
+                            .take(16)
+                            .map(str::to_string)
+                            .collect(),
                         fingerprint: if is_fingerprint(&fingerprint) {
                             fingerprint
                         } else {
@@ -315,6 +358,9 @@ impl Store {
             file.set_string(&item.id, "name", &item.name);
             file.set_string(&item.id, "host", &item.host);
             file.set_uint64(&item.id, "port", item.port as u64);
+            if !item.routes.is_empty() {
+                file.set_string(&item.id, "routes", &item.routes.join(";"));
+            }
             if !item.fingerprint.is_empty() {
                 file.set_string(&item.id, "fingerprint", &item.fingerprint);
             }
@@ -367,14 +413,43 @@ impl Store {
             .borrow()
             .items
             .iter()
-            .find(|c| c.host.eq_ignore_ascii_case(host) && c.port == port)
+            .find(|c| {
+                c.targets().iter().any(|(saved, saved_port)| {
+                    saved.eq_ignore_ascii_case(host) && *saved_port == port
+                })
+            })
             .cloned()
     }
 
-    pub fn put(&self, item: Computer) -> Result<(), String> {
+    pub fn put(&self, mut item: Computer) -> Result<(), String> {
         let previous = self.0.borrow().items.clone();
         {
             let mut inner = self.0.borrow_mut();
+            if !item.fingerprint.is_empty() {
+                if let Some(existing) = inner
+                    .items
+                    .iter()
+                    .find(|c| c.id != item.id && c.fingerprint == item.fingerprint)
+                    .cloned()
+                {
+                    item.remember_route(&existing.address());
+                    for route in &existing.routes {
+                        item.remember_route(route);
+                    }
+                    // Keep the established card and its user-selected settings.
+                    let mut merged = existing;
+                    merged.remember_route(&item.address());
+                    for route in &item.routes {
+                        merged.remember_route(route);
+                    }
+                    merged.last_connected = merged.last_connected.max(item.last_connected);
+                    if !item.os_display_name.is_empty() {
+                        merged.os_display_name = item.os_display_name;
+                    }
+                    inner.items.retain(|c| c.id != item.id);
+                    item = merged;
+                }
+            }
             match inner.items.iter_mut().find(|c| c.id == item.id) {
                 Some(existing) => *existing = item,
                 None => inner.items.push(item),
@@ -432,6 +507,8 @@ mod tests {
         item.virtual_monitor = true;
         item.video_quality = VideoQuality::Ultra;
         item.last_connected = 1_800_000_000;
+        item.remember_route("100.64.0.5:47820");
+        item.remember_route("[fd7a:115c:a1e0::5]:47820");
         store.put(item.clone()).unwrap();
         store.put(Computer::new("gem12", DEFAULT_PORT)).unwrap();
 
@@ -456,6 +533,53 @@ mod tests {
         }
         again.remove(&item.id).unwrap();
         assert_eq!(Store::open(dir.path()).items().len(), 1);
+    }
+
+    #[test]
+    fn routes_merge_one_device_but_keep_dual_boot_keys_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path());
+        let mut lan = Computer::new("192.168.0.110", DEFAULT_PORT);
+        lan.name = "Домашний компьютер".into();
+        lan.fingerprint = "a".repeat(64);
+        lan.video_quality = VideoQuality::Ultra;
+        store.put(lan.clone()).unwrap();
+        let mut tailnet = Computer::new("100.64.0.5", DEFAULT_PORT);
+        tailnet.fingerprint = lan.fingerprint.clone();
+        store.put(tailnet).unwrap();
+        let items = Store::open(dir.path()).items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, lan.id);
+        assert_eq!(items[0].name, lan.name);
+        assert_eq!(items[0].video_quality, VideoQuality::Ultra);
+        assert_eq!(items[0].targets().len(), 2);
+        assert_eq!(
+            store
+                .find_by_address("100.64.0.5", DEFAULT_PORT)
+                .unwrap()
+                .id,
+            lan.id
+        );
+        let mut other_os = Computer::new("192.168.0.110", DEFAULT_PORT);
+        other_os.fingerprint = "b".repeat(64);
+        store.put(other_os).unwrap();
+        assert_eq!(store.items().len(), 2);
+    }
+
+    #[test]
+    fn routes_reject_invalid_or_duplicate_endpoints() {
+        let mut computer = Computer::new("pc.local", DEFAULT_PORT);
+        for route in [
+            "PC.LOCAL:47820",
+            "has space",
+            "ftp://a",
+            "100.64.0.5:0",
+            "100.64.0.5:47820",
+            "100.64.0.5:47820",
+        ] {
+            computer.remember_route(route);
+        }
+        assert_eq!(computer.routes, ["100.64.0.5:47820"]);
     }
 
     #[test]

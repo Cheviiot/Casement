@@ -170,6 +170,10 @@ impl Scan {
             let mut computer = Computer::new(&address.to_string(), peer.port);
             computer.name = peer.name;
             computer.os_display_name = peer.os_display_name;
+            for address in &peer.addresses {
+                computer
+                    .remember_route(&std::net::SocketAddr::new(*address, peer.port).to_string());
+            }
             let store = self.window.store();
             let existing = store
                 .find_by_fingerprint(&peer.fingerprint.to_hex())
@@ -181,6 +185,18 @@ impl Scan {
                         .filter(|saved| saved.fingerprint.is_empty())
                 });
             let address = computer.address();
+            if let Some(mut saved) = existing.clone() {
+                let before = saved.clone();
+                saved.remember_route(&address);
+                for route in &computer.routes {
+                    saved.remember_route(route);
+                }
+                if saved != before {
+                    if let Err(e) = store.put(saved) {
+                        self.window.toast(&format!("Не удалось сохранить: {e}"));
+                    }
+                }
+            }
             let (title, subtitle) =
                 pages::connection_labels(&computer.name, &address, &computer.os_display_name);
             let row = adw::ActionRow::builder()

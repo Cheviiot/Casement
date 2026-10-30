@@ -325,6 +325,69 @@ fn info(remember: bool) -> ClientInfo {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routes_skip_an_unresponsive_address_and_learn_authenticated_endpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = start_host(dir.path(), Some(PASSWORD));
+    let me = std::sync::Arc::new(client_identity(dir.path(), "client"));
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let started = std::time::Instant::now();
+    let (handshake, addr) = crate::routes::connect(
+        me,
+        vec![
+            ("127.0.0.1".into(), blackhole.local_addr().unwrap().port()),
+            ("127.0.0.1".into(), host.addr.port()),
+        ],
+        Some(host.fingerprint),
+        info(true),
+        String::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(addr, host.addr);
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    let mut session = handshake.login(Some(PASSWORD)).await.unwrap();
+    assert_eq!(session.host_endpoints, [host.addr.to_string()]);
+    session.ping().await.unwrap();
+    session.close();
+    host.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routes_pin_the_device_across_alternatives_and_preserve_key_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+    let host = start_host(dir.path(), Some(PASSWORD));
+    let other_os = start_host(other_dir.path(), Some(PASSWORD));
+    let me = std::sync::Arc::new(client_identity(dir.path(), "client"));
+    let target = |addr: SocketAddr| (addr.ip().to_string(), addr.port());
+    let (handshake, addr) = crate::routes::connect(
+        me.clone(),
+        vec![target(other_os.addr), target(host.addr)],
+        Some(host.fingerprint),
+        info(true),
+        String::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(addr, host.addr);
+    assert_eq!(handshake.host_fingerprint, host.fingerprint);
+    handshake.close();
+    let result = crate::routes::connect(
+        me,
+        vec![target(other_os.addr)],
+        Some(host.fingerprint),
+        info(true),
+        String::new(),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(NetError::KeyChanged { expected, seen }) if expected == host.fingerprint && seen == other_os.fingerprint)
+    );
+    host.host.close();
+    other_os.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_use_password_then_trusted() {
     let dir = tempfile::tempdir().unwrap();
     let mut host = start_host(dir.path(), Some(PASSWORD));

@@ -71,6 +71,9 @@ pub struct ServerHello {
     /// Human-readable operating system name (optional for protocol-1 peers).
     #[prost(string, tag = "6")]
     pub os_display_name: String,
+    /// Other addresses of this device, learned only after an authenticated login.
+    #[prost(string, repeated, tag = "7")]
+    pub endpoints: Vec<String>,
 }
 
 /// One SPAKE2 message.
@@ -470,6 +473,7 @@ mod tests {
             }),
             reliable_input: true,
             os_display_name: "ALT Linux".into(),
+            endpoints: vec!["100.64.0.2:47820".into()],
         }));
         let bytes = msg.encode_to_vec();
         assert_eq!(Control::decode(bytes.as_slice()).unwrap(), msg);
@@ -505,8 +509,10 @@ mod tests {
         };
         let mut current = ServerHello::decode(legacy.encode_to_vec().as_slice()).unwrap();
         assert!(!current.reliable_input);
+        assert!(current.endpoints.is_empty());
         current.reliable_input = true;
         current.os_display_name = "ALT Linux".into();
+        current.endpoints = vec!["100.64.0.2:47820".into()];
         assert_eq!(
             LegacyHello::decode(current.encode_to_vec().as_slice()).unwrap(),
             legacy

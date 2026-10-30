@@ -217,6 +217,7 @@ fn editor(window: &Window, original: Option<Computer>) {
             .unwrap_or_else(|| Computer::new(&host, port));
         if computer.host != host || computer.port != port {
             computer.fingerprint.clear();
+            computer.routes.clear();
         }
         computer.host = host;
         computer.port = port;

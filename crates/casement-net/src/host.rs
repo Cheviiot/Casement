@@ -247,7 +247,7 @@ impl Host {
     /// Binds the UDP socket. `password` and `trust` are the host's current settings.
     pub fn bind(
         identity: Identity,
-        config: HostConfig,
+        mut config: HostConfig,
         password: Option<StoredPassword>,
         trust: TrustStore,
     ) -> Result<(Self, tokio::sync::mpsc::UnboundedReceiver<HostEvent>), NetError> {
@@ -263,6 +263,7 @@ impl Host {
             quinn::default_runtime()
                 .ok_or_else(|| NetError::Io(std::io::Error::other("no async runtime")))?,
         )?;
+        config.bind = endpoint.local_addr()?;
         let (events, rx) = tokio::sync::mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             identity,
@@ -392,6 +393,7 @@ async fn serve(shared: &Shared, connection: &quinn::Connection) -> Result<(), Ne
         password: None,
         reliable_input: true,
         os_display_name: crate::os_display_name(),
+        endpoints: crate::routes::local_endpoints(connection.local_ip(), shared.config.bind),
     };
 
     if let Some(dir) = &shared.config.settings_dir {

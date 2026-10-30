@@ -2,7 +2,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,7 +11,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
-use casement_net::client::{self, ClientInfo, FileSender, Handshake, InputSender};
+use casement_net::client::{ClientInfo, FileSender, Handshake, InputSender};
 use casement_net::{Fingerprint, NetError};
 use casement_proto::{input, Input, Key, PointerButton, PointerMotion, Scroll};
 
@@ -1554,18 +1553,6 @@ struct Started {
     cursor_embedded: bool,
 }
 
-async fn resolve(host: String, port: u16) -> Result<SocketAddr, NetError> {
-    let not_found = || NetError::Io(std::io::ErrorKind::NotFound.into());
-    run(async move {
-        tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .map_err(|_| not_found())?
-            .min_by_key(|a| a.is_ipv6())
-            .ok_or_else(not_found)
-    })
-    .await
-}
-
 /// Opens a session page and runs the whole connection on the main loop.
 pub fn open(window: &Window, computer: Computer) {
     let page = session_page(window, &computer);
@@ -1628,18 +1615,6 @@ async fn flow(window: Window, page: Rc<SessionPage>, computer: Computer) {
 async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Computer) {
     let core = window.core();
     page.show_progress("Подключение…");
-    let addr = match resolve(computer.host.clone(), computer.port).await {
-        Ok(addr) => addr,
-        Err(e) => {
-            return retry_or_show(
-                &window,
-                &page,
-                &computer,
-                "Не удалось подключиться",
-                &describe(&e),
-            )
-        }
-    };
     let info = ClientInfo {
         name: core.name.clone(),
         os: casement_net::os_name().into(),
@@ -1654,10 +1629,14 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
             os: info.os.clone(),
             remember: true,
         };
-        let handshake: Result<Handshake, NetError> =
-            run(async move { client::connect(&identity, addr, expected, &info2).await }).await;
-        let handshake = match handshake {
-            Ok(h) => h,
+        let targets = computer.targets();
+        let name = computer.name.clone();
+        let handshake: Result<(Handshake, std::net::SocketAddr), NetError> = run(async move {
+            casement_net::routes::connect(identity, targets, expected, info2, name).await
+        })
+        .await;
+        let (handshake, addr) = match handshake {
+            Ok(connected) => connected,
             Err(NetError::KeyChanged { seen, .. }) => {
                 if ask_key_changed(&page, &computer.title(), &seen.display())
                     .await
@@ -1701,7 +1680,13 @@ async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Compute
         };
         page.show_progress("Вход…");
         match run(async move { handshake.login(password.as_deref()).await }).await {
-            Ok(session) => break session,
+            Ok(session) => {
+                computer.remember_route(&addr.to_string());
+                for route in &session.host_endpoints {
+                    computer.remember_route(route);
+                }
+                break session;
+            }
             Err(NetError::AuthFailed) => {
                 retry = true;
                 continue;

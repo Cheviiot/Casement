@@ -18,6 +18,7 @@ use casement_proto::{RequestKeyframe, StartScreen};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Clone)]
 pub struct ClientInfo {
     pub name: String,
     pub os: String,
@@ -35,6 +36,7 @@ pub struct Handshake {
     pub host_name: String,
     pub host_os: String,
     pub host_os_display_name: String,
+    pub host_endpoints: Vec<String>,
     password: Option<PasswordParams>,
     reliable_input: bool,
     _endpoint: quinn::Endpoint,
@@ -47,6 +49,7 @@ pub struct Session {
     pub host_name: String,
     pub host_os: String,
     pub host_os_display_name: String,
+    pub host_endpoints: Vec<String>,
     pub remembered: bool,
     input: InputSender,
     _endpoint: quinn::Endpoint,
@@ -149,6 +152,7 @@ pub async fn connect_with_version(
         host_name: auth::sanitize_name(&hello.name),
         host_os: auth::sanitize_name(&hello.os),
         host_os_display_name: auth::sanitize_name(&hello.os_display_name),
+        host_endpoints: hello.endpoints.into_iter().take(16).collect(),
         password: hello.password,
         reliable_input: hello.reliable_input,
         _endpoint: endpoint,
@@ -218,6 +222,7 @@ impl Handshake {
             host_name: self.host_name,
             host_os: self.host_os,
             host_os_display_name: self.host_os_display_name,
+            host_endpoints: self.host_endpoints,
             remembered: result.remembered,
             _endpoint: self._endpoint,
         })

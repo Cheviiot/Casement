@@ -13,6 +13,7 @@ pub mod host;
 pub mod identity;
 mod input;
 pub mod policy;
+pub mod routes;
 pub mod screen;
 #[cfg(test)]
 mod tests;
