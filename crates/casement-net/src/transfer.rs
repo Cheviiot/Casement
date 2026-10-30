@@ -9,11 +9,15 @@
 //! temporary file and renames it only when the size and SHA-256 match, never overwriting
 //! an existing file. Browsing and downloading stay inside the host's shared folder.
 
-use std::path::{Path, PathBuf};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use casement_proto::{
     control::Kind, Control, ErrorCode, FileDone, FileEntry, FileFetch, FileList, FileListing,
-    FileOffer, FileReply,
+    FileOffer, FileReply, Message, MAX_CONTROL_FRAME,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,8 +25,79 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::{framing, NetError};
 
 const CHUNK: usize = 256 * 1024;
+const IO_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Most entries in one listing; keeps the answer well below the control frame limit.
 pub const MAX_LISTING: usize = 4000;
+static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+/// A uniquely-created temporary file that is removed if its transfer fails or is
+/// cancelled. The file lives beside its destination so publishing it is atomic.
+struct TransferTemp {
+    path: PathBuf,
+}
+
+impl TransferTemp {
+    async fn create(dir: &Path) -> Result<(Self, tokio::fs::File), NetError> {
+        let dir = dir.to_path_buf();
+        // Construct the guard inside the blocking operation: cancellation while opening
+        // must not leave an unowned file after the open completes. A short ASCII name
+        // also leaves room for long Unicode destination names.
+        let (file, guard) = tokio::task::spawn_blocking(move || loop {
+            let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!(
+                ".casement-{}-{id}.casement-part",
+                std::process::id()
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok::<_, io::Error>((file, Self { path })),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        })
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))??;
+        Ok((guard, tokio::fs::File::from_std(file)))
+    }
+
+    /// Publishes without replacing a path created by another transfer or process.
+    /// Same-directory no-replace rename works on NTFS, FAT/exFAT and Linux filesystems.
+    fn publish(mut self, dir: &Path, name: &str) -> Result<PathBuf, NetError> {
+        let (stem, ext) = match name.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
+            _ => (name.to_string(), String::new()),
+        };
+        for n in 0u64.. {
+            let candidate = if n == 0 {
+                dir.join(name)
+            } else {
+                dir.join(format!("{stem} ({n}){ext}"))
+            };
+            match crate::files::rename_noreplace(&self.path, &candidate) {
+                Ok(()) => {
+                    self.remove();
+                    return Ok(candidate);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unreachable!("a free destination name must eventually be found")
+    }
+
+    fn remove(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+impl Drop for TransferTemp {
+    fn drop(&mut self) {
+        self.remove();
+    }
+}
 
 /// Where the host keeps files: uploads go to `incoming`, browsing and downloads stay in
 /// `shared`; None refuses that direction.
@@ -73,7 +148,109 @@ async fn reply(
         accepted,
         message: message.to_string(),
     };
-    framing::write(send, &Control::new(Kind::FileReply(reply))).await
+    write_control(send, &Control::new(Kind::FileReply(reply)), IO_IDLE_TIMEOUT).await
+}
+
+/// Reads one QUIC read at a time so the idle deadline is restarted by every received byte.
+async fn read_exact_progress(
+    recv: &mut quinn::RecvStream,
+    bytes: &mut [u8],
+    idle_timeout: std::time::Duration,
+) -> Result<bool, NetError> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let read = tokio::time::timeout(idle_timeout, recv.read(&mut bytes[offset..]))
+            .await
+            .map_err(|_| NetError::Timeout)?
+            .map_err(|e| NetError::Stream(e.to_string()))?;
+        match read {
+            Some(0) => {
+                return Err(NetError::Protocol(
+                    "the peer closed the stream early".into(),
+                ))
+            }
+            Some(read) => offset += read,
+            None if offset == 0 => return Ok(false),
+            None => {
+                return Err(NetError::Protocol(
+                    "the peer closed the stream early".into(),
+                ))
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Like framing::expect, with a per-read idle deadline rather than a whole-operation cap.
+async fn read_control(
+    recv: &mut quinn::RecvStream,
+    idle_timeout: std::time::Duration,
+) -> Result<Option<Control>, NetError> {
+    let mut len = [0u8; 4];
+    if !read_exact_progress(recv, &mut len, idle_timeout).await? {
+        return Ok(None);
+    }
+    let len = u32::from_be_bytes(len) as usize;
+    if len > MAX_CONTROL_FRAME {
+        return Err(NetError::Protocol(format!("control frame of {len} bytes")));
+    }
+    let mut body = vec![0u8; len];
+    if !read_exact_progress(recv, &mut body, idle_timeout).await? {
+        return Err(NetError::Protocol(
+            "the peer closed the stream early".into(),
+        ));
+    }
+    Control::decode(body.as_slice())
+        .map(Some)
+        .map_err(|e| NetError::Protocol(format!("undecodable message: {e}")))
+}
+
+async fn expect_control(
+    recv: &mut quinn::RecvStream,
+    idle_timeout: std::time::Duration,
+) -> Result<Control, NetError> {
+    read_control(recv, idle_timeout)
+        .await?
+        .ok_or_else(|| NetError::Protocol("the peer closed the stream".into()))
+}
+
+async fn write_all_progress(
+    send: &mut quinn::SendStream,
+    bytes: &[u8],
+    idle_timeout: std::time::Duration,
+) -> Result<(), NetError> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let written = tokio::time::timeout(idle_timeout, send.write(&bytes[offset..]))
+            .await
+            .map_err(|_| NetError::Timeout)?
+            .map_err(|e| NetError::Stream(e.to_string()))?;
+        if written == 0 {
+            return Err(NetError::Stream(
+                "the peer stopped reading the stream".into(),
+            ));
+        }
+        offset += written;
+    }
+    Ok(())
+}
+
+async fn write_control(
+    send: &mut quinn::SendStream,
+    control: &Control,
+    idle_timeout: std::time::Duration,
+) -> Result<(), NetError> {
+    let body = control.encode_to_vec();
+    if body.len() > MAX_CONTROL_FRAME {
+        return Err(NetError::Protocol(format!(
+            "control frame of {} bytes",
+            body.len()
+        )));
+    }
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&body);
+    write_all_progress(send, &frame, idle_timeout).await
 }
 
 /// Host side: answers one file stream.
@@ -82,7 +259,7 @@ pub(crate) async fn serve(
     mut recv: quinn::RecvStream,
     files: &HostFiles,
 ) -> Result<Served, NetError> {
-    let first = framing::expect(&mut recv).await?.kind;
+    let first = expect_control(&mut recv, IO_IDLE_TIMEOUT).await?.kind;
     let result = match (first, files) {
         (
             Some(Kind::FileOffer(offer)),
@@ -113,7 +290,10 @@ pub(crate) async fn serve(
             HostFiles {
                 shared: Some(root), ..
             },
-        ) => send_shared(&mut send, root, &fetch.path).await,
+        ) => {
+            let _ = send.set_priority(-1);
+            send_shared(&mut send, root, &fetch.path).await
+        }
         (Some(Kind::FileList(_) | Kind::FileFetch(_)), _) => Err(NetError::Protocol(
             "this computer does not share its files".into(),
         )),
@@ -124,7 +304,12 @@ pub(crate) async fn serve(
             NetError::Protocol(m) => m.clone(),
             other => other.to_string(),
         };
-        let _ = framing::write(&mut send, &Control::failure(ErrorCode::NotAllowed, message)).await;
+        let _ = write_control(
+            &mut send,
+            &Control::failure(ErrorCode::NotAllowed, message),
+            IO_IDLE_TIMEOUT,
+        )
+        .await;
     }
     let _ = send.finish();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), send.stopped()).await;
@@ -226,13 +411,19 @@ async fn send_shared(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    framing::write(
+    write_control(
         send,
         &Control::new(Kind::FileOffer(FileOffer { name, size })),
+        IO_IDLE_TIMEOUT,
     )
     .await?;
     let sha256 = write_bytes(send, &mut file, size, |_, _| {}).await?;
-    framing::write(send, &Control::new(Kind::FileDone(FileDone { sha256 }))).await?;
+    write_control(
+        send,
+        &Control::new(Kind::FileDone(FileDone { sha256 })),
+        IO_IDLE_TIMEOUT,
+    )
+    .await?;
     Ok(Served::Sent(path, size))
 }
 
@@ -241,24 +432,38 @@ async fn write_bytes(
     send: &mut quinn::SendStream,
     file: &mut tokio::fs::File,
     size: u64,
+    progress: impl FnMut(u64, u64) + Send,
+) -> Result<Vec<u8>, NetError> {
+    write_bytes_with_timeout(send, file, size, progress, IO_IDLE_TIMEOUT).await
+}
+
+async fn write_bytes_with_timeout(
+    send: &mut quinn::SendStream,
+    file: &mut tokio::fs::File,
+    size: u64,
     mut progress: impl FnMut(u64, u64) + Send,
+    idle_timeout: std::time::Duration,
 ) -> Result<Vec<u8>, NetError> {
     let mut hasher = Sha256::new();
     let mut sent = 0u64;
     let mut buf = vec![0u8; CHUNK];
-    loop {
-        let got = file.read(&mut buf).await?;
+    while sent < size {
+        let want = buf
+            .len()
+            .min(usize::try_from(size - sent).unwrap_or(usize::MAX));
+        let got = file.read(&mut buf[..want]).await?;
         if got == 0 {
-            break;
+            return Err(NetError::Protocol(
+                "the file changed while it was being sent".into(),
+            ));
         }
         hasher.update(&buf[..got]);
-        send.write_all(&buf[..got])
-            .await
-            .map_err(|e| NetError::Stream(e.to_string()))?;
+        write_all_progress(send, &buf[..got], idle_timeout).await?;
         sent += got as u64;
         progress(sent, size);
     }
-    if sent != size {
+    let mut extra = [0u8; 1];
+    if file.read(&mut extra).await? != 0 {
         return Err(NetError::Protocol(
             "the file changed while it was being sent".into(),
         ));
@@ -272,16 +477,26 @@ async fn read_bytes(
     recv: &mut quinn::RecvStream,
     file: &mut tokio::fs::File,
     size: u64,
+    progress: impl FnMut(u64, u64) + Send,
+) -> Result<(), NetError> {
+    read_bytes_with_timeout(recv, file, size, progress, IO_IDLE_TIMEOUT).await
+}
+
+async fn read_bytes_with_timeout(
+    recv: &mut quinn::RecvStream,
+    file: &mut tokio::fs::File,
+    size: u64,
     mut progress: impl FnMut(u64, u64) + Send,
+    idle_timeout: std::time::Duration,
 ) -> Result<(), NetError> {
     let mut hasher = Sha256::new();
     let mut left = size;
     let mut buf = vec![0u8; CHUNK];
     while left > 0 {
         let want = buf.len().min(left as usize);
-        let got = recv
-            .read(&mut buf[..want])
+        let got = tokio::time::timeout(idle_timeout, recv.read(&mut buf[..want]))
             .await
+            .map_err(|_| NetError::Timeout)?
             .map_err(|e| NetError::Stream(e.to_string()))?
             .ok_or_else(|| NetError::Protocol("the file ended early".into()))?;
         hasher.update(&buf[..got]);
@@ -291,7 +506,7 @@ async fn read_bytes(
     }
     file.flush().await?;
     file.sync_all().await?;
-    let done = match framing::expect(recv).await?.kind {
+    let done = match expect_control(recv, idle_timeout).await?.kind {
         Some(Kind::FileDone(done)) => done,
         _ => return Err(NetError::Protocol("expected the file checksum".into())),
     };
@@ -316,14 +531,13 @@ async fn receive(
         return Err(NetError::Protocol("unusable file name".into()));
     };
     tokio::fs::create_dir_all(dir).await?;
-    let partial = dir.join(format!(".{name}.casement-part"));
-    let mut file = tokio::fs::File::create(&partial).await?;
+    let (partial, mut file) = TransferTemp::create(dir).await?;
     reply(&mut send, true, "").await?;
 
     let result: Result<(PathBuf, u64), NetError> = async {
         read_bytes(&mut recv, &mut file, offer.size, |_, _| {}).await?;
-        let path = unique_path(dir, &name);
-        tokio::fs::rename(&partial, &path).await?;
+        drop(file);
+        let path = partial.publish(dir, &name)?;
         Ok((path, offer.size))
     }
     .await;
@@ -336,7 +550,6 @@ async fn receive(
             reply(&mut send, true, &saved).await?;
         }
         Err(e) => {
-            let _ = tokio::fs::remove_file(&partial).await;
             let _ = reply(&mut send, false, &e.to_string()).await;
         }
     }
@@ -352,19 +565,32 @@ pub async fn send(
     path: &Path,
     progress: impl FnMut(u64, u64) + Send,
 ) -> Result<String, NetError> {
+    send_with_timeout(connection, path, progress, IO_IDLE_TIMEOUT).await
+}
+
+async fn send_with_timeout(
+    connection: &quinn::Connection,
+    path: &Path,
+    progress: impl FnMut(u64, u64) + Send,
+    idle_timeout: std::time::Duration,
+) -> Result<String, NetError> {
     let mut file = tokio::fs::File::open(path).await?;
     let size = file.metadata().await?.len();
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let (mut send, mut recv) = connection.open_bi().await?;
-    framing::write(
+    let (mut send, mut recv) = tokio::time::timeout(idle_timeout, connection.open_bi())
+        .await
+        .map_err(|_| NetError::Timeout)??;
+    let _ = send.set_priority(-1);
+    write_control(
         &mut send,
         &Control::new(Kind::FileOffer(FileOffer { name, size })),
+        idle_timeout,
     )
     .await?;
-    match framing::expect(&mut recv).await?.kind {
+    match expect_control(&mut recv, idle_timeout).await?.kind {
         Some(Kind::FileReply(reply)) if reply.accepted => {}
         Some(Kind::FileReply(reply)) => {
             return Err(NetError::Protocol(format!(
@@ -375,13 +601,15 @@ pub async fn send(
         Some(Kind::Failure(failure)) => return Err(NetError::Protocol(failure.message)),
         _ => return Err(NetError::Protocol("expected the host's answer".into())),
     }
-    let sha256 = write_bytes(&mut send, &mut file, size, progress).await?;
-    framing::write(
+    let sha256 =
+        write_bytes_with_timeout(&mut send, &mut file, size, progress, idle_timeout).await?;
+    write_control(
         &mut send,
         &Control::new(Kind::FileDone(FileDone { sha256 })),
+        idle_timeout,
     )
     .await?;
-    match framing::expect(&mut recv).await?.kind {
+    match expect_control(&mut recv, idle_timeout).await?.kind {
         Some(Kind::FileReply(reply)) if reply.accepted => Ok(reply.message),
         Some(Kind::FileReply(reply)) => Err(NetError::Protocol(reply.message)),
         _ => Err(NetError::Protocol(
@@ -399,13 +627,28 @@ fn refusal(kind: Option<Kind>, expected: &str) -> NetError {
 
 /// Client side: the entries of `path` in the host's shared folder.
 pub async fn list(connection: &quinn::Connection, path: &str) -> Result<FileListing, NetError> {
-    let (mut send, mut recv) = connection.open_bi().await?;
+    list_with_timeout(connection, path, IO_IDLE_TIMEOUT).await
+}
+
+async fn list_with_timeout(
+    connection: &quinn::Connection,
+    path: &str,
+    idle_timeout: std::time::Duration,
+) -> Result<FileListing, NetError> {
+    let (mut send, mut recv) = tokio::time::timeout(idle_timeout, connection.open_bi())
+        .await
+        .map_err(|_| NetError::Timeout)??;
     let request = FileList {
         path: path.to_string(),
     };
-    framing::write(&mut send, &Control::new(Kind::FileList(request))).await?;
+    write_control(
+        &mut send,
+        &Control::new(Kind::FileList(request)),
+        idle_timeout,
+    )
+    .await?;
     let _ = send.finish();
-    match framing::expect(&mut recv).await?.kind {
+    match expect_control(&mut recv, idle_timeout).await?.kind {
         Some(Kind::FileListing(listing)) => Ok(listing),
         other => Err(refusal(other, "the folder listing")),
     }
@@ -419,36 +662,52 @@ pub async fn fetch(
     dir: &Path,
     progress: impl FnMut(u64, u64) + Send,
 ) -> Result<PathBuf, NetError> {
-    let (mut send, mut recv) = connection.open_bi().await?;
+    fetch_with_timeout(connection, path, dir, progress, IO_IDLE_TIMEOUT).await
+}
+
+async fn fetch_with_timeout(
+    connection: &quinn::Connection,
+    path: &str,
+    dir: &Path,
+    progress: impl FnMut(u64, u64) + Send,
+    idle_timeout: std::time::Duration,
+) -> Result<PathBuf, NetError> {
+    let (mut send, mut recv) = tokio::time::timeout(idle_timeout, connection.open_bi())
+        .await
+        .map_err(|_| NetError::Timeout)??;
     let request = FileFetch {
         path: path.to_string(),
     };
-    framing::write(&mut send, &Control::new(Kind::FileFetch(request))).await?;
+    write_control(
+        &mut send,
+        &Control::new(Kind::FileFetch(request)),
+        idle_timeout,
+    )
+    .await?;
     let _ = send.finish();
-    let offer = match framing::expect(&mut recv).await?.kind {
+    let offer = match expect_control(&mut recv, idle_timeout).await?.kind {
         Some(Kind::FileOffer(offer)) => offer,
         other => return Err(refusal(other, "the file")),
     };
     let name = safe_name(&offer.name).unwrap_or_else(|| "file".into());
     tokio::fs::create_dir_all(dir).await?;
-    let partial = dir.join(format!(".{name}.casement-part"));
-    let mut file = tokio::fs::File::create(&partial).await?;
+    let (partial, mut file) = TransferTemp::create(dir).await?;
     let result = async {
-        read_bytes(&mut recv, &mut file, offer.size, progress).await?;
-        let path = unique_path(dir, &name);
-        tokio::fs::rename(&partial, &path).await?;
+        read_bytes_with_timeout(&mut recv, &mut file, offer.size, progress, idle_timeout).await?;
+        drop(file);
+        let path = partial.publish(dir, &name)?;
         Ok(path)
     }
     .await;
-    if result.is_err() {
-        let _ = tokio::fs::remove_file(&partial).await;
-    }
     result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncSeekExt;
+
+    use crate::test_support::loopback_pair;
 
     #[test]
     fn names_are_cleaned() {
@@ -482,5 +741,277 @@ mod tests {
             unique_path(dir.path(), "README"),
             dir.path().join("README (1)")
         );
+    }
+
+    #[tokio::test]
+    async fn publish_never_overwrites_and_allocates_collision_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("same.bin");
+        std::fs::write(&original, b"keep existing").unwrap();
+
+        let (temp, mut file) = TransferTemp::create(dir.path()).await.unwrap();
+        file.write_all(b"incoming").await.unwrap();
+        file.sync_all().await.unwrap();
+        drop(file);
+
+        let published = temp.publish(dir.path(), "same.bin").unwrap();
+        assert_eq!(published, dir.path().join("same (1).bin"));
+        assert_eq!(std::fs::read(&original).unwrap(), b"keep existing");
+        assert_eq!(std::fs::read(published).unwrap(), b"incoming");
+    }
+
+    #[tokio::test]
+    async fn stalled_initial_response_times_out() {
+        let (_client, _server, connection, peer) = loopback_pair().await;
+        let peer_task = tokio::spawn(async move {
+            let (_send, mut recv) = peer.accept_bi().await.unwrap();
+            assert!(read_control(&mut recv, std::time::Duration::from_secs(1))
+                .await
+                .unwrap()
+                .is_some());
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let result = fetch_with_timeout(
+            &connection,
+            "missing.bin",
+            dir.path(),
+            |_, _| {},
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(matches!(result, Err(NetError::Timeout)));
+        peer_task.await.unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stalled_listing_response_times_out() {
+        let (_client, _server, connection, peer) = loopback_pair().await;
+        let peer_task = tokio::spawn(async move {
+            let (_send, mut recv) = peer.accept_bi().await.unwrap();
+            let request = read_control(&mut recv, std::time::Duration::from_secs(1))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(request.kind, Some(Kind::FileList(_))));
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+        let result =
+            list_with_timeout(&connection, "", std::time::Duration::from_millis(100)).await;
+        assert!(matches!(result, Err(NetError::Timeout)));
+        peer_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_body_times_out_and_removes_partial_file() {
+        let (_client, _server, connection, peer) = loopback_pair().await;
+        let peer_task = tokio::spawn(async move {
+            let (mut send, mut recv) = peer.accept_bi().await.unwrap();
+            assert!(read_control(&mut recv, std::time::Duration::from_secs(1))
+                .await
+                .unwrap()
+                .is_some());
+            write_control(
+                &mut send,
+                &Control::new(Kind::FileOffer(FileOffer {
+                    name: "partial.bin".into(),
+                    size: 16,
+                })),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let result = fetch_with_timeout(
+            &connection,
+            "partial.bin",
+            dir.path(),
+            |_, _| {},
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(matches!(result, Err(NetError::Timeout)));
+        peer_task.await.unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn slow_transfer_with_regular_progress_exceeds_idle_timeout() {
+        let (_client, _server, connection, peer) = loopback_pair().await;
+        let (send, mut recv) = connection.open_bi().await.unwrap();
+        drop(send);
+        let peer_task = tokio::spawn(async move {
+            let (mut send, _recv) = peer.accept_bi().await.unwrap();
+            let hasher = Sha256::digest(b"abcd");
+            for byte in b"abcd" {
+                write_all_progress(
+                    &mut send,
+                    std::slice::from_ref(byte),
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            }
+            write_control(
+                &mut send,
+                &Control::new(Kind::FileDone(FileDone {
+                    sha256: hasher.to_vec(),
+                })),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            send.finish().unwrap();
+            let _ = send.stopped().await;
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = tokio::fs::File::create(dir.path().join("slow.bin"))
+            .await
+            .unwrap();
+        let result = read_bytes_with_timeout(
+            &mut recv,
+            &mut file,
+            4,
+            |_, _| {},
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read(dir.path().join("slow.bin")).unwrap(), b"abcd");
+        peer_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_final_upload_reply_times_out() {
+        let (_client, _server, connection, peer) = loopback_pair().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upload.bin");
+        std::fs::write(&path, b"upload").unwrap();
+        let peer_task = tokio::spawn(async move {
+            let (mut send, mut recv) = peer.accept_bi().await.unwrap();
+            let offer = read_control(&mut recv, std::time::Duration::from_secs(1))
+                .await
+                .unwrap()
+                .unwrap();
+            let size = match offer.kind.unwrap() {
+                Kind::FileOffer(offer) => offer.size,
+                other => panic!("expected file offer, got {other:?}"),
+            };
+            write_control(
+                &mut send,
+                &Control::new(Kind::FileReply(FileReply {
+                    accepted: true,
+                    message: String::new(),
+                })),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            let mut bytes = vec![0; size as usize];
+            assert!(
+                read_exact_progress(&mut recv, &mut bytes, std::time::Duration::from_secs(1),)
+                    .await
+                    .unwrap()
+            );
+            assert!(matches!(
+                read_control(&mut recv, std::time::Duration::from_secs(1))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .kind,
+                Some(Kind::FileDone(_))
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+        let result = send_with_timeout(
+            &connection,
+            &path,
+            |_, _| {},
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(matches!(result, Err(NetError::Timeout)));
+        peer_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sending_stops_at_declared_size_and_rejects_an_extra_byte() {
+        let (_client, _server, connection, peer) = loopback_pair().await;
+        let (mut send, _recv) = connection.open_bi().await.unwrap();
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (bytes_tx, bytes_rx) = tokio::sync::oneshot::channel();
+        let peer_task = tokio::spawn(async move {
+            let (_peer_send, mut peer_recv) = peer.accept_bi().await.unwrap();
+            let mut bytes = [0u8; 4];
+            assert!(read_exact_progress(
+                &mut peer_recv,
+                &mut bytes,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap());
+            bytes_tx.send(bytes).unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("growing.bin");
+        let mut bytes = b"head".to_vec();
+        bytes.resize(1024 * 1024, b'x');
+        std::fs::write(&path, bytes).unwrap();
+        let mut file = tokio::fs::File::open(path).await.unwrap();
+        let result = write_bytes_with_timeout(
+            &mut send,
+            &mut file,
+            4,
+            move |sent, total| progress_tx.send((sent, total)).unwrap(),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(result, Err(NetError::Protocol(_))));
+        assert_eq!(bytes_rx.await.unwrap(), *b"head");
+        assert_eq!(file.stream_position().await.unwrap(), 5);
+        peer_task.await.unwrap();
+        let mut progress_seen = false;
+        while let Ok((sent, total)) = progress_rx.try_recv() {
+            progress_seen = true;
+            assert!(sent <= total);
+            assert_eq!(total, 4);
+        }
+        assert!(progress_seen);
+    }
+
+    #[tokio::test]
+    async fn sending_detects_a_truncated_source() {
+        let (_client, _server, connection, peer) = loopback_pair().await;
+        let (mut send, _recv) = connection.open_bi().await.unwrap();
+        let (bytes_tx, bytes_rx) = tokio::sync::oneshot::channel();
+        let peer_task = tokio::spawn(async move {
+            let (_peer_send, mut peer_recv) = peer.accept_bi().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut buf = [0u8; 8];
+            while let Ok(Some(n)) = peer_recv.read(&mut buf).await {
+                bytes.extend_from_slice(&buf[..n]);
+            }
+            bytes_tx.send(bytes).unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.bin");
+        std::fs::write(&path, b"short").unwrap();
+        let mut file = tokio::fs::File::open(path).await.unwrap();
+        let result = write_bytes_with_timeout(
+            &mut send,
+            &mut file,
+            10,
+            |_, _| {},
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(result, Err(NetError::Protocol(_))));
+        drop(send);
+        assert_eq!(bytes_rx.await.unwrap(), b"short");
+        peer_task.await.unwrap();
     }
 }

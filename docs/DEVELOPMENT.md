@@ -47,16 +47,22 @@ scripts/check-glibc target/release/casement   # не новее glibc 2.38 (ALT 
 
 | Команда | Результат в `dist/` |
 |---|---|
-| `scripts/package-linux` | `casement-ВЕРСИЯ-linux-x86_64.tar.gz` с `install.sh` |
+| `scripts/package-linux` | самодостаточные `casement-ВЕРСИЯ-linux-x86_64.run` и `.tar.gz` |
 | `scripts/package-alt` | `casement-ВЕРСИЯ-alt1.x86_64.rpm` (rpmbuild из Debian 13, зависимости ALT в spec) |
 | `scripts/package-fedora` | `casement-ВЕРСИЯ-1.fc44.x86_64.rpm` (в контейнере Fedora 44) |
 | `scripts/package-deb` | `casement_ВЕРСИЯ_amd64.deb` (в контейнере Debian 13) |
 | `scripts/package-windows` | `casement-ВЕРСИЯ-windows-x86_64-setup.exe` (NSIS) и `-portable.zip` |
 | `flatpak-builder --user --install build-flatpak packaging/flatpak/io.github.cheviiot.Casement.yml` | Flatpak |
-| `scripts/install-user` | ставит текущую сборку себе в `~/.local` |
+| `scripts/install-user` | ставит текущую сборку в `~/.local/opt/casement` |
 
-Пакеты Linux берут готовую `cargo build --release`: программы одни и те же, а
-зависимости каждый пакет вычисляет на своём дистрибутиве. `package-windows` сам
+Универсальный Linux-установщик хранит приложение, GTK, Libadwaita, GStreamer, плагины и
+динамический загрузчик в собственном каталоге `~/.local/opt/casement`. Версии лежат в
+`versions/`, а `current` переключается атомарно. В стандартные XDG-каталоги попадают
+только ярлык, значок, AppStream metadata и пользовательская служба systemd. Проверка
+установки в полностью отдельный профиль — `scripts/dev/test-linux-run`.
+
+Дистрибутивные пакеты Linux берут готовую `cargo build --release`: программы одни и те
+же, а зависимости каждый пакет вычисляет на своём дистрибутиве. `package-windows` сам
 собирает `x86_64-pc-windows-gnu`, кладёт рядом все DLL, плагины GStreamer, схемы и
 значки и делает из этого установщик (`packaging/windows/casement.nsi`) и архив.
 Значок встраивается в `.exe` при сборке (`packaging/windows/icon.rs`).
@@ -64,7 +70,7 @@ scripts/check-glibc target/release/casement   # не новее glibc 2.38 (ALT 
 ## CI и релизы
 
 `.github/workflows/build.yml` на каждый push и pull request проверяет форматирование,
-clippy и тесты, собирает архив Linux, пакеты ALT, Fedora и Debian, установщик Windows и
+clippy и тесты, собирает `.run` и архив Linux, пакеты ALT, Fedora и Debian, установщик Windows и
 Flatpak. Тег `vX.Y.Z` (совпадающий с версией в `Cargo.toml`) после тех же шагов
 публикует релиз со всеми пакетами, `install.sh` и `SHA256SUMS`:
 
@@ -76,18 +82,45 @@ git tag v0.1.0 && git push origin v0.1.0
 
 - `scripts/dev/ui-check OUT.png [СТРАНИЦА]` — снимок окна под headless Broadway, ничего
   не появляется на экране. Список страниц — в начале скрипта.
+- `scripts/dev/test-ui` — проверка навигации, форм, сохранения, отмены подключения и
+  курсора через настоящие GTK-сигналы в отдельном Broadway. Профиль одноразовый;
+  клавиатурные и мышиные события операционной системы не посылаются. Нужна debug-сборка.
+- `scripts/dev/test-ui-live` — настоящий QUIC loopback и H.264 от `videotestsrc`,
+  файловый браузер, скачивание, выбор нескольких файлов, последовательная отправка и
+  переключение монитора. Проверяет отмену скачивания в процессе и уход со страницы
+  с удалением частичного файла. Профили, общая папка и «Загрузки» отдельные; захвата рабочего
+  стола и системного ввода нет. Нужны debug-сборка приложения и `openh264enc` либо `x264enc`.
+- `CASEMENT_DECODER='identity sleep-time=100000 ! openh264dec ! videoconvert' scripts/dev/test-ui-live`
+  проверяет те же действия при намеренно медленном декодере (около 10 кадров/с при
+  источнике 30 кадров/с). Это проверка восстановления, не измерение задержки LAN.
+- `CASEMENT_WINDOW_WIDTH=400 CASEMENT_WINDOW_HEIGHT=640 scripts/dev/ui-check …` —
+  узкое окно; `ADW_DEBUG_COLOR_SCHEME=prefer-dark` — тёмная тема. Режим снимка не
+  запускает и не перенастраивает фоновую службу.
 - `scripts/dev/screenshots` — картинки для README в `docs/images`: каждая страница с
   выдуманными компьютерами, левая половина в светлом оформлении, правая в тёмном.
 - `casement-cli listen` на одной машине и `casement-cli connect АДРЕС --record a.h264
   --wiggle` на другой: вход, запись экрана, движение указателя. `--latency N` меряет
   задержку от движения до кадра, `--audio N` — звук, `--clipboard` — буфер обмена.
 - `casement-cli decode-bench a.h264` сравнивает способы декодирования на этой машине.
+- `cargo run -p casement-net --example route_probe -- CONFIG_DIR FINGERPRINT NAME
+  LAN_IP:PORT --screen` проверяет автоматический переход со старой LAN-записи на
+  Tailscale, вход, RTT и получение первого кадра. Нужен уже доверенный device key;
+  ввод и тестовые окна не создаются. Запускать бинарник на хосте, где доступен
+  локальный `tailscale` (в контейнере его обычно нет).
 - На Windows процессы из SSH живут в сеансе 0 без рабочего стола: хост для проверки
   запускается задачей планировщика в интерактивном сеансе пользователя.
+
+Для проверки Windows GTK без перезагрузки `oriel-dev` содержит Wine 11.20, Xvfb и
+`wine-ldap` (`podman exec --user root oriel-dev dnf -y install wine-ldap`). Последний
+пакет нужен для `WLDAP32.dll` в цепочке GTK/AppStream; без него приложение завершается
+до запуска интерфейса. Использовать только отдельный `WINEPREFIX` и виртуальный display.
+Первое создание префикса может продолжаться после возврата команды; проверять его
+процессы перед повтором. Wine пригоден для проверки переходов и native cursor через
+XFixes, но его шрифты и тени не дают надёжной визуальной проверки Windows.
 
 ## Что дальше
 
 - Передача кадра в окно без копирования (DMABuf): нужна проверка на живом Wayland.
 - Курсор метаданными, а не в картинке, — меньше задержка указателя.
-- Экран входа в систему: системная служба на Windows, отдельный путь на Linux.
+- Экран входа в систему на Linux; системная служба Windows уже реализована.
 - Пакет ALT в репозиторий дистрибутива (gear/hasher), подпись Windows-программ.

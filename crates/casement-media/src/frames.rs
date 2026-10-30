@@ -1,6 +1,9 @@
 //! Encoded frames from an appsink to the network, on any system.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -10,11 +13,13 @@ use gstreamer_video as gst_video;
 use casement_net::screen::EncodedFrame;
 
 /// Frames in flight between the encoder and the network before we start dropping.
-pub(crate) const QUEUE: usize = 6;
+/// Two access units absorb normal scheduler jitter without retaining a visible video tail.
+pub(crate) const QUEUE: usize = 2;
 
 pub(crate) fn pull_frames(
     sink: gst_app::AppSink,
     frames: tokio::sync::mpsc::Sender<EncodedFrame>,
+    overflow: Arc<AtomicBool>,
     size: tokio::sync::oneshot::Sender<(u32, u32)>,
 ) {
     let mut size = Some(size);
@@ -39,11 +44,8 @@ pub(crate) fn pull_frames(
             }
         }
         let keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
-        if need_keyframe.load(Ordering::Relaxed) {
-            if !keyframe {
-                continue;
-            }
-            need_keyframe.store(false, Ordering::Relaxed);
+        if need_keyframe.load(Ordering::Relaxed) && !keyframe {
+            continue;
         }
         let Ok(map) = buffer.map_readable() else {
             continue;
@@ -54,9 +56,15 @@ pub(crate) fn pull_frames(
             data: map.as_slice().to_vec(),
         };
         match frames.try_send(frame) {
-            Ok(()) => {}
+            Ok(()) => {
+                if keyframe {
+                    need_keyframe.store(false, Ordering::Relaxed);
+                }
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                // The network fell behind: skip to the next keyframe and ask for it now.
+                // The network fell behind: the consumer clears stale queued frames and
+                // waits for a new keyframe; skip deltas here and ask the encoder now.
+                overflow.store(true, Ordering::Release);
                 need_keyframe.store(true, Ordering::Relaxed);
                 let event = gst_video::UpstreamForceKeyUnitEvent::builder()
                     .all_headers(true)

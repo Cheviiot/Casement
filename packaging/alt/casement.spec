@@ -24,6 +24,8 @@ Source3: io.github.cheviiot.Casement.desktop
 Source4: io.github.cheviiot.Casement.svg
 Source5: casement-host.service
 Source6: io.github.cheviiot.Casement.metainfo.xml
+Source7: casement-os-icons.tar.gz
+Source8: LICENSE.devicon
 
 # Linked libraries (the binaries need glibc 2.38 or older, checked by check-glibc).
 Requires: glibc-core >= 2.38
@@ -54,9 +56,11 @@ install -Dm755 %{SOURCE1} %{buildroot}%{_bindir}/casement-host
 install -Dm755 %{SOURCE2} %{buildroot}%{_bindir}/casement-cli
 install -Dm644 %{SOURCE3} %{buildroot}%{_datadir}/applications/io.github.cheviiot.Casement.desktop
 install -Dm644 %{SOURCE4} %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/io.github.cheviiot.Casement.svg
+tar -xzf %{SOURCE7} -C %{buildroot}%{_datadir}/icons/hicolor/scalable/apps
 sed 's|@BINDIR@|%{_bindir}|' %{SOURCE5} > casement-host.service
 install -Dm644 casement-host.service %{buildroot}/usr/lib/systemd/user/casement-host.service
 install -Dm644 %{SOURCE6} %{buildroot}%{_datadir}/metainfo/io.github.cheviiot.Casement.metainfo.xml
+install -Dm644 %{SOURCE8} %{buildroot}%{_datadir}/licenses/%{name}/LICENSE.devicon
 
 
 %post
@@ -74,6 +78,8 @@ fi
 %{_bindir}/casement-cli
 %{_datadir}/applications/io.github.cheviiot.Casement.desktop
 %{_datadir}/icons/hicolor/scalable/apps/io.github.cheviiot.Casement.svg
+%{_datadir}/icons/hicolor/scalable/apps/casement-os-*.svg
+/usr/share/licenses/%{name}/LICENSE.devicon
 /usr/lib/systemd/user/casement-host.service
 %{_datadir}/metainfo/io.github.cheviiot.Casement.metainfo.xml
 

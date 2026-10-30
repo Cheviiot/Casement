@@ -5,9 +5,9 @@
 # (cargo build) and ImageMagick in oriel-dev.
 set -e
 cd "$(dirname "$0")/../.."
-work=_scratch/screenshots
-rm -rf "$work" && mkdir -p "$work/config"
-cp _scratch/cfg/device.key "$work/config/" 2>/dev/null || true
+mkdir -p _scratch
+work=$(mktemp -d _scratch/screenshots.XXXXXX)
+mkdir -p "$work/config"
 key_a=$(printf 'a%.0s' $(seq 64))
 key_b=$(printf 'b%.0s' $(seq 64))
 cat > "$work/config/connections.ini" <<INI
@@ -24,6 +24,8 @@ fingerprint=$key_b
 [media]
 name=Медиацентр
 host=192.168.1.40
+fingerprint=$(printf 'c%.0s' $(seq 64))
+last-connected=1793196000
 INI
 
 # PAGE (ui-check) and the image it becomes.
@@ -35,7 +37,7 @@ for shot in "home:" "computer:computer"; do
             BROADWAY_DISPLAY_NUMBER=7 scripts/dev/ui-check "$work/$name-$scheme.png" $page \
             >/dev/null 2>&1
     done
-    podman exec --user "$(id -un)" -w "$PWD" oriel-dev sh -ec "
+    podman exec --user "$(id -un)" -w "$PWD" -e MAGICK_THREAD_LIMIT=2 oriel-dev ionice -c 3 nice -n 19 sh -ec "
         light=$work/$name-prefer-light.png dark=$work/$name-prefer-dark.png
         w=\$(magick identify -format %w \"\$light\"); h=\$(magick identify -format %h \"\$light\")
         half=\$((w / 2))
@@ -52,4 +54,4 @@ for shot in "home:" "computer:computer"; do
             -strip -define png:compression-level=9 docs/images/$name.png"
     echo "docs/images/$name.png"
 done
-rm -rf "$work"
+rm -r "$work"

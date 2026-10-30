@@ -20,10 +20,13 @@ install -Dm644 data/io.github.cheviiot.Casement.desktop \
     "$pkg/usr/share/applications/io.github.cheviiot.Casement.desktop"
 install -Dm644 data/io.github.cheviiot.Casement.svg \
     "$pkg/usr/share/icons/hicolor/scalable/apps/io.github.cheviiot.Casement.svg"
+install -Dm644 -t "$pkg/usr/share/icons/hicolor/scalable/apps" \
+    data/icons/hicolor/scalable/apps/*.svg
 mkdir -p "$pkg/usr/lib/systemd/user"
 sed 's|@BINDIR@|/usr/bin|' data/casement-host.service > "$pkg/usr/lib/systemd/user/casement-host.service"
 install -Dm644 data/io.github.cheviiot.Casement.metainfo.xml "$pkg/usr/share/metainfo/io.github.cheviiot.Casement.metainfo.xml"
 install -Dm644 LICENSE "$pkg/usr/share/doc/casement/copyright"
+install -Dm644 data/icons/LICENSE.devicon "$pkg/usr/share/doc/casement/LICENSE.devicon"
 
 # dpkg-shlibdeps wants a debian/control next to it.
 mkdir -p "$root/debian"

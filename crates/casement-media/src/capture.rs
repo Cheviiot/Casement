@@ -12,6 +12,7 @@ use casement_net::screen::{EncodedFrame, ScreenControl, ScreenEvent, ScreenStrea
 use casement_proto::{input, Input};
 
 use crate::frames::{pull_frames, QUEUE};
+use crate::input_queue::{self, Command};
 use crate::mutter;
 
 /// Text types offered and accepted on the host's clipboard, best first.
@@ -125,29 +126,29 @@ fn converter(encoder: &str) -> &'static str {
     }
 }
 
-/// Low latency everywhere: no B-frames, a keyframe at least every 2 s at 60 fps.
-fn encoder_description(name: &str) -> String {
+/// Low latency everywhere: no B-frames, a keyframe at least every second at 60 fps.
+fn encoder_description(name: &str, requested_bitrate_kbps: u32) -> String {
+    let bitrate = crate::bitrate::initial(requested_bitrate_kbps);
     match name {
-        "vah264enc" => {
-            "vah264enc rate-control=cbr bitrate=20000 key-int-max=120 b-frames=0 target-usage=6"
-                .into()
-        }
-        "openh264enc" => {
-            "openh264enc bitrate=12000000 rate-control=bitrate gop-size=120 complexity=low".into()
-        }
-        _ => "x264enc tune=zerolatency speed-preset=ultrafast bitrate=12000 key-int-max=120".into(),
+        "vah264enc" => format!(
+            "vah264enc name=encoder rate-control=cbr bitrate={bitrate} key-int-max=60 b-frames=0 target-usage=6"
+        ),
+        "openh264enc" => format!(
+            "openh264enc name=encoder bitrate={} rate-control=bitrate gop-size=60 complexity=low",
+            bitrate.saturating_mul(1000)
+        ),
+        _ => format!(
+            "x264enc name=encoder tune=zerolatency speed-preset=ultrafast bitrate={bitrate} key-int-max=60"
+        ),
     }
-}
-
-enum Command {
-    Input(Input),
-    Clipboard(String),
 }
 
 struct Control {
     pipeline: gst::Pipeline,
     sink: gst_app::AppSink,
-    input: tokio::sync::mpsc::UnboundedSender<Command>,
+    encoder: gst::Element,
+    encoder_name: &'static str,
+    input: input_queue::Sender,
     clipboard_task: tokio::task::AbortHandle,
 }
 
@@ -160,11 +161,15 @@ impl ScreenControl for Control {
     }
 
     fn input(&self, input: Input) {
-        let _ = self.input.send(Command::Input(input));
+        self.input.send(Command::Input(input));
+    }
+
+    fn set_bitrate(&self, bitrate_kbps: u32) -> bool {
+        crate::bitrate::set(&self.encoder, self.encoder_name, bitrate_kbps)
     }
 
     fn clipboard(&self, text: String) {
-        let _ = self.input.send(Command::Clipboard(text));
+        self.input.send(Command::Clipboard(text));
     }
 
     fn resize(&self, width: u32, height: u32) {
@@ -185,6 +190,7 @@ impl ScreenControl for Control {
 
 impl Drop for Control {
     fn drop(&mut self) {
+        self.input.close();
         let _ = self.pipeline.set_state(gst::State::Null);
         self.clipboard_task.abort();
     }
@@ -193,50 +199,66 @@ impl Drop for Control {
 /// Applies input in order; ends the Mutter session when the sender goes away.
 async fn input_loop(
     session: Arc<mutter::Session>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Command>,
+    mut rx: input_queue::Receiver,
     clipboard: Arc<std::sync::Mutex<String>>,
+    events: tokio::sync::mpsc::UnboundedSender<ScreenEvent>,
 ) {
     let (mut scroll_x, mut scroll_y) = (0.0f64, 0.0f64);
     while let Some(command) = rx.recv().await {
-        let event = match command {
-            Command::Input(event) => event,
-            Command::Clipboard(text) => {
-                *clipboard.lock().unwrap() = text;
-                if let Err(e) = session.set_selection(TEXT_TYPES).await {
-                    tracing::warn!("clipboard: {e}");
+        let result = rx
+            .until_closed(tokio::time::timeout(Duration::from_secs(1), async {
+                match command {
+                    Command::Clipboard(text) => {
+                        *clipboard.lock().unwrap() = text;
+                        session
+                            .set_selection(TEXT_TYPES)
+                            .await
+                            .map_err(|e| format!("clipboard: {e}"))
+                    }
+                    Command::Input(event) => {
+                        let result = match event.kind {
+                            Some(input::Kind::Motion(m)) => session.pointer_motion(m.x, m.y).await,
+                            Some(input::Kind::Button(b)) => {
+                                session.pointer_button(b.button as i32, b.pressed).await
+                            }
+                            Some(input::Kind::Key(k)) => session.key(k.code, k.pressed).await,
+                            Some(input::Kind::Scroll(s)) => {
+                                // Mutter takes whole wheel steps; keep the remainder for next time.
+                                scroll_x += s.dx;
+                                scroll_y += s.dy;
+                                let (sx, sy) = (scroll_x.trunc(), scroll_y.trunc());
+                                scroll_x -= sx;
+                                scroll_y -= sy;
+                                let mut result = Ok(());
+                                if sy != 0.0 {
+                                    result = session.scroll_discrete(0, sy as i32).await;
+                                }
+                                if sx != 0.0 && result.is_ok() {
+                                    result = session.scroll_discrete(1, sx as i32).await;
+                                }
+                                result
+                            }
+                            None => Ok(()),
+                        };
+                        result.map_err(|e| format!("input: {e}"))
+                    }
                 }
-                continue;
+            }))
+            .await;
+        match result {
+            None => break,
+            Some(Err(_)) => {
+                tracing::warn!("input: Mutter call timed out after 1 s");
+                break;
             }
-        };
-        let result = match event.kind {
-            Some(input::Kind::Motion(m)) => session.pointer_motion(m.x, m.y).await,
-            Some(input::Kind::Button(b)) => {
-                session.pointer_button(b.button as i32, b.pressed).await
-            }
-            Some(input::Kind::Key(k)) => session.key(k.code, k.pressed).await,
-            Some(input::Kind::Scroll(s)) => {
-                // Mutter takes whole wheel steps here; keep the remainder for the next event.
-                scroll_x += s.dx;
-                scroll_y += s.dy;
-                let (sx, sy) = (scroll_x.trunc(), scroll_y.trunc());
-                scroll_x -= sx;
-                scroll_y -= sy;
-                let mut result = Ok(());
-                if sy != 0.0 {
-                    result = session.scroll_discrete(0, sy as i32).await;
-                }
-                if sx != 0.0 && result.is_ok() {
-                    result = session.scroll_discrete(1, sx as i32).await;
-                }
-                result
-            }
-            None => Ok(()),
-        };
-        if let Err(e) = result {
-            tracing::warn!("input: {e}");
+            Some(Ok(Err(error))) => tracing::warn!("{error}"),
+            Some(Ok(Ok(()))) => {}
         }
     }
-    session.stop().await;
+    // Timeout/overflow ends the whole shared screen, so the network drops Control
+    // and its clipboard task as well. A live video with dead input is not a session.
+    let _ = events.send(ScreenEvent::Ended("desktop input stopped".into()));
+    let _ = tokio::time::timeout(Duration::from_secs(2), session.stop()).await;
 }
 
 /// A sensible virtual monitor for a client asking `width` x `height`: even sides within
@@ -255,13 +277,14 @@ pub fn virtual_size(width: u32, height: u32) -> (u32, u32) {
 pub async fn start(
     session: mutter::Session,
     virtual_size: Option<(u32, u32)>,
+    bitrate_kbps: u32,
 ) -> Result<ScreenStream, String> {
     let session = Arc::new(session);
     let encoder = encoder_name().ok_or("no H.264 encoder")?;
     let description = format!(
-        "pipewiresrc path={} do-timestamp=true keepalive-time=500 {}! {} ! {} \
+        "pipewiresrc path={} do-timestamp=true keepalive-time=0 min-buffers=1 max-buffers=2 {}! {} ! {} \
          ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au \
-         ! appsink name=sink sync=false max-buffers=8 drop=false",
+         ! appsink name=sink sync=false max-buffers={} drop=false",
         session.node_id,
         // A virtual monitor takes the size its consumer negotiates.
         virtual_size
@@ -270,7 +293,8 @@ pub async fn start(
             ))
             .unwrap_or_default(),
         converter(encoder),
-        encoder_description(encoder)
+        encoder_description(encoder, bitrate_kbps),
+        QUEUE
     );
     tracing::info!("capture: {description}");
     let pipeline = gst::parse::launch(&description)
@@ -281,15 +305,23 @@ pub async fn start(
         .by_name("sink")
         .and_then(|e| e.downcast::<gst_app::AppSink>().ok())
         .ok_or("no appsink")?;
+    let encoder_element = pipeline.by_name("encoder").ok_or("no encoder element")?;
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (input_tx, input_rx) = input_queue::channel();
     let clipboard = Arc::new(std::sync::Mutex::new(String::new()));
-    tokio::spawn(input_loop(session.clone(), input_rx, clipboard.clone()));
     let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(input_loop(
+        session.clone(),
+        input_rx,
+        clipboard.clone(),
+        events_tx.clone(),
+    ));
     let clipboard_task = tokio::spawn(clipboard_loop(session.clone(), clipboard, events_tx));
     let control = Control {
         pipeline: pipeline.clone(),
         sink: sink.clone(),
+        encoder: encoder_element,
+        encoder_name: encoder,
         input: input_tx,
         clipboard_task: clipboard_task.abort_handle(),
     };
@@ -299,11 +331,13 @@ pub async fn start(
         .map_err(|e| format!("cannot start capture: {e}"))?;
 
     let (frames_tx, frames) = tokio::sync::mpsc::channel::<EncodedFrame>(QUEUE);
+    let frame_overflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (size_tx, size_rx) = tokio::sync::oneshot::channel::<(u32, u32)>();
     let puller = sink.clone();
+    let overflow = frame_overflow.clone();
     std::thread::Builder::new()
         .name("casement-capture".into())
-        .spawn(move || pull_frames(puller, frames_tx, size_tx))
+        .spawn(move || pull_frames(puller, frames_tx, overflow, size_tx))
         .map_err(|e| e.to_string())?;
 
     let (width, height) = match tokio::time::timeout(Duration::from_secs(10), size_rx).await {
@@ -321,9 +355,11 @@ pub async fn start(
         height,
         codec: "h264".into(),
         frames,
+        frame_overflow,
         control: Box::new(control),
         events: Some(events),
         monitors,
         monitor,
+        cursor_embedded: virtual_size.is_none(),
     })
 }

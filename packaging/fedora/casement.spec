@@ -18,6 +18,8 @@ Source4:        io.github.cheviiot.Casement.svg
 Source5:        casement-host.service
 Source6:        LICENSE
 Source7:        io.github.cheviiot.Casement.metainfo.xml
+Source8:        casement-os-icons.tar.gz
+Source9:        LICENSE.devicon
 
 # Loaded at run time, so not found from the binaries: capture, encoding, decoding and
 # playback plugins, and the PipeWire source for the screen.
@@ -39,10 +41,12 @@ install -Dm755 %{SOURCE1} %{buildroot}%{_bindir}/casement-host
 install -Dm755 %{SOURCE2} %{buildroot}%{_bindir}/casement-cli
 install -Dm644 %{SOURCE3} %{buildroot}%{_datadir}/applications/io.github.cheviiot.Casement.desktop
 install -Dm644 %{SOURCE4} %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/io.github.cheviiot.Casement.svg
+tar -xzf %{SOURCE8} -C %{buildroot}%{_datadir}/icons/hicolor/scalable/apps
 sed 's|@BINDIR@|%{_bindir}|' %{SOURCE5} > casement-host.service
 install -Dm644 casement-host.service %{buildroot}%{_userunitdir}/casement-host.service
 install -Dm644 %{SOURCE6} %{buildroot}%{_licensedir}/%{name}/LICENSE
 install -Dm644 %{SOURCE7} %{buildroot}%{_metainfodir}/io.github.cheviiot.Casement.metainfo.xml
+install -Dm644 %{SOURCE9} %{buildroot}%{_licensedir}/%{name}/LICENSE.devicon
 
 
 %post
@@ -56,11 +60,13 @@ fi
 
 %files
 %license %{_licensedir}/%{name}/LICENSE
+%license %{_licensedir}/%{name}/LICENSE.devicon
 %{_bindir}/casement
 %{_bindir}/casement-host
 %{_bindir}/casement-cli
 %{_datadir}/applications/io.github.cheviiot.Casement.desktop
 %{_datadir}/icons/hicolor/scalable/apps/io.github.cheviiot.Casement.svg
+%{_datadir}/icons/hicolor/scalable/apps/casement-os-*.svg
 %{_userunitdir}/casement-host.service
 %{_metainfodir}/io.github.cheviiot.Casement.metainfo.xml
 

@@ -87,32 +87,38 @@ impl Identity {
         })?;
         let path = dir.join(KEY_FILE);
         match fs::read(&path) {
-            Ok(bytes) => {
-                let seed: [u8; SEED_LEN] =
-                    bytes
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| IdentityError::Damaged {
-                            path: path.clone(),
-                            found: bytes.len(),
-                        })?;
-                Ok(Self {
-                    key: SigningKey::from_bytes(&seed),
-                    path,
-                })
-            }
+            Ok(bytes) => Self::from_bytes(path, &bytes),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 let key = SigningKey::generate(&mut OsRng);
-                crate::files::write_private(&path, key.as_bytes()).map_err(|source| {
+                match crate::files::write_private_new(&path, key.as_bytes()).map_err(|source| {
                     IdentityError::Write {
                         path: path.clone(),
                         source,
                     }
-                })?;
-                Ok(Self { key, path })
+                })? {
+                    true => Ok(Self { key, path }),
+                    false => {
+                        let bytes = fs::read(&path).map_err(|source| IdentityError::Read {
+                            path: path.clone(),
+                            source,
+                        })?;
+                        Self::from_bytes(path, &bytes)
+                    }
+                }
             }
             Err(source) => Err(IdentityError::Read { path, source }),
         }
+    }
+
+    fn from_bytes(path: PathBuf, bytes: &[u8]) -> Result<Self, IdentityError> {
+        let seed: [u8; SEED_LEN] = bytes.try_into().map_err(|_| IdentityError::Damaged {
+            path: path.clone(),
+            found: bytes.len(),
+        })?;
+        Ok(Self {
+            key: SigningKey::from_bytes(&seed),
+            path,
+        })
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
@@ -160,6 +166,50 @@ mod tests {
         let err = Identity::load_or_create(dir.path()).err().unwrap();
         assert!(matches!(err, IdentityError::Damaged { found: 5, .. }));
         assert_eq!(fs::read(dir.path().join(KEY_FILE)).unwrap(), b"short");
+    }
+
+    #[test]
+    fn concurrent_initializers_return_the_published_key() {
+        use std::sync::{Arc, Barrier};
+
+        const INITIALIZERS: usize = 4;
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = Arc::new(Barrier::new(INITIALIZERS));
+        let handles: Vec<_> = (0..INITIALIZERS)
+            .map(|_| {
+                let dir = dir.path().to_owned();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Identity::load_or_create(&dir).unwrap().fingerprint()
+                })
+            })
+            .collect();
+        let fingerprints: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(fingerprints
+            .iter()
+            .all(|fingerprint| *fingerprint == fingerprints[0]));
+        let disk_key = fs::read(dir.path().join(KEY_FILE)).unwrap();
+        let key: [u8; SEED_LEN] = disk_key.as_slice().try_into().unwrap();
+        assert_eq!(
+            Fingerprint::of(&SigningKey::from_bytes(&key).verifying_key()),
+            fingerprints[0]
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(dir.path().join(KEY_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]

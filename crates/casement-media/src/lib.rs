@@ -5,9 +5,13 @@
 
 mod audio;
 pub mod autostart;
+mod bitrate;
 #[cfg(target_os = "linux")]
 mod capture;
 mod frames;
+#[cfg(target_os = "linux")]
+mod input_queue;
+pub mod keyboard;
 #[cfg(target_os = "linux")]
 mod mutter;
 mod opus;
@@ -59,7 +63,7 @@ impl ScreenProvider for GnomeScreen {
             let session = mutter::Session::start(virtual_size, &request.monitor)
                 .await
                 .map_err(|e| format!("GNOME screen sharing: {e}"))?;
-            capture::start(session, virtual_size).await
+            capture::start(session, virtual_size, request.bitrate_kbps).await
         })
     }
 }

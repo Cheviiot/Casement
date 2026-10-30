@@ -1,6 +1,6 @@
 #!/bin/sh
-# Installs this checkout's release build for the current user, as the release archive's
-# installer does: build with cargo build --release first.
+# Installs this checkout's release build into ~/.local/opt/casement, as the release
+# installer does. Build release binaries first.
 set -e
 cd "$(dirname "$0")/.."
 scripts/package-linux >/dev/null

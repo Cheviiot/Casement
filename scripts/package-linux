@@ -1,23 +1,215 @@
 #!/bin/sh
-# Packs the release build (cargo build --release) with its desktop files and the
-# installer into dist/casement-VERSION-linux-x86_64.tar.gz.
-set -e
+# Builds the transparent portable archive and the single-file .run installer. Both carry
+# their own GTK, Libadwaita, GStreamer and glibc runtime and install into
+# ~/.local/opt/casement without root privileges.
+set -eu
 cd "$(dirname "$0")/.."
+
 version=$(scripts/version)
 name=casement-$version-linux-x86_64
 stage=build/linux/$name
-rm -rf build/linux && mkdir -p "$stage/bin" "$stage/share/applications" \
-    "$stage/share/icons/hicolor/scalable/apps" "$stage/share/casement" "$stage/share/metainfo"
-for b in casement casement-host casement-cli; do
-    scripts/check-glibc "target/release/$b"
-    install -m 755 "target/release/$b" "$stage/bin/"
+app=$stage/app
+scratch=build/linux/.package
+plugins=$app/lib/gstreamer-1.0
+
+# Never publish whatever happens to be left in target/release from an earlier run.
+# CI normally has a warm release build, while local packaging must be correct on its own.
+"${CARGO:-cargo}" build --release -j "${JOBS:-4}"
+
+rm -rf build/linux
+mkdir -p "$app/bin" "$app/lib" "$app/libexec/casement" "$plugins" \
+    "$app/share/applications" "$app/share/icons/hicolor/scalable/apps" \
+    "$app/share/metainfo" "$app/share/casement" "$stage/share/applications" \
+    "$stage/share/icons/hicolor/scalable/apps" "$stage/share/metainfo" \
+    "$stage/share/casement" "$scratch"
+install -m 755 packaging/linux/runtime-exec.sh "$app/libexec/casement-runtime"
+
+owners=$scratch/owners
+: > "$owners"
+record_owner() {
+    owner=$(rpm -qf --qf '%{NAME}\n' "$1" 2>/dev/null | sort -u | head -1 || true)
+    [ -z "$owner" ] || grep -qxF "$owner" "$owners" 2>/dev/null || printf '%s\n' "$owner" >> "$owners"
+}
+
+# Real programs are private; the public launchers select this runtime's dynamic loader.
+for program in casement casement-host casement-cli; do
+    scripts/check-glibc "target/release/$program"
+    install -m 755 "target/release/$program" "$app/libexec/casement/$program"
+    install -m 755 packaging/linux/launcher.sh "$app/bin/$program"
 done
+
+plugin_dir=$(pkg-config --variable=pluginsdir gstreamer-1.0)
+required_plugins='coreelements app videoconvertscale videoparsersbad audioconvert audioresample opus opusparse autodetect volume playback typefindfunctions gtk4 openh264'
+optional_plugins='va pipewire pulseaudio'
+for plugin in $required_plugins $optional_plugins; do
+    source=$plugin_dir/libgst$plugin.so
+    if [ ! -f "$source" ]; then
+        case " $required_plugins " in
+            *" $plugin "*) echo "Required GStreamer plugin is missing: $source" >&2; exit 1 ;;
+            *) echo "Optional GStreamer plugin is missing: $plugin" >&2; continue ;;
+        esac
+    fi
+    install -m 755 "$source" "$plugins/"
+    record_owner "$source"
+done
+
+# Helpers are ELF programs too, so a tiny shell launcher starts each through our loader.
+scanner=$(find /usr/libexec /usr/lib64 -type f -name gst-plugin-scanner -print 2>/dev/null | head -1)
+[ -n "$scanner" ] || { echo "gst-plugin-scanner not found" >&2; exit 1; }
+mkdir -p "$app/libexec/gstreamer-1.0"
+install -m 755 "$scanner" "$app/libexec/gstreamer-1.0/gst-plugin-scanner.real"
+install -m 755 packaging/linux/helper-launcher.sh "$app/libexec/gstreamer-1.0/gst-plugin-scanner"
+record_owner "$scanner"
+
+if [ -d /usr/libexec/glycin-loaders ] && [ -d /usr/share/glycin-loaders ]; then
+    mkdir -p "$app/libexec/glycin-loaders" "$app/share/glycin-loaders"
+    cp -a /usr/share/glycin-loaders/. "$app/share/glycin-loaders/"
+    find "$app/share/glycin-loaders" -type f -name '*.conf' -exec \
+        sed -i 's|Exec=/usr/libexec/glycin-loaders|Exec=@APPROOT@/current/libexec/glycin-loaders|g' {} +
+    find /usr/libexec/glycin-loaders -type f -perm /111 | while IFS= read -r helper; do
+        relative=${helper#/usr/libexec/glycin-loaders/}
+        mkdir -p "$app/libexec/glycin-loaders/$(dirname "$relative")"
+        install -m 755 "$helper" "$app/libexec/glycin-loaders/$relative.real"
+        install -m 755 packaging/linux/helper-launcher.sh "$app/libexec/glycin-loaders/$relative"
+        record_owner "$helper"
+    done
+fi
+
+# Dconf gives the private GLib runtime normal desktop settings while still allowing the
+# host's other GIO modules through their standard compiled-in paths.
+for module in /usr/lib64/gio/modules/libdconfsettings.so /usr/lib/gio/modules/libdconfsettings.so; do
+    [ -f "$module" ] || continue
+    mkdir -p "$app/lib/gio/modules"
+    install -m 755 "$module" "$app/lib/gio/modules/"
+    record_owner "$module"
+done
+
+# Collect the transitive ELF closure. Supplying our own loader makes the Fedora-built
+# runtime usable on systems with older glibc; external GPU drivers remain loadable from
+# the host because the loader's normal system search paths stay enabled.
+todo=$(find "$app/libexec" "$plugins" "$app/lib/gio" -type f \( -perm /111 -o -name '*.so' \) 2>/dev/null | tr '\n' ' ')
+seen=' '
+while [ -n "$todo" ]; do
+    set -- $todo
+    file=$1
+    shift
+    todo="$*"
+    case "$seen" in *" $file "*) continue ;; esac
+    seen="$seen$file "
+    dependencies=$(ldd "$file" 2>/dev/null | awk '
+        $2 == "=>" && $3 ~ /^\// { print $3 }
+        $1 ~ /^\// { print $1 }
+    ' | sort -u)
+    for source in $dependencies; do
+        basename=$(basename "$source")
+        # Fontconfig is a stable desktop ABI whose parser must match the host's config.
+        # Keeping it with the system also keeps locally installed fonts and aliases.
+        [ "$basename" = libfontconfig.so.1 ] && continue
+        destination=$app/lib/$basename
+        if [ ! -f "$destination" ]; then
+            cp -L "$source" "$destination"
+            chmod 755 "$destination"
+            todo="$todo $destination"
+            record_owner "$source"
+        fi
+    done
+done
+
+# Keep glibc separate. A compatible host loader is preferable for proprietary and Mesa
+# drivers; the private loader remains the compatibility path for older distributions.
+mkdir -p "$app/lib/glibc"
+for library in ld-linux-x86-64.so.2 libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 \
+    librt.so.1 libresolv.so.2 libutil.so.1 libanl.so.1 libBrokenLocale.so.1; do
+    [ -e "$app/lib/$library" ] || continue
+    mv "$app/lib/$library" "$app/lib/glibc/"
+done
+getconf GNU_LIBC_VERSION | awk '{print $2}' > "$app/lib/glibc/VERSION"
+test -x "$app/lib/glibc/ld-linux-x86-64.so.2"
+
+# Graphics and VA libraries must match the distribution's driver. A new-enough host uses
+# its own copies; the private compatibility loader gets these bundled fallbacks.
+mkdir -p "$app/lib/platform"
+for library in libEGL.so.1 libGL.so.1 libGLX.so.0 libGLdispatch.so.0 libOpenGL.so.0 \
+    libgbm.so.1 libdrm.so.2 libdrm_amdgpu.so.1 libdrm_intel.so.1 \
+    libdrm_nouveau.so.2 libdrm_radeon.so.1 libva.so.2 libva-drm.so.2 \
+    libva-wayland.so.2 libva-x11.so.2 libvulkan.so.1; do
+    [ -e "$app/lib/$library" ] || continue
+    mv "$app/lib/$library" "$app/lib/platform/"
+done
+
+# Runtime data needed independently of what the host distribution ships.
+cp -a /usr/share/icons/Adwaita "$app/share/icons/"
+record_owner /usr/share/icons/Adwaita
+if [ -f /usr/share/icons/hicolor/index.theme ]; then
+    install -m 644 /usr/share/icons/hicolor/index.theme "$app/share/icons/hicolor/"
+    record_owner /usr/share/icons/hicolor/index.theme
+fi
+if [ -d /usr/share/gtk-4.0 ]; then
+    cp -a /usr/share/gtk-4.0 "$app/share/"
+    record_owner /usr/share/gtk-4.0
+fi
+if [ -d /usr/share/mime ]; then
+    cp -a /usr/share/mime "$app/share/"
+    record_owner /usr/share/mime
+fi
+mkdir -p "$app/share/glib-2.0/schemas"
+cp /usr/share/glib-2.0/schemas/*.xml "$app/share/glib-2.0/schemas/"
+glib-compile-schemas "$app/share/glib-2.0/schemas"
+for domain in gtk40 libadwaita; do
+    source=/usr/share/locale/ru/LC_MESSAGES/$domain.mo
+    [ -f "$source" ] || continue
+    mkdir -p "$app/share/locale/ru/LC_MESSAGES"
+    cp "$source" "$app/share/locale/ru/LC_MESSAGES/"
+    record_owner "$source"
+done
+
 install -m 644 data/io.github.cheviiot.Casement.desktop "$stage/share/applications/"
 install -m 644 data/io.github.cheviiot.Casement.svg "$stage/share/icons/hicolor/scalable/apps/"
+install -m 644 data/io.github.cheviiot.Casement.svg "$app/share/icons/hicolor/scalable/apps/"
+install -m 644 data/icons/hicolor/scalable/apps/*.svg "$app/share/icons/hicolor/scalable/apps/"
 install -m 644 data/casement-host.service "$stage/share/casement/"
 install -m 644 data/io.github.cheviiot.Casement.metainfo.xml "$stage/share/metainfo/"
 install -m 755 packaging/linux/install.sh packaging/linux/uninstall.sh "$stage/"
 install -m 644 LICENSE "$stage/"
+printf '%s\n' "$version" > "$stage/VERSION"
+
+# Include the licenses and exact package list for every copied runtime file.
+licenses=$app/share/licenses/casement
+mkdir -p "$licenses/runtime"
+install -m 644 data/icons/LICENSE.devicon "$licenses/"
+sort -u "$owners" -o "$owners"
+: > "$licenses/runtime-packages.txt"
+while IFS= read -r package; do
+    [ -n "$package" ] || continue
+    rpm -q --qf '%{NAME}\t%{VERSION}-%{RELEASE}\t%{LICENSE}\n' "$package" \
+        >> "$licenses/runtime-packages.txt"
+    mkdir -p "$licenses/runtime/$package"
+    rpm -ql "$package" | grep '^/usr/share/licenses/' | while IFS= read -r license; do
+        [ -f "$license" ] || continue
+        cp "$license" "$licenses/runtime/$package/$(basename "$license")"
+    done
+done < "$owners"
+
 mkdir -p dist
-tar -C build/linux -czf "dist/$name.tar.gz" "$name"
-echo "dist/$name.tar.gz"
+archive=dist/$name.tar.gz
+tar -C build/linux -czf "$archive" "$name"
+
+payload_sha=$(sha256sum "$archive" | awk '{print $1}')
+header=$scratch/run-header
+sed "s/@PAYLOAD_SHA256@/$payload_sha/" packaging/linux/run-header.sh > "$header.1"
+payload_line=$(( $(wc -l < "$header.1") + 1 ))
+sed "s/@PAYLOAD_LINE@/$payload_line/" "$header.1" > "$header"
+run=dist/$name.run
+cp "$header" "$run"
+cat "$archive" >> "$run"
+chmod 755 "$run"
+
+sh -n packaging/linux/install.sh
+sh -n packaging/linux/uninstall.sh
+sh -n packaging/linux/launcher.sh
+sh -n packaging/linux/helper-launcher.sh
+sh -n packaging/linux/runtime-exec.sh
+sh -n packaging/linux/run-header.sh
+sh "$run" --check
+echo "$archive"
+echo "$run"

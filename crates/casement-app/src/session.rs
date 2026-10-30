@@ -2,9 +2,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use adw::prelude::*;
@@ -12,7 +11,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
-use casement_net::client::{self, ClientInfo, FileSender, Handshake, InputSender};
+use casement_net::client::{ClientInfo, FileSender, Handshake, InputSender};
 use casement_net::{Fingerprint, NetError};
 use casement_proto::{input, Input, Key, PointerButton, PointerMotion, Scroll};
 
@@ -58,6 +57,25 @@ fn decoder() -> &'static str {
     }
 }
 
+/// A virtual desktop keeps one selected mode for the whole connection. Its resolution must
+/// not depend on the window's initial size: a small window would otherwise create a blurry
+/// 720p desktop, while a HiDPI scale could accidentally select an expensive 4K stream.
+fn virtual_desktop_size(quality: crate::store::VideoQuality) -> (u32, u32) {
+    quality.virtual_size()
+}
+
+fn remote_os_label(family: &str, display_name: &str) -> String {
+    let display_name = display_name.trim();
+    if !display_name.is_empty() {
+        return display_name.to_string();
+    }
+    match family.trim().to_ascii_lowercase().as_str() {
+        "windows" => "Windows".to_string(),
+        "linux" => "Linux".to_string(),
+        _ => family.trim().to_string(),
+    }
+}
+
 /// The picture of the remote screen and the input that goes back.
 struct Remote {
     picture: gtk::Picture,
@@ -72,6 +90,11 @@ struct Remote {
     pending: Cell<Option<((i32, i32), i64)>>,
     input: RefCell<Option<InputSender>>,
     pressed: RefCell<HashSet<u32>>,
+    buttons: RefCell<HashSet<u32>>,
+    pointer: Cell<Option<(f64, f64)>>,
+    hidden_cursor: gtk::gdk::Cursor,
+    cursor_hidden: Cell<bool>,
+    cursor_embedded: Cell<bool>,
 }
 
 impl Remote {
@@ -84,6 +107,15 @@ impl Remote {
             .vexpand(true)
             .css_classes(["remote-screen"])
             .build();
+        // An explicit alpha texture also works on Windows, independently of whether
+        // the cursor theme implements the CSS name "none".
+        let transparent = gtk::gdk::MemoryTexture::new(
+            1,
+            1,
+            gtk::gdk::MemoryFormat::R8g8b8a8,
+            &glib::Bytes::from_static(&[0, 0, 0, 0]),
+            4,
+        );
         let remote = Rc::new(Self {
             picture,
             width: Cell::new(0),
@@ -94,11 +126,25 @@ impl Remote {
             pending: Cell::new(None),
             input: RefCell::new(None),
             pressed: RefCell::new(HashSet::new()),
+            buttons: RefCell::new(HashSet::new()),
+            pointer: Cell::new(None),
+            hidden_cursor: gtk::gdk::Cursor::from_texture(&transparent, 0, 0, None),
+            cursor_hidden: Cell::new(false),
+            cursor_embedded: Cell::new(true),
         });
         remote.attach_controllers();
         let weak = Rc::downgrade(&remote);
+        remote.picture.connect_paintable_notify(move |_| {
+            if let Some(remote) = weak.upgrade() {
+                remote.sync_cursor();
+            }
+        });
+        let weak = Rc::downgrade(&remote);
         remote.picture.add_tick_callback(move |_, clock| {
             if let Some(remote) = weak.upgrade() {
+                // Covers a first frame, monitor switch and resize while the pointer
+                // is stationary, as well as ordinary pointer events.
+                remote.sync_cursor();
                 remote.refit(clock.frame_time());
             }
             glib::ControlFlow::Continue
@@ -165,27 +211,42 @@ impl Remote {
         }
     }
 
-    /// Widget coordinates → remote pixels (the picture is letterboxed to fit).
-    fn to_remote(&self, x: f64, y: f64) -> Option<(f64, f64)> {
-        // The picture's own size follows a resized virtual monitor; fall back to the
-        // size the host announced.
-        let (rw, rh) = match (self.source_size(), self.picture.paintable()) {
-            (Some((w, h)), _) => (w as f64, h as f64),
-            (None, Some(p)) if p.intrinsic_width() > 0 && p.intrinsic_height() > 0 => {
-                (p.intrinsic_width() as f64, p.intrinsic_height() as f64)
-            }
-            _ => (self.width.get() as f64, self.height.get() as f64),
-        };
-        let (ww, wh) = (self.picture.width() as f64, self.picture.height() as f64);
-        if rw == 0.0 || ww == 0.0 || wh == 0.0 {
-            return None;
+    fn sync_cursor(&self) {
+        let inside = self
+            .pointer
+            .get()
+            .is_none_or(|point| self.viewport().is_some_and(|v| v.contains(point)));
+        let hide = self.cursor_embedded.get() && inside && self.picture.paintable().is_some();
+        if self.cursor_hidden.replace(hide) != hide {
+            self.picture.set_cursor(if hide {
+                Some(&self.hidden_cursor)
+            } else {
+                None
+            });
         }
-        let scale = (ww / rw).min(wh / rh);
-        let (ox, oy) = ((ww - rw * scale) / 2.0, (wh - rh * scale) / 2.0);
-        Some((
-            ((x - ox) / scale).clamp(0.0, rw - 1.0),
-            ((y - oy) / scale).clamp(0.0, rh - 1.0),
-        ))
+    }
+
+    fn viewport(&self) -> Option<crate::viewport::Viewport> {
+        let source = if let Some((w, h)) = self.source_size() {
+            (w as f64, h as f64)
+        } else if let Some(paintable) = self.picture.paintable() {
+            let (w, h) = (paintable.intrinsic_width(), paintable.intrinsic_height());
+            if w > 0 && h > 0 {
+                (w as f64, h as f64)
+            } else {
+                (self.width.get() as f64, self.height.get() as f64)
+            }
+        } else {
+            (self.width.get() as f64, self.height.get() as f64)
+        };
+        crate::viewport::Viewport::new(
+            (self.picture.width() as f64, self.picture.height() as f64),
+            source,
+        )
+    }
+
+    fn to_remote(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        self.viewport()?.remote((x, y))
     }
 
     fn release_keys(&self) {
@@ -196,16 +257,75 @@ impl Remote {
                 pressed: false,
             }));
         }
+        let buttons: Vec<_> = self.buttons.borrow_mut().drain().collect();
+        for button in buttons {
+            self.send(input::Kind::Button(PointerButton {
+                button,
+                pressed: false,
+            }));
+        }
+    }
+
+    fn pointer_press(&self, button: u32, x: f64, y: f64) {
+        self.picture.grab_focus();
+        if !self.viewport().is_some_and(|v| v.contains((x, y))) {
+            return;
+        }
+        if let Some((x, y)) = self.to_remote(x, y) {
+            self.send(input::Kind::Motion(PointerMotion { x, y }));
+        }
+        if let Some(button) = evdev_button(button) {
+            self.buttons.borrow_mut().insert(button);
+            self.send(input::Kind::Button(PointerButton {
+                button,
+                pressed: true,
+            }));
+        }
+    }
+
+    fn pointer_release(&self, button: u32, x: f64, y: f64) {
+        let Some(button) = evdev_button(button) else {
+            return;
+        };
+        if !self.buttons.borrow_mut().remove(&button) {
+            return;
+        }
+        // A drag begun inside the image must end even when it leaves the viewport.
+        if let Some((x, y)) = self.to_remote(x, y) {
+            self.send(input::Kind::Motion(PointerMotion { x, y }));
+        }
+        self.send(input::Kind::Button(PointerButton {
+            button,
+            pressed: false,
+        }));
     }
 
     fn attach_controllers(self: &Rc<Self>) {
         let motion = gtk::EventControllerMotion::new();
         let this = Rc::downgrade(self);
-        motion.connect_motion(move |_, x, y| {
+        motion.connect_enter(move |_, x, y| {
             if let Some(this) = this.upgrade() {
+                this.pointer.set(Some((x, y)));
+                this.sync_cursor();
                 if let Some((x, y)) = this.to_remote(x, y) {
                     this.send(input::Kind::Motion(PointerMotion { x, y }));
                 }
+            }
+        });
+        let this = Rc::downgrade(self);
+        motion.connect_motion(move |_, x, y| {
+            if let Some(this) = this.upgrade() {
+                this.pointer.set(Some((x, y)));
+                this.sync_cursor();
+                if let Some((x, y)) = this.to_remote(x, y) {
+                    this.send(input::Kind::Motion(PointerMotion { x, y }));
+                }
+            }
+        });
+        let this = Rc::downgrade(self);
+        motion.connect_leave(move |_| {
+            if let Some(this) = this.upgrade() {
+                this.pointer.set(None);
             }
         });
         self.picture.add_controller(motion);
@@ -214,26 +334,12 @@ impl Remote {
         let this = Rc::downgrade(self);
         click.connect_pressed(move |gesture, _, x, y| {
             let Some(this) = this.upgrade() else { return };
-            this.picture.grab_focus();
-            if let Some((x, y)) = this.to_remote(x, y) {
-                this.send(input::Kind::Motion(PointerMotion { x, y }));
-            }
-            if let Some(button) = evdev_button(gesture.current_button()) {
-                this.send(input::Kind::Button(PointerButton {
-                    button,
-                    pressed: true,
-                }));
-            }
+            this.pointer_press(gesture.current_button(), x, y);
         });
         let this = Rc::downgrade(self);
-        click.connect_released(move |gesture, _, _, _| {
+        click.connect_released(move |gesture, _, x, y| {
             let Some(this) = this.upgrade() else { return };
-            if let Some(button) = evdev_button(gesture.current_button()) {
-                this.send(input::Kind::Button(PointerButton {
-                    button,
-                    pressed: false,
-                }));
-            }
+            this.pointer_release(gesture.current_button(), x, y);
         });
         self.picture.add_controller(click);
 
@@ -241,24 +347,35 @@ impl Remote {
         let this = Rc::downgrade(self);
         scroll.connect_scroll(move |_, dx, dy| {
             if let Some(this) = this.upgrade() {
-                this.send(input::Kind::Scroll(Scroll { dx, dy }));
+                if let Some(point) = this
+                    .pointer
+                    .get()
+                    .filter(|p| this.viewport().is_some_and(|v| v.contains(*p)))
+                {
+                    if let Some((x, y)) = this.to_remote(point.0, point.1) {
+                        this.send(input::Kind::Motion(PointerMotion { x, y }));
+                        this.send(input::Kind::Scroll(Scroll { dx, dy }));
+                    }
+                }
             }
             glib::Propagation::Stop
         });
         self.picture.add_controller(scroll);
 
-        // Physical keys: GDK hardware keycodes are evdev codes + 8 on Linux.
+        // GDK uses different hardware keycode namespaces on Linux and Windows.
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let this = Rc::downgrade(self);
-        keys.connect_key_pressed(move |_, _, keycode, _| {
+        keys.connect_key_pressed(move |_, key, keycode, _| {
             let Some(this) = this.upgrade() else {
                 return glib::Propagation::Proceed;
             };
-            if this.input.borrow().is_none() || keycode < 8 {
+            if this.input.borrow().is_none() {
                 return glib::Propagation::Proceed;
             }
-            let code = keycode - 8;
+            let Some(code) = crate::keyboard::evdev(key, keycode) else {
+                return glib::Propagation::Proceed;
+            };
             this.pressed.borrow_mut().insert(code);
             this.send(input::Kind::Key(Key {
                 code,
@@ -267,11 +384,12 @@ impl Remote {
             glib::Propagation::Stop
         });
         let this = Rc::downgrade(self);
-        keys.connect_key_released(move |_, _, keycode, _| {
+        keys.connect_key_released(move |_, key, keycode, _| {
             let Some(this) = this.upgrade() else { return };
-            if keycode >= 8 {
-                let code = keycode - 8;
-                this.pressed.borrow_mut().remove(&code);
+            if let Some(code) = crate::keyboard::evdev(key, keycode) {
+                if !this.pressed.borrow_mut().remove(&code) {
+                    return;
+                }
                 this.send(input::Kind::Key(Key {
                     code,
                     pressed: false,
@@ -300,11 +418,11 @@ pub struct SessionPage {
     remote: Rc<Remote>,
     /// Ends the network side of the session when dropped or sent.
     stop: RefCell<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Cancels the GTK-side connection flow as soon as its page is left or restarted.
+    connecting: RefCell<Option<tokio::sync::oneshot::Sender<()>>>,
+    generation: Cell<u64>,
     /// Asks the host for a keyframe (after a decoder error).
     keyframe: RefCell<Option<tokio::sync::mpsc::UnboundedSender<()>>>,
-    /// Files to send to the host.
-    files_out: RefCell<Option<tokio::sync::mpsc::UnboundedSender<std::path::PathBuf>>>,
-    send_file: gtk::Button,
     files_wired: Cell<bool>,
     /// Browsing and downloading the host's files while connected.
     browse_files: gtk::Button,
@@ -314,15 +432,16 @@ pub struct SessionPage {
     gone: Cell<bool>,
     /// Automatic reconnect attempt in progress (0 = none).
     reconnects: Cell<u32>,
-    /// New window sizes for a virtual monitor.
-    resize_out: RefCell<Option<tokio::sync::mpsc::UnboundedSender<(u32, u32)>>>,
-    resize_watch: RefCell<Option<glib::SourceId>>,
+    /// Pending automatic reconnect; cancelled when this page leaves or a flow restarts.
+    reconnect_watch: RefCell<Option<glib::SourceId>>,
     /// Local clipboard text for the host.
     clipboard_out: RefCell<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
     clipboard_watch: RefCell<Option<glib::SignalHandlerId>>,
     pipeline: RefCell<Option<gst::Pipeline>>,
     bus_watch: RefCell<Option<gst::bus::BusWatchGuard>>,
     toolbar: adw::ToolbarView,
+    controls: gtk::Box,
+    disconnect: gtk::Button,
     window: adw::ApplicationWindow,
     fullscreen: gtk::Button,
     /// The host's sound, when it sends any; the toggle mutes it on this side.
@@ -368,7 +487,7 @@ impl SessionPage {
         let cancel = gtk::Button::builder()
             .label("Отмена")
             .halign(gtk::Align::Center)
-            .css_classes(["pill"])
+            .css_classes(["primary-action"])
             .build();
         let busy = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -383,7 +502,7 @@ impl SessionPage {
         let retry = gtk::Button::builder()
             .label("Подключиться снова")
             .halign(gtk::Align::Center)
-            .css_classes(["pill", "suggested-action"])
+            .css_classes(["primary-action", "suggested-action"])
             .build();
         let result = adw::StatusPage::builder().child(&retry).build();
         let remote = Remote::new();
@@ -402,40 +521,42 @@ impl SessionPage {
             .visible(false)
             .build();
         let disconnect = gtk::Button::builder()
-            .label("Отключиться")
-            .css_classes(["flat"])
-            .build();
-        let send_file = gtk::Button::builder()
-            .icon_name("document-send-symbolic")
-            .tooltip_text("Отправить файлы")
+            .icon_name("network-offline-symbolic")
+            .tooltip_text("Завершить сеанс")
             .visible(false)
             .build();
         let browse_files = gtk::Button::builder()
             .icon_name("folder-remote-symbolic")
-            .tooltip_text("Файлы того компьютера")
+            .tooltip_text("Файлы")
             .visible(false)
             .build();
         header.pack_end(&disconnect);
-        header.pack_end(&fullscreen);
-        header.pack_end(&send_file);
-        header.pack_end(&browse_files);
         let sound = gtk::ToggleButton::builder()
             .icon_name("audio-volume-high-symbolic")
             .tooltip_text("Выключить звук того компьютера")
             .visible(false)
             .build();
-        header.pack_end(&sound);
         let monitors_button = gtk::Button::builder()
             .icon_name("video-display-symbolic")
             .tooltip_text("Монитор того компьютера")
             .visible(false)
             .build();
-        header.pack_end(&monitors_button);
+        let controls = gtk::Box::builder()
+            .spacing(12)
+            .halign(gtk::Align::Center)
+            .css_classes(["session-tools"])
+            .visible(false)
+            .build();
+        controls.append(&browse_files);
+        controls.append(&monitors_button);
+        controls.append(&sound);
+        controls.append(&fullscreen);
         let view = adw::ToolbarView::builder()
             .top_bar_style(adw::ToolbarStyle::Raised)
             .build();
         view.set_content(Some(&stack));
         view.add_top_bar(&header);
+        view.add_bottom_bar(&controls);
         let page = adw::NavigationPage::builder()
             .child(&view)
             .title(computer.title())
@@ -450,22 +571,23 @@ impl SessionPage {
             retry,
             remote,
             stop: RefCell::new(None),
+            connecting: RefCell::new(None),
+            generation: Cell::new(0),
             keyframe: RefCell::new(None),
             clipboard_out: RefCell::new(None),
-            resize_out: RefCell::new(None),
-            files_out: RefCell::new(None),
-            send_file,
             files_wired: Cell::new(false),
             browse_files,
             remote_files: RefCell::new(None),
             host_name: RefCell::new(computer.title()),
             gone: Cell::new(false),
             reconnects: Cell::new(0),
-            resize_watch: RefCell::new(None),
+            reconnect_watch: RefCell::new(None),
             clipboard_watch: RefCell::new(None),
             pipeline: RefCell::new(None),
             bus_watch: RefCell::new(None),
             toolbar: view,
+            controls,
+            disconnect: disconnect.clone(),
             window,
             fullscreen,
             sound,
@@ -517,8 +639,11 @@ impl SessionPage {
                 if this.window.is_fullscreen() {
                     if y <= 2.0 {
                         this.toolbar.set_reveal_top_bars(true);
+                        this.toolbar.set_reveal_bottom_bars(true);
                     } else if y > 80.0 {
                         this.toolbar.set_reveal_top_bars(false);
+                        this.toolbar
+                            .set_reveal_bottom_bars(y >= (this.toolbar.height() - 60) as f64);
                     }
                 }
             }
@@ -599,7 +724,8 @@ impl SessionPage {
         self.pending.replace(Some(tx));
         let weak = Rc::downgrade(self);
         let entry2 = entry.clone();
-        yes.connect_clicked(move |_| {
+        yes.connect_clicked(move |button| {
+            button.set_sensitive(false);
             let text = entry2
                 .as_ref()
                 .map(|e| e.text().to_string())
@@ -618,11 +744,27 @@ impl SessionPage {
             }
         });
         if let Some(entry) = &entry {
+            yes.set_sensitive(false);
+            let button = yes.clone();
+            entry.connect_changed(move |entry| {
+                button.set_sensitive(
+                    !entry.text().is_empty()
+                        && entry.text().len() <= casement_net::auth::MAX_PASSWORD_BYTES,
+                );
+            });
             let y = yes.clone();
-            entry.connect_entry_activated(move |_| y.emit_clicked());
+            entry.connect_entry_activated(move |_| {
+                if y.is_sensitive() {
+                    y.emit_clicked();
+                }
+            });
             entry.grab_focus();
         } else {
-            yes.grab_focus();
+            if question.yes_style == "destructive-action" {
+                no.grab_focus();
+            } else {
+                yes.grab_focus();
+            }
         }
         rx.await.ok().flatten()
     }
@@ -641,111 +783,50 @@ impl SessionPage {
         self.stack.set_visible_child_name("result");
     }
 
-    /// Sending files: the header button and dropping files onto the screen.
-    fn accept_files(
-        self: &Rc<Self>,
-        results: async_channel::Receiver<Result<String, String>>,
-        window: Window,
-    ) {
-        self.send_file.set_visible(true);
-        // Wired once per page; a reconnect reuses them through `files_out`.
-        if !self.files_wired.replace(true) {
-            self.wire_file_inputs(&window);
+    /// Files live in one page; dropping onto the screen opens it with those files queued.
+    fn enable_files(self: &Rc<Self>, window: &Window) {
+        if self.files_wired.replace(true) {
+            return;
         }
-        glib::spawn_future_local(async move {
-            while let Ok(result) = results.recv().await {
-                match result {
-                    Ok(saved) => window.toast(&format!(
-                        "Отправлено: «{saved}» в «Загрузки» на том компьютере"
-                    )),
-                    Err(e) => window.toast(&format!("Не удалось отправить {e}")),
-                }
-            }
-        });
-    }
-
-    fn wire_file_inputs(self: &Rc<Self>, window: &Window) {
-        let weak = Rc::downgrade(self);
-        let owner = window.clone();
+        let (weak, owner) = (Rc::downgrade(self), window.clone());
         self.browse_files.connect_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
                 this.open_remote_files(&owner);
             }
         });
-        let weak = Rc::downgrade(self);
-        self.send_file.connect_clicked(move |_| {
-            let Some(this) = weak.upgrade() else { return };
-            let dialog = gtk::FileDialog::builder()
-                .title("Отправить файлы на тот компьютер")
-                .build();
-            let parent = this.window.clone();
-            glib::spawn_future_local(async move {
-                if let Ok(files) = dialog.open_multiple_future(Some(&parent)).await {
-                    for file in files.iter::<gtk::gio::File>().flatten() {
-                        if let Some(path) = file.path() {
-                            this.queue_file(path);
-                        }
-                    }
-                }
-            });
-        });
         let drop = gtk::DropTarget::new(
             gtk::gdk::FileList::static_type(),
             gtk::gdk::DragAction::COPY,
         );
-        let weak = Rc::downgrade(self);
+        let (weak, owner) = (Rc::downgrade(self), window.clone());
         drop.connect_drop(move |_, value, _, _| {
             let (Some(this), Ok(list)) = (weak.upgrade(), value.get::<gtk::gdk::FileList>()) else {
                 return false;
             };
-            for file in list.files() {
-                if let Some(path) = file.path() {
-                    this.queue_file(path);
-                }
+            let paths: Vec<_> = list
+                .files()
+                .iter()
+                .filter_map(|file| file.path())
+                .filter(|path| path.is_file())
+                .collect();
+            if paths.is_empty() {
+                return false;
             }
+            this.open_files_with(&owner, paths);
             true
         });
         self.remote.picture.add_controller(drop);
     }
 
-    fn open_remote_files(&self, window: &Window) {
-        let files = self.remote_files.borrow().clone();
-        if let Some(files) = files {
-            crate::remote_files::open(window, files, &self.host_name.borrow());
-        }
+    fn open_remote_files(self: &Rc<Self>, window: &Window) {
+        self.open_files_with(window, Vec::new());
     }
 
-    fn queue_file(&self, path: std::path::PathBuf) {
-        if path.is_file() {
-            if let Some(out) = self.files_out.borrow().as_ref() {
-                let _ = out.send(path);
-            }
+    fn open_files_with(self: &Rc<Self>, window: &Window, uploads: Vec<std::path::PathBuf>) {
+        if let Some(files) = self.remote_files.borrow().clone() {
+            self.remote.release_keys();
+            crate::remote_files::open(window, files, &self.host_name.borrow(), uploads);
         }
-    }
-
-    /// A virtual monitor follows the window: when the picture area keeps a new size for a
-    /// moment, ask the host for it.
-    fn follow_window_size(&self, width: u32, height: u32) {
-        let Some(out) = self.resize_out.borrow().clone() else {
-            return;
-        };
-        let picture = self.remote.picture.clone();
-        let sent = std::cell::Cell::new((width, height));
-        let seen = std::cell::Cell::new((width, height));
-        let id = glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
-            let now = (
-                picture.width().max(0) as u32,
-                picture.height().max(0) as u32,
-            );
-            if now.0 >= 640 && now.1 >= 480 && now == seen.get() && now != sent.get() {
-                sent.set(now);
-                // Never Break here: shutdown() removes this source and must find it.
-                let _ = out.send(now);
-            }
-            seen.set(now);
-            glib::ControlFlow::Continue
-        });
-        self.resize_watch.replace(Some(id));
     }
 
     /// Text clipboard both ways while the screen is shown. Our own writes come back as
@@ -794,7 +875,9 @@ impl SessionPage {
         if on {
             self.window.fullscreen();
             self.toolbar.set_reveal_top_bars(false);
+            self.toolbar.set_reveal_bottom_bars(false);
             self.toolbar.set_extend_content_to_top_edge(true);
+            self.toolbar.set_extend_content_to_bottom_edge(true);
             // Alt+Tab, Super and friends go to the remote computer while in fullscreen.
             if let Some(toplevel) = &toplevel {
                 toplevel.inhibit_system_shortcuts(None::<&gtk::gdk::Event>);
@@ -803,7 +886,9 @@ impl SessionPage {
         } else {
             self.window.unfullscreen();
             self.toolbar.set_reveal_top_bars(true);
+            self.toolbar.set_reveal_bottom_bars(true);
             self.toolbar.set_extend_content_to_top_edge(false);
+            self.toolbar.set_extend_content_to_bottom_edge(false);
             if let Some(toplevel) = &toplevel {
                 toplevel.restore_system_shortcuts();
             }
@@ -821,37 +906,47 @@ impl SessionPage {
     }
 
     fn shutdown(&self) {
+        self.clear_reconnect_watch();
         if self.window.is_fullscreen() {
             self.set_fullscreen(false);
         }
         self.fullscreen.set_visible(false);
+        self.controls.set_visible(false);
+        self.disconnect.set_visible(false);
+        self.connecting.take();
         self.bus_watch.replace(None);
         self.keyframe.replace(None);
         self.clipboard_out.replace(None);
-        self.resize_out.replace(None);
-        self.files_out.replace(None);
-        self.send_file.set_visible(false);
         self.remote_files.replace(None);
         self.browse_files.set_visible(false);
-        if let Some(id) = self.resize_watch.take() {
-            id.remove();
-        }
         if let Some(id) = self.clipboard_watch.take() {
             self.remote.picture.clipboard().disconnect(id);
         }
         self.remote.release_keys();
         self.remote.input.replace(None);
+        self.remote
+            .picture
+            .set_paintable(None::<&gtk::gdk::Paintable>);
+        self.remote.sync_cursor();
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
         if let Some(pipeline) = self.pipeline.take() {
             let _ = pipeline.set_state(gst::State::Null);
         }
+        self.remote.fit.take();
+        self.remote.source.store(0, Ordering::Relaxed);
         if let Some(pipeline) = self.sound_pipeline.take() {
             let _ = pipeline.set_state(gst::State::Null);
         }
         self.sound.set_visible(false);
         self.monitors_button.set_visible(false);
+    }
+
+    fn clear_reconnect_watch(&self) {
+        if let Some(id) = self.reconnect_watch.take() {
+            id.remove();
+        }
     }
 
     /// With more than one monitor on the host, a button that opens the monitor page.
@@ -1053,11 +1148,11 @@ impl SessionPage {
     }
 
     /// Decoder pipeline whose sink paints into the picture; returns its appsrc.
-    fn start_decoder(&self) -> Result<gst_app::AppSrc, String> {
+    fn start_decoder(&self, reset: Arc<AtomicBool>) -> Result<gst_app::AppSrc, String> {
         // $CASEMENT_DECODER replaces the decoding part, for comparing pipelines.
         let decoding = std::env::var("CASEMENT_DECODER").unwrap_or_else(|_| decoder().into());
         let description = format!(
-            "appsrc name=src is-live=true format=time do-timestamp=true \
+            "appsrc name=src is-live=true format=time do-timestamp=true max-buffers=2 max-bytes=0 \
              caps=video/x-h264,stream-format=byte-stream,alignment=au \
              ! h264parse ! {decoding} ! gtk4paintablesink name=sink sync=false"
         );
@@ -1082,6 +1177,7 @@ impl SessionPage {
             .add_watch_local(move |_, message| {
                 if let gst::MessageView::Error(err) = message.view() {
                     glib::g_warning!("Casement", "decoder: {}", err.error());
+                    reset.store(true, Ordering::Release);
                     if let Some(pipeline) = restart.upgrade() {
                         let _ = pipeline.set_state(gst::State::Null);
                         let _ = pipeline.set_state(gst::State::Playing);
@@ -1105,11 +1201,11 @@ impl SessionPage {
 
 /// The trusted key changed: maybe a reinstall, maybe someone in the middle.
 async fn ask_key_changed(page: &Rc<SessionPage>, title: &str, fingerprint: &str) -> Option<String> {
-    let text = format!("У «{title}» другой ключ, чем раньше");
+    page.page.set_title(title);
     page.ask(Question {
         icon: "dialog-warning-symbolic",
         title: "Ключ компьютера изменился",
-        text: &text,
+        text: "",
         fingerprint: Some(fingerprint),
         password: false,
         yes: "Доверять новому ключу",
@@ -1120,7 +1216,7 @@ async fn ask_key_changed(page: &Rc<SessionPage>, title: &str, fingerprint: &str)
 }
 
 async fn ask_password(page: &Rc<SessionPage>, name: &str, retry: bool) -> Option<String> {
-    let text = format!("«{name}»");
+    page.page.set_title(name);
     page.ask(Question {
         icon: if retry {
             "dialog-error-symbolic"
@@ -1132,7 +1228,7 @@ async fn ask_password(page: &Rc<SessionPage>, name: &str, retry: bool) -> Option
         } else {
             "Пароль доступа"
         },
-        text: &text,
+        text: "",
         fingerprint: None,
         password: true,
         yes: "Войти",
@@ -1143,13 +1239,270 @@ async fn ask_password(page: &Rc<SessionPage>, name: &str, retry: bool) -> Option
 }
 
 /// For UI checks: a session page showing one of the questions, without a connection.
+pub async fn check_session_lifetime(window: &Window) -> Result<Vec<String>, String> {
+    let mut computer = Computer::new("\0", 47999);
+    computer.name = "Проверка повторного подключения".into();
+    let page = session_page(window, &computer);
+    page.show_result("network-offline-symbolic", "Нет соединения", None, true);
+    let weak = Rc::downgrade(&page);
+    drop(page); // The completed connection task no longer owns the controller.
+    if weak.upgrade().is_none() {
+        return Err("session: controller dropped on the error page".into());
+    }
+    let cover = pages::frame(
+        "Проверка навигации",
+        "session-cover",
+        &gtk::Label::new(Some("Проверка")),
+        None,
+    );
+    window.navigation().push(&cover);
+    if weak.upgrade().is_none_or(|p| p.gone.get()) {
+        return Err("session: covering the page ended the session".into());
+    }
+    window.navigation().pop();
+    weak.upgrade()
+        .ok_or("session: lost on uncover")?
+        .retry
+        .emit_clicked();
+    let started = std::time::Instant::now();
+    while weak.upgrade().is_some_and(|p| p.generation.get() == 0) {
+        if started.elapsed().as_secs() > 1 {
+            return Err("session: retry did not start after an error".into());
+        }
+        glib::timeout_future(std::time::Duration::from_millis(10)).await;
+    }
+    window.navigation().pop();
+    let started = std::time::Instant::now();
+    while weak.upgrade().is_some() {
+        if started.elapsed().as_secs() > 1 {
+            return Err("session: controller stayed alive after removal".into());
+        }
+        glib::timeout_future(std::time::Duration::from_millis(10)).await;
+    }
+
+    let computer = Computer::new("127.0.0.1", 47999);
+    let page = session_page(window, &computer);
+    let weak = Rc::downgrade(&page);
+    let reconnect_started = Rc::new(Cell::new(false));
+    page.reconnects.set(1);
+    schedule_reconnect_after(
+        window,
+        &page,
+        &computer,
+        std::time::Duration::from_millis(100),
+        {
+            let reconnect_started = reconnect_started.clone();
+            move |_, _, _| reconnect_started.set(true)
+        },
+    );
+    window.navigation().pop();
+    drop(page);
+    if weak.upgrade().is_some() {
+        return Err("session: reconnect timer retained the page after removal".into());
+    }
+    glib::timeout_future(std::time::Duration::from_millis(150)).await;
+    if reconnect_started.get() {
+        return Err("session: reconnect started after its page was removed".into());
+    }
+
+    Ok(vec![
+        "session controller survives a completed error flow".into(),
+        "covered session remains alive".into(),
+        "retry works after an error".into(),
+        "session controller is released after leaving".into(),
+        "reconnect timer is cancelled when its page leaves".into(),
+    ])
+}
+
+pub async fn check_cursor(window: &Window) -> Result<Vec<String>, String> {
+    let remote = Remote::new();
+    remote.width.set(160);
+    remote.height.set(90);
+    let nav = pages::frame("Проверка курсора", "cursor-check", &remote.picture, None);
+    window.navigation().push(&nav);
+    glib::timeout_future(std::time::Duration::from_millis(50)).await;
+    // With no browser acknowledging Broadway frames, a dynamically pushed page has
+    // no allocation yet. Use a deterministic private viewport for this cursor check.
+    remote.picture.allocate(800, 600, -1, None);
+    let center = (
+        remote.picture.width() as f64 / 2.0,
+        remote.picture.height() as f64 / 2.0,
+    );
+    remote.pointer.set(Some(center));
+    remote.sync_cursor();
+    if remote.cursor_hidden.get() {
+        return Err("cursor: hidden before the first frame".into());
+    }
+    let pixels = glib::Bytes::from_owned(vec![200u8; 160 * 90 * 4]);
+    let frame =
+        gtk::gdk::MemoryTexture::new(160, 90, gtk::gdk::MemoryFormat::R8g8b8a8, &pixels, 160 * 4);
+    remote.picture.set_paintable(Some(&frame));
+    glib::timeout_future(std::time::Duration::from_millis(50)).await;
+    if !remote.cursor_hidden.get() {
+        return Err(format!("cursor: first frame did not hide the local pointer without motion (widget {}x{}, pointer {:?})",
+            remote.picture.width(), remote.picture.height(), remote.pointer.get()));
+    }
+    let texture = remote
+        .picture
+        .cursor()
+        .and_then(|c| c.texture())
+        .ok_or("cursor: no explicit cursor texture")?;
+    let mut pixel = [255u8; 4];
+    texture.download(&mut pixel, 4);
+    if texture.width() != 1 || texture.height() != 1 || pixel[3] != 0 {
+        return Err("cursor: texture is not transparent".into());
+    }
+    remote.pointer.set(Some((1.0, center.1)));
+    remote.sync_cursor();
+    if !remote.cursor_hidden.get() {
+        return Err("cursor: pointer inside the image was not hidden".into());
+    }
+    let pixels = glib::Bytes::from_owned(vec![200u8; 160 * 320 * 4]);
+    let portrait =
+        gtk::gdk::MemoryTexture::new(160, 320, gtk::gdk::MemoryFormat::R8g8b8a8, &pixels, 160 * 4);
+    remote.picture.set_paintable(Some(&portrait));
+    glib::timeout_future(std::time::Duration::from_millis(50)).await;
+    if remote.cursor_hidden.get() {
+        return Err("cursor: stationary pointer over a new margin stayed hidden".into());
+    }
+    remote.pointer_press(1, 1.0, center.1);
+    if !remote.buttons.borrow().is_empty() {
+        return Err("input: clicking a letterbox margin pressed a remote button".into());
+    }
+    remote.pointer_press(1, center.0, center.1);
+    if !remote.buttons.borrow().contains(&0x110) {
+        return Err("input: pressing inside the image did not start the drag".into());
+    }
+    remote.pointer_release(1, 900.0, 700.0);
+    if !remote.buttons.borrow().is_empty() {
+        return Err("input: releasing a drag outside the image left the button held".into());
+    }
+    remote.picture.set_paintable(None::<&gtk::gdk::Paintable>);
+    glib::timeout_future(std::time::Duration::from_millis(30)).await;
+    if remote.picture.cursor().is_some() {
+        return Err("cursor: not restored after the picture ended".into());
+    }
+    remote.cursor_embedded.set(false);
+    remote.pointer.set(Some(center));
+    remote.picture.set_paintable(Some(&frame));
+    remote.sync_cursor();
+    if remote.cursor_hidden.get() || remote.picture.cursor().is_some() {
+        return Err("cursor: virtual screen did not keep the local pointer visible".into());
+    }
+    remote.picture.set_paintable(None::<&gtk::gdk::Paintable>);
+    window.navigation().pop();
+    Ok(vec![
+        "cursor hides on first frame without motion".into(),
+        "cursor is an explicit transparent texture".into(),
+        "cursor follows image geometry while stationary".into(),
+        "cursor restores when the picture ends".into(),
+        "virtual screen keeps the low-latency local cursor visible".into(),
+        "image margins ignore clicks and an outside drag release clears the button".into(),
+    ])
+}
+
+pub async fn check_decoder_recovery(window: &Window) -> Result<Vec<String>, String> {
+    let computer = Computer::new("127.0.0.1", 47999);
+    let page = session_page(window, &computer);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    page.keyframe.replace(Some(tx));
+    let reset = Arc::new(AtomicBool::new(false));
+    let _src = page.start_decoder(reset.clone())?;
+    let pipeline = page
+        .pipeline
+        .borrow()
+        .clone()
+        .ok_or("decoder check: no pipeline")?;
+    pipeline
+        .post_message(gst::message::Error::new(
+            gst::CoreError::Failed,
+            "synthetic decoder recovery check",
+        ))
+        .map_err(|e| e.to_string())?;
+    let started = std::time::Instant::now();
+    while !reset.load(Ordering::Acquire) {
+        if started.elapsed().as_secs() > 1 {
+            return Err("decoder check: error did not invalidate the reference chain".into());
+        }
+        glib::timeout_future(std::time::Duration::from_millis(10)).await;
+    }
+    rx.try_recv()
+        .map_err(|_| "decoder check: error did not request a keyframe")?;
+    let mut budget = casement_net::video::VideoBudget {
+        recovering: reset.swap(false, Ordering::AcqRel),
+    };
+    if budget.accept(false, 0) || !budget.accept(true, 0) || !budget.accept(false, 0) {
+        return Err("decoder check: reset did not wait for an independent frame".into());
+    }
+    window.navigation().pop();
+    Ok(vec![
+        "decoder error resets the reference chain and requests an independent frame".into(),
+    ])
+}
+
 pub fn preview(window: &Window, which: &str) {
     const FP: &str = "3F2A-91C4-0B7E-55D1-AE20-6C93-1F48-B70D";
-    let mut computer = Computer::new("192.168.0.110", casement_net::DEFAULT_PORT);
+    let mut computer = Computer::new("127.0.0.1", 47999);
     computer.name = "GEM12".into();
     let page = SessionPage::new(&computer, window.widget());
     watch_leave(window, &page);
     window.navigation().push(&page.page);
+    match which {
+        "connecting" => {
+            page.show_progress("Подключение…");
+            return;
+        }
+        "connection-error" => {
+            page.show_result(
+                "network-offline-symbolic",
+                "Нет соединения",
+                Some("Компьютер не ответил"),
+                true,
+            );
+            return;
+        }
+        "session" | "monitors" => {
+            let pixels = glib::Bytes::from_owned([38u8, 44, 54, 255].repeat(640 * 360));
+            let frame = gtk::gdk::MemoryTexture::new(
+                640,
+                360,
+                gtk::gdk::MemoryFormat::R8g8b8a8,
+                &pixels,
+                640 * 4,
+            );
+            page.remote.picture.set_paintable(Some(&frame));
+            page.remote.width.set(640);
+            page.remote.height.set(360);
+            page.stack.set_visible_child_name("screen");
+            page.controls.set_visible(true);
+            page.disconnect.set_visible(true);
+            page.browse_files.set_visible(true);
+            page.fullscreen.set_visible(true);
+            page.sound.set_visible(true);
+            let monitors = vec![
+                casement_net::screen::Monitor {
+                    id: "DP-1".into(),
+                    name: "Основной экран".into(),
+                    width: 1920,
+                    height: 1080,
+                    primary: true,
+                },
+                casement_net::screen::Monitor {
+                    id: "HDMI-1".into(),
+                    name: "Второй экран".into(),
+                    width: 2560,
+                    height: 1440,
+                    primary: false,
+                },
+            ];
+            page.offer_monitors(window, &computer, &monitors, "DP-1");
+            if which == "monitors" {
+                page.open_monitors(window, &computer);
+            }
+            return;
+        }
+        _ => {}
+    }
     let which = which.to_string();
     glib::spawn_future_local(async move {
         match which.as_str() {
@@ -1171,13 +1524,14 @@ fn close_page(window: &Window, page: &SessionPage) {
 /// Ends the session when its page leaves the stack, not when another page covers it.
 fn watch_leave(window: &Window, page: &Rc<SessionPage>) {
     let handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::default();
-    let (weak, handler2) = (Rc::downgrade(page), handler.clone());
+    // A failed flow ends, but the page and its retry action must remain alive.
+    let keep = RefCell::new(Some(page.clone()));
+    let (target, handler2) = (page.page.clone(), handler.clone());
     let id = window.navigation().connect_popped(move |nav, popped| {
-        let Some(page) = weak.upgrade() else {
-            return;
-        };
-        if popped == &page.page {
-            page.leave();
+        if popped == &target {
+            if let Some(page) = keep.take() {
+                page.leave();
+            }
             if let Some(id) = handler2.take() {
                 nav.disconnect(id);
             }
@@ -1193,25 +1547,35 @@ struct Started {
     input: InputSender,
     files: FileSender,
     sound: Option<casement_net::audio::AudioFormat>,
+    decoder_reset: Arc<AtomicBool>,
     monitors: Vec<casement_net::screen::Monitor>,
     monitor: String,
-}
-
-async fn resolve(host: String, port: u16) -> Result<SocketAddr, NetError> {
-    let not_found = || NetError::Io(std::io::ErrorKind::NotFound.into());
-    run(async move {
-        tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .map_err(|_| not_found())?
-            .min_by_key(|a| a.is_ipv6())
-            .ok_or_else(not_found)
-    })
-    .await
+    cursor_embedded: bool,
 }
 
 /// Opens a session page and runs the whole connection on the main loop.
 pub fn open(window: &Window, computer: Computer) {
-    let page = SessionPage::new(&computer, window.widget());
+    let page = session_page(window, &computer);
+    glib::spawn_future_local(flow(window.clone(), page, computer));
+}
+
+/// A weak probe for the isolated GTK fixture; keeps the production connection's
+/// file stream available without covering its video with the Files page.
+pub(crate) fn open_for_check(
+    window: &Window,
+    computer: Computer,
+) -> impl Fn() -> Option<FileSender> {
+    let page = session_page(window, &computer);
+    let weak = Rc::downgrade(&page);
+    glib::spawn_future_local(flow(window.clone(), page, computer));
+    move || {
+        weak.upgrade()
+            .and_then(|page| page.remote_files.borrow().clone())
+    }
+}
+
+fn session_page(window: &Window, computer: &Computer) -> Rc<SessionPage> {
+    let page = SessionPage::new(computer, window.widget());
     watch_leave(window, &page);
     window.navigation().push(&page.page);
     let window = window.clone();
@@ -1227,24 +1591,30 @@ pub fn open(window: &Window, computer: Computer) {
             glib::spawn_future_local(flow(retry_window.clone(), page, latest));
         }
     });
-    glib::spawn_future_local(flow(window, page, computer));
+    page
 }
 
-async fn flow(window: Window, page: Rc<SessionPage>, mut computer: Computer) {
+async fn flow(window: Window, page: Rc<SessionPage>, computer: Computer) {
+    page.clear_reconnect_watch();
+    if page.gone.get() {
+        return;
+    }
+    let generation = page.generation.get().wrapping_add(1);
+    page.generation.set(generation);
+    let (stop, cancel) = tokio::sync::oneshot::channel();
+    page.connecting.replace(Some(stop));
+    tokio::select! {
+        _ = cancel => {},
+        _ = flow_inner(window, page.clone(), computer) => {},
+    }
+    if page.generation.get() == generation {
+        page.connecting.take();
+    }
+}
+
+async fn flow_inner(window: Window, page: Rc<SessionPage>, mut computer: Computer) {
     let core = window.core();
-    page.show_progress(&format!("Подключение к {}…", computer.address()));
-    let addr = match resolve(computer.host.clone(), computer.port).await {
-        Ok(addr) => addr,
-        Err(e) => {
-            return retry_or_show(
-                &window,
-                &page,
-                &computer,
-                "Не удалось подключиться",
-                &describe(&e),
-            )
-        }
-    };
+    page.show_progress("Подключение…");
     let info = ClientInfo {
         name: core.name.clone(),
         os: casement_net::os_name().into(),
@@ -1259,16 +1629,21 @@ async fn flow(window: Window, page: Rc<SessionPage>, mut computer: Computer) {
             os: info.os.clone(),
             remember: true,
         };
-        let handshake: Result<Handshake, NetError> =
-            run(async move { client::connect(&identity, addr, expected, &info2).await }).await;
-        let handshake = match handshake {
-            Ok(h) => h,
+        let targets = computer.targets();
+        let name = computer.name.clone();
+        let handshake: Result<(Handshake, std::net::SocketAddr), NetError> = run(async move {
+            casement_net::routes::connect(identity, targets, expected, info2, name).await
+        })
+        .await;
+        let (handshake, addr) = match handshake {
+            Ok(connected) => connected,
             Err(NetError::KeyChanged { seen, .. }) => {
                 if ask_key_changed(&page, &computer.title(), &seen.display())
                     .await
                     .is_some()
                 {
-                    computer.fingerprint.clear();
+                    // Approval is for this exact key, including the next handshake.
+                    computer.fingerprint = seen.to_hex();
                     page.show_progress("Проверка нового ключа…");
                     continue;
                 }
@@ -1305,7 +1680,13 @@ async fn flow(window: Window, page: Rc<SessionPage>, mut computer: Computer) {
         };
         page.show_progress("Вход…");
         match run(async move { handshake.login(password.as_deref()).await }).await {
-            Ok(session) => break session,
+            Ok(session) => {
+                computer.remember_route(&addr.to_string());
+                for route in &session.host_endpoints {
+                    computer.remember_route(route);
+                }
+                break session;
+            }
             Err(NetError::AuthFailed) => {
                 retry = true;
                 continue;
@@ -1319,13 +1700,14 @@ async fn flow(window: Window, page: Rc<SessionPage>, mut computer: Computer) {
     if computer.name.is_empty() {
         computer.name = session.host_name.clone();
     }
+    let reported_os = remote_os_label(&session.host_os, &session.host_os_display_name);
+    if !reported_os.is_empty() {
+        computer.os_display_name = reported_os;
+    }
     window.remember(computer.clone());
     page.page.set_title(&computer.title());
     page.host_name.replace(computer.title());
-    page.show_progress(&format!(
-        "Подключено к «{}», ждём изображение…",
-        session.host_name
-    ));
+    page.show_progress("Ожидание экрана…");
 
     // The network side lives on Tokio: it starts the screen, pumps frames into the decoder
     // and keeps the session until the page goes away.
@@ -1333,30 +1715,43 @@ async fn flow(window: Window, page: Rc<SessionPage>, mut computer: Computer) {
     page.stop.replace(Some(stop_tx));
     let (keyframe_tx, mut keyframe_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     page.keyframe.replace(Some(keyframe_tx));
-    // A virtual monitor gets the size of the area the picture will fill.
+    // A virtual desktop starts in a standard mode and stays there. Window resizes are
+    // handled by GTK's local scaling, so shrinking the window cannot renegotiate a frame
+    // while the decoder still owns buffers of the previous size.
+    let (max_width, max_height) = if computer.virtual_monitor {
+        virtual_desktop_size(computer.video_quality)
+    } else {
+        (
+            page.stack.width().max(640) as u32,
+            page.stack.height().max(480) as u32,
+        )
+    };
     let request = casement_net::screen::ScreenRequest {
-        max_width: page.stack.width().max(640) as u32,
-        max_height: page.stack.height().max(480) as u32,
+        max_width,
+        max_height,
         virtual_monitor: computer.virtual_monitor,
         monitor: page.monitor.borrow().clone(),
+        bitrate_kbps: computer.video_quality.bitrate_kbps(),
+        adaptive_bitrate: true,
+        max_bitrate_kbps: computer.video_quality.max_bitrate_kbps(),
     };
     let (screen_tx, screen_rx) = async_channel::bounded::<Result<Started, String>>(1);
     let (src_tx, src_rx) = tokio::sync::oneshot::channel::<gst_app::AppSrc>();
     let (sound_src_tx, sound_src_rx) = tokio::sync::oneshot::channel::<gst_app::AppSrc>();
     let (ended_tx, ended_rx) = async_channel::bounded::<Option<String>>(1);
-    let (files_tx, mut files_rx) = tokio::sync::mpsc::unbounded_channel::<std::path::PathBuf>();
-    page.files_out.replace(Some(files_tx));
-    let (file_result_tx, file_result_rx) = async_channel::unbounded::<Result<String, String>>();
-    let (resize_tx, mut resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, u32)>();
-    if computer.virtual_monitor {
-        page.resize_out.replace(Some(resize_tx));
-    }
     let (clip_out_tx, mut clip_out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     page.clipboard_out.replace(Some(clip_out_tx));
     let (clip_in_tx, clip_in_rx) = async_channel::unbounded::<String>();
     runtime().spawn(async move {
         let mut session = session;
-        let screen = match session.start_screen_with(request).await {
+        let mut stop_rx = stop_rx;
+        // Closing the page must also cancel startup, before a screen/audio reply
+        // exists. Cancelling a framing read is safe here because the connection ends.
+        let started = tokio::select! {
+            _ = &mut stop_rx => { session.close(); return; }
+            started = session.start_screen_with(request) => started,
+        };
+        let screen = match started {
             Ok(screen) => screen,
             Err(e) => {
                 let _ = screen_tx.send(Err(describe(&e))).await;
@@ -1365,11 +1760,16 @@ async fn flow(window: Window, page: Rc<SessionPage>, mut computer: Computer) {
             }
         };
         // Sound is a bonus: without it the session goes on silently.
-        let sound = match session.start_audio().await {
+        let audio = tokio::select! {
+            _ = &mut stop_rx => { session.close(); return; }
+            audio = session.start_audio() => audio,
+        };
+        let sound = match audio {
             Ok(format) if format.codec == "opus" => Some(format),
             _ => None,
         };
         let (mut control, mut messages, handle) = session.split();
+        let decoder_reset = Arc::new(AtomicBool::new(false));
         let _ = screen_tx
             .send(Ok(Started {
                 width: screen.width,
@@ -1377,8 +1777,10 @@ async fn flow(window: Window, page: Rc<SessionPage>, mut computer: Computer) {
                 input: handle.input_sender(),
                 files: handle.file_sender(),
                 sound: sound.clone(),
+                decoder_reset: decoder_reset.clone(),
                 monitors: screen.monitors,
                 monitor: screen.monitor,
+                cursor_embedded: screen.cursor_embedded,
             }))
             .await;
         let Ok(src) = src_rx.await else { return };
@@ -1408,7 +1810,9 @@ async fn flow(window: Window, page: Rc<SessionPage>, mut computer: Computer) {
             })
         });
         // Each stream is read by its own task: reads are not cancellation-safe in select!.
-        let (frames_tx, mut frames) = tokio::sync::mpsc::channel(8);
+        // One completed AU may wait while the previous one is admitted to the decoder.
+        // Keeping the wire reader eager avoids turning this bridge into QUIC backpressure.
+        let (frames_tx, mut frames) = tokio::sync::mpsc::channel(1);
         let mut video = screen.video;
         let reader = tokio::spawn(async move {
             loop {
@@ -1427,17 +1831,29 @@ async fn flow(window: Window, page: Rc<SessionPage>, mut computer: Computer) {
                 }
             }
         });
-        let mut stop_rx = stop_rx;
+        let mut budget = casement_net::video::VideoBudget::default();
+        let mut recovery = tokio::time::interval(std::time::Duration::from_millis(100));
+        recovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let reason = loop {
             tokio::select! {
                 frame = frames.recv() => match frame {
                     Some(Ok(Some(frame))) => {
+                        if decoder_reset.swap(false, Ordering::AcqRel) {
+                            budget.recovering = true;
+                        }
+                        if !budget.accept(frame.keyframe, src.property::<u64>("current-level-buffers")) {
+                            continue;
+                        }
                         let mut buffer = gst::Buffer::from_slice(frame.data);
                         if !frame.keyframe {
                             buffer.get_mut().unwrap().set_flags(gst::BufferFlags::DELTA_UNIT);
                         }
-                        if src.push_buffer(buffer).is_err() {
-                            break None;
+                        if let Err(error) = src.push_buffer(buffer) {
+                            if error == gst::FlowError::Flushing {
+                                budget.recovering = true;
+                            } else {
+                                break Some("Не удалось продолжить показ экрана".to_string());
+                            }
                         }
                     }
                     Some(Ok(None)) | None => break Some("Тот компьютер прекратил показ экрана".to_string()),
@@ -1448,21 +1864,8 @@ async fn flow(window: Window, page: Rc<SessionPage>, mut computer: Computer) {
                         break Some("Соединение прервалось".to_string());
                     }
                 }
-                Some(path) = files_rx.recv() => {
-                    // Each file goes on its own stream in the background.
-                    let handle_files = handle.file_sender();
-                    let results = file_result_tx.clone();
-                    tokio::spawn(async move {
-                        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        let result = handle_files
-                            .send(&path, |_, _| {})
-                            .await
-                            .map_err(|e| format!("«{name}»: {}", describe(&e)));
-                        let _ = results.send(result).await;
-                    });
-                }
-                Some((width, height)) = resize_rx.recv() => {
-                    if control.resize(width, height).await.is_err() {
+                _ = recovery.tick(), if budget.recovering => {
+                    if control.request_keyframe().await.is_err() {
                         break Some("Соединение прервалось".to_string());
                     }
                 }
@@ -1490,12 +1893,16 @@ async fn flow(window: Window, page: Rc<SessionPage>, mut computer: Computer) {
             input,
             files,
             sound,
+            decoder_reset,
             monitors,
             monitor,
+            cursor_embedded,
         })) => {
             page.remote.width.set(width);
             page.remote.height.set(height);
-            match page.start_decoder() {
+            page.remote.cursor_embedded.set(cursor_embedded);
+            page.remote.sync_cursor();
+            match page.start_decoder(decoder_reset) {
                 Ok(src) => {
                     let player = sound.and_then(|format| {
                         page.start_sound(&format)
@@ -1513,8 +1920,9 @@ async fn flow(window: Window, page: Rc<SessionPage>, mut computer: Computer) {
                     let _ = src_tx.send(src);
                     page.remote.input.replace(Some(input));
                     page.share_clipboard(clip_in_rx.clone());
-                    page.follow_window_size(width, height);
-                    page.accept_files(file_result_rx.clone(), window.clone());
+                    page.enable_files(&window);
+                    page.controls.set_visible(true);
+                    page.disconnect.set_visible(true);
                     page.remote_files.replace(Some(files));
                     page.browse_files.set_visible(true);
                     page.offer_monitors(&window, &computer, &monitors, &monitor);
@@ -1576,22 +1984,73 @@ fn retry_or_show(
     }
 }
 
-fn schedule_reconnect(window: &Window, page: &Rc<SessionPage>, computer: &Computer, reason: &str) {
+fn schedule_reconnect(window: &Window, page: &Rc<SessionPage>, computer: &Computer, _reason: &str) {
     let attempt = page.reconnects.get();
     let delay = RECONNECT_DELAYS[(attempt as usize)
         .saturating_sub(1)
         .min(RECONNECT_DELAYS.len() - 1)];
     page.show_progress(&format!(
-        "Связь прервалась: {reason}\nПереподключение ({attempt} из {}) через {delay} с…",
+        "Переподключение через {delay} с · {attempt} из {}",
         RECONNECT_DELAYS.len()
     ));
-    let (window, page, id) = (window.clone(), page.clone(), computer.id.clone());
+    schedule_reconnect_after(
+        window,
+        page,
+        computer,
+        std::time::Duration::from_secs(delay),
+        |window, page, computer| {
+            glib::spawn_future_local(flow(window, page, computer));
+        },
+    );
+}
+
+fn schedule_reconnect_after(
+    window: &Window,
+    page: &Rc<SessionPage>,
+    computer: &Computer,
+    delay: std::time::Duration,
+    reconnect: impl FnOnce(Window, Rc<SessionPage>, Computer) + 'static,
+) {
+    page.clear_reconnect_watch();
+    let (window, weak_page, id) = (window.clone(), Rc::downgrade(page), computer.id.clone());
+    let watch_owner = page.clone();
     let fallback = computer.clone();
-    glib::timeout_add_local_once(std::time::Duration::from_secs(delay), move || {
+    let source = glib::timeout_add_local_once(delay, move || {
+        let Some(page) = weak_page.upgrade() else {
+            return;
+        };
+        // Clear the stored ID before starting a new flow so it cannot remove its own
+        // already-dispatched source if that flow calls shutdown immediately.
+        page.reconnect_watch.borrow_mut().take();
         if page.gone.get() {
             return;
         }
         let computer = window.store().find(&id).unwrap_or(fallback);
-        glib::spawn_future_local(flow(window, page, computer));
+        reconnect(window, page, computer);
     });
+    watch_owner.reconnect_watch.replace(Some(source));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{remote_os_label, virtual_desktop_size};
+    use crate::store::VideoQuality;
+
+    #[test]
+    fn virtual_desktop_uses_stable_standard_modes() {
+        assert_eq!(virtual_desktop_size(VideoQuality::Economy), (1280, 720));
+        assert_eq!(virtual_desktop_size(VideoQuality::Balanced), (1920, 1080));
+        assert_eq!(virtual_desktop_size(VideoQuality::High), (2560, 1440));
+        assert_eq!(virtual_desktop_size(VideoQuality::Ultra), (3840, 2160));
+    }
+
+    #[test]
+    fn old_and_new_hosts_get_short_operating_system_labels() {
+        assert_eq!(remote_os_label("linux", ""), "Linux");
+        assert_eq!(remote_os_label("windows", ""), "Windows");
+        assert_eq!(
+            remote_os_label("linux", "  ALT Workstation  "),
+            "ALT Workstation"
+        );
+    }
 }

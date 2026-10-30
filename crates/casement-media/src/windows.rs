@@ -3,7 +3,8 @@
 //! through `SendInput`. Clipboard text both ways through the Win32 clipboard, watched by
 //! its sequence number.
 
-use std::sync::Arc;
+use crate::keyboard::scancode;
+use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Duration;
 
 use gstreamer as gst;
@@ -38,28 +39,35 @@ const WHEEL_DELTA: f64 = 120.0;
 
 /// Encoders to try, best first; each with low-latency settings and, if those are not
 /// accepted by this GStreamer version, bare.
-const ENCODERS: &[(&str, &str)] = &[
-    (
-        "amfh264enc",
-        "amfh264enc usage=ultra-low-latency rate-control=cbr bitrate=20000 gop-size=120",
-    ),
-    (
-        "qsvh264enc",
-        "qsvh264enc low-latency=true rate-control=cbr bitrate=20000 gop-size=120",
-    ),
-    (
-        "nvd3d11h264enc",
-        "nvd3d11h264enc preset=low-latency-hq bitrate=20000 gop-size=120 bframes=0",
-    ),
-    (
-        "mfh264enc",
-        "mfh264enc low-latency=true rc-mode=cbr bitrate=20000 gop-size=120 bframes=0",
-    ),
-    (
-        "openh264enc",
-        "openh264enc bitrate=12000000 rate-control=bitrate gop-size=120 complexity=low",
-    ),
+const ENCODERS: &[&str] = &[
+    "amfh264enc",
+    "qsvh264enc",
+    "nvd3d11h264enc",
+    "mfh264enc",
+    "openh264enc",
 ];
+
+fn encoder_description(name: &str, requested_bitrate_kbps: u32) -> String {
+    let bitrate = crate::bitrate::initial(requested_bitrate_kbps);
+    match name {
+        "amfh264enc" => format!(
+            "amfh264enc name=encoder usage=ultra-low-latency rate-control=cbr bitrate={bitrate} gop-size=60"
+        ),
+        "qsvh264enc" => {
+            format!("qsvh264enc name=encoder low-latency=true rate-control=cbr bitrate={bitrate} gop-size=60")
+        }
+        "nvd3d11h264enc" => {
+            format!("nvd3d11h264enc name=encoder preset=low-latency-hq bitrate={bitrate} gop-size=60 bframes=0")
+        }
+        "mfh264enc" => format!(
+            "mfh264enc name=encoder low-latency=true rc-mode=cbr bitrate={bitrate} gop-size=60 bframes=0"
+        ),
+        _ => format!(
+            "openh264enc name=encoder bitrate={} rate-control=bitrate gop-size=60 complexity=low",
+            bitrate.saturating_mul(1000)
+        ),
+    }
+}
 
 #[derive(Clone)]
 struct Display {
@@ -134,7 +142,7 @@ impl WindowsScreen {
 pub fn encoder_name() -> Option<&'static str> {
     ENCODERS
         .iter()
-        .map(|(name, _)| *name)
+        .copied()
         .find(|name| gst::ElementFactory::find(name).is_some())
 }
 
@@ -150,13 +158,15 @@ impl ScreenProvider for WindowsScreen {
                 .cloned()
                 .ok_or("no monitor is attached")?;
             let mut last_error = String::from("no H.264 encoder");
-            for (name, tuned) in ENCODERS {
+            for name in ENCODERS {
                 if gst::ElementFactory::find(name).is_none() {
                     continue;
                 }
-                for encoder in [*tuned, *name] {
-                    match start_with(&display, encoder).await {
-                        Ok((frames, control, width, height)) => {
+                let tuned = encoder_description(name, request.bitrate_kbps);
+                let fallback = format!("{name} name=encoder");
+                for encoder in [tuned.as_str(), fallback.as_str()] {
+                    match start_with(&display, name, encoder).await {
+                        Ok((frames, frame_overflow, control, width, height)) => {
                             let events = control.clipboard.watch();
                             tracing::info!("sharing {width}x{height} with {encoder}");
                             return Ok(ScreenStream {
@@ -164,10 +174,12 @@ impl ScreenProvider for WindowsScreen {
                                 height,
                                 codec: "h264".into(),
                                 frames,
+                                frame_overflow,
                                 control: Box::new(control),
                                 events: Some(events),
                                 monitors: all.iter().map(|d| d.monitor.clone()).collect(),
                                 monitor: display.monitor.id.clone(),
+                                cursor_embedded: true,
                             });
                         }
                         Err(e) => {
@@ -184,13 +196,23 @@ impl ScreenProvider for WindowsScreen {
 
 async fn start_with(
     display: &Display,
+    encoder_name: &'static str,
     encoder: &str,
-) -> Result<(tokio::sync::mpsc::Receiver<EncodedFrame>, Control, u32, u32), String> {
+) -> Result<
+    (
+        tokio::sync::mpsc::Receiver<EncodedFrame>,
+        Arc<AtomicBool>,
+        Control,
+        u32,
+        u32,
+    ),
+    String,
+> {
     let description = format!(
         "d3d11screencapturesrc monitor-handle={} show-cursor=true ! d3d11convert ! {encoder} \
          ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au \
-         ! appsink name=sink sync=false max-buffers=8 drop=false",
-        display.handle
+         ! appsink name=sink sync=false max-buffers={} drop=false",
+        display.handle, QUEUE
     );
     let pipeline = gst::parse::launch(&description)
         .map_err(|e| format!("GStreamer pipeline: {e}"))?
@@ -200,16 +222,19 @@ async fn start_with(
         .by_name("sink")
         .and_then(|e| e.downcast::<gst_app::AppSink>().ok())
         .ok_or("no appsink")?;
+    let encoder_element = pipeline.by_name("encoder").ok_or("no encoder element")?;
     if let Err(e) = pipeline.set_state(gst::State::Playing) {
         let _ = pipeline.set_state(gst::State::Null);
         return Err(format!("cannot start capture: {e}"));
     }
     let (frames_tx, frames) = tokio::sync::mpsc::channel::<EncodedFrame>(QUEUE);
+    let frame_overflow = Arc::new(AtomicBool::new(false));
     let (size_tx, size_rx) = tokio::sync::oneshot::channel::<(u32, u32)>();
     let puller = sink.clone();
+    let overflow = frame_overflow.clone();
     std::thread::Builder::new()
         .name("casement-capture".into())
-        .spawn(move || pull_frames(puller, frames_tx, size_tx))
+        .spawn(move || pull_frames(puller, frames_tx, overflow, size_tx))
         .map_err(|e| e.to_string())?;
     let (width, height) = match tokio::time::timeout(Duration::from_secs(10), size_rx).await {
         Ok(Ok(size)) => size,
@@ -221,16 +246,20 @@ async fn start_with(
     let control = Control {
         pipeline,
         sink,
+        encoder: encoder_element,
+        encoder_name,
         rect: display.rect,
         scroll: std::sync::Mutex::new((0.0, 0.0)),
         clipboard: Arc::new(Clipboard::default()),
     };
-    Ok((frames, control, width, height))
+    Ok((frames, frame_overflow, control, width, height))
 }
 
 struct Control {
     pipeline: gst::Pipeline,
     sink: gst_app::AppSink,
+    encoder: gst::Element,
+    encoder_name: &'static str,
     /// The shared monitor on the virtual desktop, for absolute pointer positions.
     rect: RECT,
     /// Wheel remainders smaller than what is worth sending.
@@ -407,33 +436,6 @@ fn send(inputs: &[INPUT]) {
     }
 }
 
-/// Linux evdev key code → PC set 1 scancode and whether it needs the E0 prefix.
-fn scancode(code: u32) -> Option<(u16, bool)> {
-    Some(match code {
-        // The main block, function keys and keypad: evdev numbers are set 1 scancodes.
-        1..=83 | 86..=88 => (code as u16, false),
-        96 => (0x1C, true),  // keypad Enter
-        97 => (0x1D, true),  // right Ctrl
-        98 => (0x35, true),  // keypad /
-        99 => (0x37, true),  // Print Screen
-        100 => (0x38, true), // right Alt
-        102 => (0x47, true), // Home
-        103 => (0x48, true), // Up
-        104 => (0x49, true), // Page Up
-        105 => (0x4B, true), // Left
-        106 => (0x4D, true), // Right
-        107 => (0x4F, true), // End
-        108 => (0x50, true), // Down
-        109 => (0x51, true), // Page Down
-        110 => (0x52, true), // Insert
-        111 => (0x53, true), // Delete
-        125 => (0x5B, true), // left Windows
-        126 => (0x5C, true), // right Windows
-        127 => (0x5D, true), // Menu
-        _ => return None,
-    })
-}
-
 impl ScreenControl for Control {
     fn clipboard(&self, text: String) {
         let clipboard = self.clipboard.clone();
@@ -446,6 +448,10 @@ impl ScreenControl for Control {
             .all_headers(true)
             .build();
         self.sink.send_event(event);
+    }
+
+    fn set_bitrate(&self, bitrate_kbps: u32) -> bool {
+        crate::bitrate::set(&self.encoder, self.encoder_name, bitrate_kbps)
     }
 
     fn input(&self, event: Input) {

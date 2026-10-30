@@ -111,6 +111,7 @@ impl crate::screen::ScreenProvider for FakeScreen {
         };
         Box::pin(async move {
             let (tx, frames) = tokio::sync::mpsc::channel(4);
+            let frame_overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             tokio::spawn(async move {
                 for n in 0..5u64 {
                     let frame = crate::screen::EncodedFrame {
@@ -128,10 +129,12 @@ impl crate::screen::ScreenProvider for FakeScreen {
                 height: 1080,
                 codec: "h264".into(),
                 frames,
+                frame_overflow,
                 control: Box::new(control),
                 events: Some(events),
                 monitors,
                 monitor,
+                cursor_embedded: true,
             })
         })
     }
@@ -173,6 +176,142 @@ fn start_host(dir: &Path, password: Option<&str>) -> Running {
     }
 }
 
+fn start_host_with_providers(
+    dir: &Path,
+    screen: Option<std::sync::Arc<dyn crate::screen::ScreenProvider>>,
+    audio: Option<std::sync::Arc<dyn crate::audio::AudioProvider>>,
+) -> Running {
+    let identity = Identity::load_or_create(&dir.join("host")).unwrap();
+    let fingerprint = identity.fingerprint();
+    let trust = TrustStore::load(&dir.join("host")).unwrap();
+    let config = HostConfig {
+        name: "test-host".into(),
+        os: "linux".into(),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        allow_any_source: false,
+        screen,
+        files_dir: None,
+        shared_dir: None,
+        audio,
+        settings_dir: None,
+    };
+    let password = StoredPassword::create(PASSWORD).unwrap();
+    let (host, events) = Host::bind(identity, config, Some(password), trust).unwrap();
+    let host = std::sync::Arc::new(host);
+    let addr = host.local_addr().unwrap();
+    let runner = host.clone();
+    tokio::spawn(async move { runner.run().await });
+    Running {
+        addr,
+        fingerprint,
+        host,
+        events,
+    }
+}
+
+struct DropProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct PendingScreen {
+    started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::screen::ScreenProvider for PendingScreen {
+    fn start(&self, _request: crate::screen::ScreenRequest) -> crate::screen::StartFuture {
+        let started = self.started.lock().unwrap().take();
+        let dropped = self.dropped.clone();
+        Box::pin(async move {
+            let _probe = DropProbe(dropped);
+            if let Some(started) = started {
+                let _ = started.send(());
+            }
+            std::future::pending::<Result<crate::screen::ScreenStream, String>>().await
+        })
+    }
+}
+
+struct PendingAudio {
+    started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::audio::AudioProvider for PendingAudio {
+    fn start(&self) -> crate::audio::AudioStartFuture {
+        let started = self.started.lock().unwrap().take();
+        let dropped = self.dropped.clone();
+        Box::pin(async move {
+            let _probe = DropProbe(dropped);
+            if let Some(started) = started {
+                let _ = started.send(());
+            }
+            std::future::pending::<Result<crate::audio::AudioStream, String>>().await
+        })
+    }
+}
+
+struct DropTrackedControl(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl crate::screen::ScreenControl for DropTrackedControl {
+    fn request_keyframe(&self) {}
+
+    fn input(&self, _input: casement_proto::Input) {}
+}
+
+impl Drop for DropTrackedControl {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct EndedScreen {
+    events: std::sync::Arc<
+        std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::screen::ScreenEvent>>>,
+    >,
+    control_dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::screen::ScreenProvider for EndedScreen {
+    fn start(&self, _request: crate::screen::ScreenRequest) -> crate::screen::StartFuture {
+        let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        *self.events.lock().unwrap() = Some(events_tx);
+        let control = Box::new(DropTrackedControl(self.control_dropped.clone()));
+        Box::pin(async move {
+            let (_frames_tx, frames) = tokio::sync::mpsc::channel(1);
+            Ok(crate::screen::ScreenStream {
+                width: 640,
+                height: 480,
+                codec: "h264".into(),
+                frames,
+                frame_overflow: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                control,
+                events: Some(events),
+                monitors: Vec::new(),
+                monitor: String::new(),
+                cursor_embedded: true,
+            })
+        })
+    }
+}
+
+async fn wait_for_closed(events: &mut tokio::sync::mpsc::UnboundedReceiver<HostEvent>) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(event) = events.recv().await {
+            if matches!(event, HostEvent::Closed { .. }) {
+                return;
+            }
+        }
+        panic!("host event stream ended before Closed");
+    })
+    .await
+    .expect("host should report the disconnected peer promptly");
+}
+
 fn client_identity(dir: &Path, name: &str) -> Identity {
     Identity::load_or_create(&dir.join(name)).unwrap()
 }
@@ -183,6 +322,69 @@ fn info(remember: bool) -> ClientInfo {
         os: "linux".into(),
         remember,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routes_skip_an_unresponsive_address_and_learn_authenticated_endpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = start_host(dir.path(), Some(PASSWORD));
+    let me = std::sync::Arc::new(client_identity(dir.path(), "client"));
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let started = std::time::Instant::now();
+    let (handshake, addr) = crate::routes::connect(
+        me,
+        vec![
+            ("127.0.0.1".into(), blackhole.local_addr().unwrap().port()),
+            ("127.0.0.1".into(), host.addr.port()),
+        ],
+        Some(host.fingerprint),
+        info(true),
+        String::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(addr, host.addr);
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    let mut session = handshake.login(Some(PASSWORD)).await.unwrap();
+    assert_eq!(session.host_endpoints, [host.addr.to_string()]);
+    session.ping().await.unwrap();
+    session.close();
+    host.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routes_pin_the_device_across_alternatives_and_preserve_key_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+    let host = start_host(dir.path(), Some(PASSWORD));
+    let other_os = start_host(other_dir.path(), Some(PASSWORD));
+    let me = std::sync::Arc::new(client_identity(dir.path(), "client"));
+    let target = |addr: SocketAddr| (addr.ip().to_string(), addr.port());
+    let (handshake, addr) = crate::routes::connect(
+        me.clone(),
+        vec![target(other_os.addr), target(host.addr)],
+        Some(host.fingerprint),
+        info(true),
+        String::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(addr, host.addr);
+    assert_eq!(handshake.host_fingerprint, host.fingerprint);
+    handshake.close();
+    let result = crate::routes::connect(
+        me,
+        vec![target(other_os.addr)],
+        Some(host.fingerprint),
+        info(true),
+        String::new(),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(NetError::KeyChanged { expected, seen }) if expected == host.fingerprint && seen == other_os.fingerprint)
+    );
+    host.host.close();
+    other_os.host.close();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -277,6 +479,7 @@ async fn screen_frames_and_input() {
         ("Первый", true)
     );
     assert_eq!(screen.monitor, "FAKE-2");
+    assert!(screen.cursor_embedded);
     assert_eq!(
         client::clip_text(&"ж".repeat(600_000)).len(),
         casement_proto::MAX_CLIPBOARD_TEXT
@@ -323,8 +526,67 @@ async fn screen_frames_and_input() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     let got = inputs.lock().unwrap().clone();
-    assert_eq!(got.len(), 2, "both datagrams arrived on loopback");
+    assert_eq!(
+        got.len(),
+        2,
+        "motion and the reliable key arrived on loopback"
+    );
     assert_eq!(keyframes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // A legacy client still uses datagrams. New key/button/scroll commands share an
+    // ordered reliable stream; the provider sees the original input kinds.
+    sender
+        .legacy()
+        .send(&Input {
+            kind: Some(input::Kind::Key(Key {
+                code: 30,
+                pressed: false,
+            })),
+        })
+        .unwrap();
+    for pressed in [true, false] {
+        sender
+            .send(&Input {
+                kind: Some(input::Kind::Key(Key { code: 42, pressed })),
+            })
+            .unwrap();
+        sender
+            .send(&Input {
+                kind: Some(input::Kind::Button(casement_proto::PointerButton {
+                    button: 272,
+                    pressed,
+                })),
+            })
+            .unwrap();
+    }
+    sender
+        .send(&Input {
+            kind: Some(input::Kind::Scroll(casement_proto::Scroll {
+                dx: 0.0,
+                dy: 1.0,
+            })),
+        })
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while inputs.lock().unwrap().len() < 8 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let keys: Vec<_> = inputs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|input| match &input.kind {
+            Some(input::Kind::Key(key)) if key.code == 42 => Some(key.pressed),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keys, [true, false]);
+    assert!(inputs.lock().unwrap().iter().any(
+        |input| matches!(&input.kind, Some(input::Kind::Key(key)) if key.code == 30 && !key.pressed)
+    ));
 
     // Clipboard both ways, through the split session.
     let (mut sender, mut receiver, handle) = session.split();
@@ -338,8 +600,189 @@ async fn screen_frames_and_input() {
         Some(client::HostMessage::Clipboard("host: привет".into()))
     );
     assert_eq!(clipboard.lock().unwrap().as_slice(), ["привет".to_string()]);
+    let sender = handle.input_sender();
+    sender
+        .send(&Input {
+            kind: Some(input::Kind::Key(Key {
+                code: 29,
+                pressed: true,
+            })),
+        })
+        .unwrap();
+    sender
+        .send(&Input {
+            kind: Some(input::Kind::Button(casement_proto::PointerButton {
+                button: 272,
+                pressed: true,
+            })),
+        })
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let pressed = {
+                let events = inputs.lock().unwrap();
+                matches!(&events[events.len()-2].kind, Some(input::Kind::Key(key)) if key.code == 29 && key.pressed)
+                    && matches!(&events[events.len()-1].kind, Some(input::Kind::Button(button)) if button.button == 272 && button.pressed)
+            };
+            if pressed { break }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
     handle.close();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let released = {
+                let events = inputs.lock().unwrap();
+                matches!(&events[events.len()-2].kind, Some(input::Kind::Key(key)) if key.code == 29 && !key.pressed)
+                    && matches!(&events[events.len()-1].kind, Some(input::Kind::Button(button)) if !button.pressed)
+            };
+            if released { break }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
     host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_during_screen_start_drops_provider_and_closes_host_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider = std::sync::Arc::new(PendingScreen {
+        started: std::sync::Mutex::new(Some(started_tx)),
+        dropped: dropped.clone(),
+    });
+    let mut host = start_host_with_providers(&dir.path().join("server"), Some(provider), None);
+    let me = client_identity(&dir.path().join("client"), "identity");
+    let handshake = client::connect(&me, host.addr, Some(host.fingerprint), &info(false))
+        .await
+        .unwrap();
+    let mut session = handshake.login(Some(PASSWORD)).await.unwrap();
+
+    let mut start = Box::pin(session.start_screen(640, 480));
+    tokio::select! {
+        _ = started_rx => {},
+        _ = &mut start => panic!("screen startup unexpectedly completed"),
+    }
+    drop(start);
+    session.close();
+
+    wait_for_closed(&mut host.events).await;
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "closing the peer drops the pending screen provider future"
+    );
+    host.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_during_audio_start_drops_provider_and_closes_host_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider = std::sync::Arc::new(PendingAudio {
+        started: std::sync::Mutex::new(Some(started_tx)),
+        dropped: dropped.clone(),
+    });
+    let mut host = start_host_with_providers(&dir.path().join("server"), None, Some(provider));
+    let me = client_identity(&dir.path().join("client"), "identity");
+    let handshake = client::connect(&me, host.addr, Some(host.fingerprint), &info(false))
+        .await
+        .unwrap();
+    let mut session = handshake.login(Some(PASSWORD)).await.unwrap();
+
+    let mut start = Box::pin(session.start_audio());
+    tokio::select! {
+        _ = started_rx => {},
+        _ = &mut start => panic!("audio startup unexpectedly completed"),
+    }
+    drop(start);
+    session.close();
+
+    wait_for_closed(&mut host.events).await;
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "closing the peer drops the pending audio provider future"
+    );
+    host.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ended_screen_event_closes_connection_and_drops_backend_control() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let control_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider = std::sync::Arc::new(EndedScreen {
+        events: events.clone(),
+        control_dropped: control_dropped.clone(),
+    });
+    let mut host = start_host_with_providers(&dir.path().join("server"), Some(provider), None);
+    let me = client_identity(&dir.path().join("client"), "identity");
+    let handshake = client::connect(&me, host.addr, Some(host.fingerprint), &info(false))
+        .await
+        .unwrap();
+    let mut session = handshake.login(Some(PASSWORD)).await.unwrap();
+    let _screen = session.start_screen(640, 480).await.unwrap();
+
+    events
+        .lock()
+        .unwrap()
+        .take()
+        .expect("screen provider installed its event sender")
+        .send(crate::screen::ScreenEvent::Ended(
+            "screen input backend failed".into(),
+        ))
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), session.closed())
+        .await
+        .expect("backend failure should close the client connection");
+    wait_for_closed(&mut host.events).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !control_dropped.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("backend control should be released promptly");
+    host.host.close();
+}
+
+#[tokio::test]
+async fn reliable_input_queue_overload_closes_instead_of_losing_transitions() {
+    use casement_proto::{input, Input, Key};
+    let dir = tempfile::tempdir().unwrap();
+    let host = start_host(dir.path(), Some(PASSWORD));
+    let identity = client_identity(dir.path(), "client");
+    let session = client::connect(&identity, host.addr, None, &info(false))
+        .await
+        .unwrap()
+        .login(Some(PASSWORD))
+        .await
+        .unwrap();
+    let sender = session.input_sender();
+    // This current-thread runtime cannot drain the worker during the synchronous
+    // burst, making queue exhaustion deterministic without an OS input target.
+    let mut stopped = false;
+    for _ in 0..1024 {
+        if sender
+            .send(&Input {
+                kind: Some(input::Kind::Key(Key {
+                    code: 30,
+                    pressed: true,
+                })),
+            })
+            .is_err()
+        {
+            stopped = true;
+            break;
+        }
+    }
+    assert!(stopped, "typing queue must be bounded");
+    tokio::time::timeout(std::time::Duration::from_secs(1), session.closed())
+        .await
+        .unwrap();
+    host.host.close();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -513,6 +956,107 @@ async fn files_arrive_whole_and_never_overwrite() {
     assert!(leftovers.is_empty(), "no partial files stay behind");
     session.close();
     host.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_uploads_with_same_name_keep_both_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = start_host(dir.path(), Some(PASSWORD));
+    let me = client_identity(dir.path(), "client");
+    let handshake = client::connect(&me, host.addr, None, &info(false))
+        .await
+        .unwrap();
+    let session = handshake.login(Some(PASSWORD)).await.unwrap();
+
+    let first = vec![0x31; 4_000_000];
+    let second = vec![0xC7; 4_000_000];
+    let sources = dir.path().join("sources");
+    std::fs::create_dir_all(sources.join("first")).unwrap();
+    std::fs::create_dir_all(sources.join("second")).unwrap();
+    let first_path = sources.join("first/same.bin");
+    let second_path = sources.join("second/same.bin");
+    std::fs::write(&first_path, &first).unwrap();
+    std::fs::write(&second_path, &second).unwrap();
+
+    let downloads = dir.path().join("host").join("downloads");
+    std::fs::create_dir_all(&downloads).unwrap();
+    std::fs::write(downloads.join("same.bin"), b"keep existing").unwrap();
+    let (a, b) = tokio::join!(
+        session.send_file(&first_path, |_, _| {}),
+        session.send_file(&second_path, |_, _| {}),
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    assert_ne!(a, b);
+    assert_eq!(
+        std::fs::read(downloads.join("same.bin")).unwrap(),
+        b"keep existing"
+    );
+    let contents = [
+        std::fs::read(downloads.join(a)).unwrap(),
+        std::fs::read(downloads.join(b)).unwrap(),
+    ];
+    assert!(contents.contains(&first));
+    assert!(contents.contains(&second));
+    assert_no_partial_files(&downloads);
+    session.close();
+    host.host.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_fetches_with_same_name_keep_both_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared = dir.path().join("host").join("shared");
+    std::fs::create_dir_all(shared.join("first")).unwrap();
+    std::fs::create_dir_all(shared.join("second")).unwrap();
+    let first = vec![0x25; 4_000_000];
+    let second = vec![0xD2; 4_000_000];
+    std::fs::write(shared.join("first/same.bin"), &first).unwrap();
+    std::fs::write(shared.join("second/same.bin"), &second).unwrap();
+    let host = start_host(dir.path(), Some(PASSWORD));
+    let me = client_identity(dir.path(), "client");
+    let handshake = client::connect(&me, host.addr, None, &info(false))
+        .await
+        .unwrap();
+    let session = handshake.login(Some(PASSWORD)).await.unwrap();
+
+    let downloads = dir.path().join("client-downloads");
+    std::fs::create_dir_all(&downloads).unwrap();
+    std::fs::write(downloads.join("same.bin"), b"keep existing").unwrap();
+    let (a, b) = tokio::join!(
+        session.fetch_file("first/same.bin", &downloads, |_, _| {}),
+        session.fetch_file("second/same.bin", &downloads, |_, _| {}),
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    assert_ne!(a, b);
+    assert_eq!(
+        std::fs::read(downloads.join("same.bin")).unwrap(),
+        b"keep existing"
+    );
+    let contents = [std::fs::read(a).unwrap(), std::fs::read(b).unwrap()];
+    assert!(contents.contains(&first));
+    assert!(contents.contains(&second));
+    assert_no_partial_files(&downloads);
+    session.close();
+    host.host.close();
+}
+
+fn assert_no_partial_files(dir: &std::path::Path) {
+    let leftovers: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".casement-part")
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no partial files stay behind: {leftovers:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
